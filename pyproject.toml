@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thriftattention"
+version = "0.0.1"
+description = "Selective mixed-precision attention kernels for long-context FP4 inference."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

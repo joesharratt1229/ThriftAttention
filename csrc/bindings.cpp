@@ -1,0 +1,341 @@
+#include <torch/extension.h>
+
+#include <vector>
+
+namespace {
+
+void check_fp16_qkv(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "Q/K/V must be CUDA tensors");
+    TORCH_CHECK(q.dtype() == at::kHalf && k.dtype() == at::kHalf && v.dtype() == at::kHalf,
+                "Q/K/V must be float16 tensors");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+                "Q/K/V must be 4D [batch, heads, seq, head_dim]");
+    TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0),
+                "Q/K/V batch dimensions must match");
+    TORCH_CHECK(k.size(1) == v.size(1), "K and V head dimensions must match");
+    TORCH_CHECK(k.size(2) == v.size(2), "K and V sequence lengths must match");
+    TORCH_CHECK(q.size(3) == k.size(3) && q.size(3) == v.size(3),
+                "Q/K/V head dimensions must match");
+}
+
+void check_packed_qkv(
+    const at::Tensor& q_packed,
+    const at::Tensor& k_packed,
+    const at::Tensor& v_packed_t,
+    const at::Tensor& q_scale,
+    const at::Tensor& k_scale,
+    const at::Tensor& v_scale_t) {
+    TORCH_CHECK(q_packed.is_cuda() && k_packed.is_cuda() && v_packed_t.is_cuda(),
+                "packed Q/K/V must be CUDA tensors");
+    TORCH_CHECK(q_scale.is_cuda() && k_scale.is_cuda() && v_scale_t.is_cuda(),
+                "Q/K/V scales must be CUDA tensors");
+    TORCH_CHECK(q_packed.dim() == 4 && k_packed.dim() == 4 && v_packed_t.dim() == 4,
+                "packed Q/K/V must be 4D tensors");
+    TORCH_CHECK(q_packed.size(0) == k_packed.size(0), "packed Q/K batch dimensions must match");
+    TORCH_CHECK(q_packed.size(1) % k_packed.size(1) == 0,
+                "Q heads must be divisible by KV heads");
+    TORCH_CHECK(q_packed.size(3) == k_packed.size(3), "packed Q/K head dimensions must match");
+}
+
+}  // namespace
+
+// Implemented in csrc/cuda/sm120/nvfp4/fp4_attention.cu.
+void fp4_attention_causal_nvfp4(
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim);
+
+// Implemented in csrc/cuda/sm120/nvfp4/thrift_attention.cu.
+void thrift_attention_causal_nvfp4(
+    const void* Q_fp16, const void* K_fp16, const void* V_fp16,
+    const void* topk_mask, int topk_word_count,
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim);
+
+// Implemented in csrc/cuda/sm120/nvfp4/quantization.cu.
+void nvfp4_quantise(void* X, void* X_fp4, void* X_scale, int bs, int seq_len, int head_dim);
+void nvfp4_quantise_permute_seq(
+    void* X, void* X_fp4, void* X_scale, int bs, int seq_len, int head_dim, bool inverse);
+void nvfp4_quantise_transpose(void* X, void* X_fp4, void* X_scale, int bs, int seq_len, int head_dim);
+void nvfp4_quantise_transpose_permute_seq(
+    void* X, void* X_fp4, void* X_scale, int bs, int seq_len, int head_dim, bool inverse);
+
+// Implemented in csrc/cuda/sm120/nvfp4/block_selection.cu.
+void block_mean_topk(
+    const void* q_mean,
+    const void* k_mean,
+    void* topk_out,
+    int flat_heads,
+    int num_q_blocks,
+    int num_kv_blocks,
+    int head_dim,
+    int topk_count);
+void pack_topk_mask(
+    const int32_t* topk,
+    void* topk_mask,
+    int flat_heads,
+    int topk_count,
+    int total_units,
+    int word_count);
+
+static at::Tensor fp4_attention_causal_nvfp4_packed(
+    const at::Tensor& q_packed,
+    const at::Tensor& k_packed,
+    const at::Tensor& v_packed_t,
+    const at::Tensor& q_scale,
+    const at::Tensor& k_scale,
+    const at::Tensor& v_scale_t) {
+    check_packed_qkv(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t);
+
+    const int batch = q_packed.size(0);
+    const int num_q_heads = q_packed.size(1);
+    const int num_kv_heads = k_packed.size(1);
+    const int flat_q_heads = batch * num_q_heads;
+    const int q_len = q_packed.size(2);
+    const int kv_len = k_packed.size(2);
+    const int head_dim = q_packed.size(3) * 2;
+    const int kv_capacity = static_cast<int>(k_packed.stride(1)) / (head_dim / 2);
+
+    at::Tensor out = at::empty({batch, num_q_heads, q_len, head_dim},
+        at::TensorOptions().dtype(at::kHalf).device(q_packed.device()));
+
+    fp4_attention_causal_nvfp4(
+        q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+        q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+        out.data_ptr(), flat_q_heads, q_len, kv_len, kv_capacity,
+        num_q_heads, num_kv_heads, head_dim);
+
+    return out;
+}
+
+static at::Tensor thrift_attention_causal_nvfp4_packed(
+    const at::Tensor& q_fp16,
+    const at::Tensor& k_fp16,
+    const at::Tensor& v_fp16,
+    const at::Tensor& selected_blocks,
+    const at::Tensor& q_packed,
+    const at::Tensor& k_packed,
+    const at::Tensor& v_packed_t,
+    const at::Tensor& q_scale,
+    const at::Tensor& k_scale,
+    const at::Tensor& v_scale_t) {
+    check_fp16_qkv(q_fp16, k_fp16, v_fp16);
+    check_packed_qkv(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t);
+    TORCH_CHECK(selected_blocks.is_cuda(), "selected_blocks must be a CUDA tensor");
+    TORCH_CHECK(selected_blocks.dtype() == at::kInt, "selected_blocks must be int32");
+    TORCH_CHECK(selected_blocks.dim() == 2,
+                "selected_blocks must be [batch * heads, top_k]");
+
+    const int batch = q_packed.size(0);
+    const int num_q_heads = q_packed.size(1);
+    const int num_kv_heads = k_packed.size(1);
+    const int flat_q_heads = batch * num_q_heads;
+    const int q_len = q_packed.size(2);
+    const int kv_len = k_packed.size(2);
+    const int head_dim = q_packed.size(3) * 2;
+    const int topk_count = selected_blocks.size(1);
+    const int kv_capacity = static_cast<int>(k_packed.stride(1)) / (head_dim / 2);
+    TORCH_CHECK(selected_blocks.size(0) == flat_q_heads,
+                "selected_blocks first dimension must equal batch * Q heads");
+
+    if (topk_count == 0) {
+        return fp4_attention_causal_nvfp4_packed(
+            q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t);
+    }
+
+    constexpr int topk_unit_tokens = 64;
+    const int total_topk_units = (kv_len + topk_unit_tokens - 1) / topk_unit_tokens;
+    const int topk_word_count = (total_topk_units + 63) / 64;
+    TORCH_CHECK(topk_word_count <= 32,
+                "ThriftAttention supports at most 2048 64-token KV blocks, got ",
+                total_topk_units);
+
+    auto mask_opts = at::TensorOptions().dtype(at::kLong).device(selected_blocks.device());
+    at::Tensor topk_mask = at::empty({flat_q_heads, topk_word_count}, mask_opts);
+    pack_topk_mask(
+        static_cast<const int32_t*>(selected_blocks.data_ptr()),
+        topk_mask.data_ptr(),
+        flat_q_heads, topk_count, total_topk_units, topk_word_count);
+
+    at::Tensor out = at::empty({batch, num_q_heads, q_len, head_dim},
+        at::TensorOptions().dtype(at::kHalf).device(q_packed.device()));
+
+    thrift_attention_causal_nvfp4(
+        q_fp16.data_ptr(), k_fp16.data_ptr(), v_fp16.data_ptr(),
+        topk_mask.data_ptr(), topk_word_count,
+        q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+        q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+        out.data_ptr(), flat_q_heads, q_len, kv_len, kv_capacity,
+        num_q_heads, num_kv_heads, head_dim);
+
+    return out;
+}
+
+static std::vector<at::Tensor> nvfp4_quantize(const at::Tensor& x) {
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dtype() == at::kHalf, "x must be float16");
+    TORCH_CHECK(x.dim() == 4, "x must be 4D [batch, heads, seq, head_dim]");
+
+    const int batch = x.size(0);
+    const int heads = x.size(1);
+    const int seq_len = x.size(2);
+    const int head_dim = x.size(3);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128,
+                "head_dim must be 64 or 128, got ", head_dim);
+
+    auto opts_u8 = at::TensorOptions().dtype(at::kByte).device(x.device());
+    auto opts_f8 = at::TensorOptions().dtype(at::kFloat8_e4m3fn).device(x.device());
+    at::Tensor x_packed = at::empty({batch, heads, seq_len, head_dim / 2}, opts_u8);
+    at::Tensor x_scale = at::empty({batch, heads, seq_len, head_dim / 16}, opts_f8);
+
+    nvfp4_quantise(
+        x.data_ptr(), x_packed.data_ptr(), x_scale.data_ptr(),
+        batch * heads, seq_len, head_dim);
+
+    return {x_packed, x_scale};
+}
+
+static std::vector<at::Tensor> nvfp4_quantize_permuted(const at::Tensor& x) {
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dtype() == at::kHalf, "x must be float16");
+    TORCH_CHECK(x.dim() == 4, "x must be 4D [batch, heads, seq, head_dim]");
+
+    const int batch = x.size(0);
+    const int heads = x.size(1);
+    const int seq_len = x.size(2);
+    const int head_dim = x.size(3);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128,
+                "head_dim must be 64 or 128, got ", head_dim);
+
+    auto opts_u8 = at::TensorOptions().dtype(at::kByte).device(x.device());
+    auto opts_f8 = at::TensorOptions().dtype(at::kFloat8_e4m3fn).device(x.device());
+    at::Tensor x_packed = at::empty({batch, heads, seq_len, head_dim / 2}, opts_u8);
+    at::Tensor x_scale = at::empty({batch, heads, seq_len, head_dim / 16}, opts_f8);
+
+    nvfp4_quantise_permute_seq(
+        x.data_ptr(), x_packed.data_ptr(), x_scale.data_ptr(),
+        batch * heads, seq_len, head_dim, false);
+
+    return {x_packed, x_scale};
+}
+
+static std::vector<at::Tensor> nvfp4_quantize_transposed(const at::Tensor& x) {
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dtype() == at::kHalf, "x must be float16");
+    TORCH_CHECK(x.dim() == 4, "x must be 4D [batch, heads, seq, head_dim]");
+
+    const int batch = x.size(0);
+    const int heads = x.size(1);
+    const int seq_len = x.size(2);
+    const int head_dim = x.size(3);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128,
+                "head_dim must be 64 or 128, got ", head_dim);
+
+    constexpr int seq_block = 128;
+    const int padded_seq = ((seq_len + seq_block - 1) / seq_block) * seq_block;
+    auto opts_u8 = at::TensorOptions().dtype(at::kByte).device(x.device());
+    auto opts_f8 = at::TensorOptions().dtype(at::kFloat8_e4m3fn).device(x.device());
+    at::Tensor x_packed = at::empty({batch, heads, head_dim, padded_seq / 2}, opts_u8);
+    at::Tensor x_scale = at::empty({batch, heads, head_dim, padded_seq / 16}, opts_f8);
+
+    nvfp4_quantise_transpose(
+        x.data_ptr(), x_packed.data_ptr(), x_scale.data_ptr(),
+        batch * heads, seq_len, head_dim);
+
+    return {x_packed, x_scale};
+}
+
+static std::vector<at::Tensor> nvfp4_quantize_transposed_permuted(const at::Tensor& x) {
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dtype() == at::kHalf, "x must be float16");
+    TORCH_CHECK(x.dim() == 4, "x must be 4D [batch, heads, seq, head_dim]");
+
+    const int batch = x.size(0);
+    const int heads = x.size(1);
+    const int seq_len = x.size(2);
+    const int head_dim = x.size(3);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128,
+                "head_dim must be 64 or 128, got ", head_dim);
+
+    constexpr int seq_block = 128;
+    const int padded_seq = ((seq_len + seq_block - 1) / seq_block) * seq_block;
+    auto opts_u8 = at::TensorOptions().dtype(at::kByte).device(x.device());
+    auto opts_f8 = at::TensorOptions().dtype(at::kFloat8_e4m3fn).device(x.device());
+    at::Tensor x_packed = at::empty({batch, heads, head_dim, padded_seq / 2}, opts_u8);
+    at::Tensor x_scale = at::empty({batch, heads, head_dim, padded_seq / 16}, opts_f8);
+
+    nvfp4_quantise_transpose_permute_seq(
+        x.data_ptr(), x_packed.data_ptr(), x_scale.data_ptr(),
+        batch * heads, seq_len, head_dim, false);
+
+    return {x_packed, x_scale};
+}
+
+static at::Tensor block_mean_topk_impl(
+    const at::Tensor& q_mean,
+    const at::Tensor& k_mean,
+    int topk_count) {
+    TORCH_CHECK(q_mean.is_cuda() && k_mean.is_cuda(),
+                "q_mean and k_mean must be CUDA tensors");
+    TORCH_CHECK(q_mean.is_contiguous() && k_mean.is_contiguous(),
+                "q_mean and k_mean must be contiguous");
+    TORCH_CHECK(q_mean.dtype() == at::kHalf && k_mean.dtype() == at::kHalf,
+                "q_mean and k_mean must be float16");
+    TORCH_CHECK(q_mean.dim() == 4 && k_mean.dim() == 4,
+                "q_mean and k_mean must be 4D tensors");
+    TORCH_CHECK(q_mean.size(0) == k_mean.size(0),
+                "q_mean and k_mean batch dimensions must match");
+    TORCH_CHECK(q_mean.size(1) == k_mean.size(1),
+                "q_mean and k_mean head dimensions must match");
+    TORCH_CHECK(q_mean.size(3) == k_mean.size(3),
+                "q_mean and k_mean head_dim must match");
+
+    const int batch = q_mean.size(0);
+    const int heads = q_mean.size(1);
+    const int flat_heads = batch * heads;
+    const int num_q_blocks = q_mean.size(2);
+    const int num_kv_blocks = k_mean.size(2);
+    const int head_dim = q_mean.size(3);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128,
+                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(num_kv_blocks <= 1024,
+                "block selector supports <= 1024 KV blocks, got ", num_kv_blocks);
+    TORCH_CHECK(topk_count >= 0 && topk_count <= num_kv_blocks,
+                "topk_count must be in [0, num_kv_blocks]");
+
+    auto opts = at::TensorOptions().dtype(at::kInt).device(q_mean.device());
+    at::Tensor topk = at::empty({flat_heads, num_q_blocks, topk_count}, opts);
+    if (topk_count == 0) {
+        return topk;
+    }
+
+    block_mean_topk(
+        q_mean.data_ptr(), k_mean.data_ptr(), topk.data_ptr(),
+        flat_heads, num_q_blocks, num_kv_blocks, head_dim, topk_count);
+
+    return topk;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("fp4_attention_causal_nvfp4_packed", &fp4_attention_causal_nvfp4_packed,
+          "Pure NVFP4 causal attention over packed tensors");
+    m.def("thrift_attention_causal_nvfp4_packed", &thrift_attention_causal_nvfp4_packed,
+          "ThriftAttention causal attention over packed tensors");
+    m.def("nvfp4_quantize", &nvfp4_quantize,
+          "Quantize contiguous FP16 tensors to packed NVFP4 with FP8 scales");
+    m.def("nvfp4_quantize_permuted", &nvfp4_quantize_permuted,
+          "Quantize contiguous FP16 tensors to packed NVFP4 with Sage-style sequence permutation");
+    m.def("nvfp4_quantize_transposed", &nvfp4_quantize_transposed,
+          "Quantize contiguous FP16 tensors to transposed packed NVFP4 with FP8 scales");
+    m.def("nvfp4_quantize_transposed_permuted", &nvfp4_quantize_transposed_permuted,
+          "Quantize contiguous FP16 tensors to transposed packed NVFP4 with Sage-style sequence permutation");
+    m.def("block_mean_topk", &block_mean_topk_impl,
+          "Select KV blocks using block-mean QK scores");
+}
