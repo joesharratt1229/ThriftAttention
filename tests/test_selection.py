@@ -10,7 +10,9 @@ def test_resolve_top_k_clamps_explicit_value():
 
 
 def test_resolve_top_k_uses_fraction():
-    assert resolve_top_k(64, fraction=0.05) == 4
+    assert resolve_top_k(2048, fraction=0.05) == 52
+    assert resolve_top_k(2048, fraction=0.10) == 105
+    assert resolve_top_k(2048, fraction=0.25) == 274
 
 
 def test_resolve_top_k_rejects_negative_value():

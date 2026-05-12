@@ -49,10 +49,12 @@ void fp4_attention_causal_nvfp4(
 // Implemented in csrc/cuda/sm120/nvfp4/thrift_attention.cu.
 void thrift_attention_causal_nvfp4(
     const void* Q_fp16, const void* K_fp16, const void* V_fp16,
+    const void* selected_blocks, int topk_count,
     const void* topk_mask, int topk_word_count,
     const void* Q, const void* K, const void* V,
     const void* S_Q, const void* S_K, const void* S_V,
-    void* O, int bs, int q_len, int kv_len, int kv_capacity,
+    void* O, void* rowmax_state, void* rowsum_state,
+    int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads, int head_dim);
 
 // Implemented in csrc/cuda/sm120/nvfp4/quantization.cu.
@@ -167,13 +169,18 @@ static at::Tensor thrift_attention_causal_nvfp4_packed(
 
     at::Tensor out = at::empty({batch, num_q_heads, q_len, head_dim},
         at::TensorOptions().dtype(at::kHalf).device(q_packed.device()));
+    auto state_opts = at::TensorOptions().dtype(at::kFloat).device(q_packed.device());
+    at::Tensor rowmax_state = at::empty({batch, num_q_heads, q_len}, state_opts);
+    at::Tensor rowsum_state = at::empty({batch, num_q_heads, q_len}, state_opts);
 
     thrift_attention_causal_nvfp4(
         q_fp16.data_ptr(), k_fp16.data_ptr(), v_fp16.data_ptr(),
+        selected_blocks.data_ptr(), topk_count,
         topk_mask.data_ptr(), topk_word_count,
         q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
         q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
-        out.data_ptr(), flat_q_heads, q_len, kv_len, kv_capacity,
+        out.data_ptr(), rowmax_state.data_ptr(), rowsum_state.data_ptr(),
+        flat_q_heads, q_len, kv_len, kv_capacity,
         num_q_heads, num_kv_heads, head_dim);
 
     return out;
@@ -310,8 +317,8 @@ static at::Tensor block_mean_topk_impl(
     const int head_dim = q_mean.size(3);
     TORCH_CHECK(head_dim == 64 || head_dim == 128,
                 "head_dim must be 64 or 128, got ", head_dim);
-    TORCH_CHECK(num_kv_blocks <= 1024,
-                "block selector supports <= 1024 KV blocks, got ", num_kv_blocks);
+    TORCH_CHECK(num_kv_blocks <= 2048,
+                "block selector supports <= 2048 KV blocks, got ", num_kv_blocks);
     TORCH_CHECK(topk_count >= 0 && topk_count <= num_kv_blocks,
                 "topk_count must be in [0, num_kv_blocks]");
 

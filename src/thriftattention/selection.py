@@ -22,7 +22,22 @@ def resolve_top_k(
         fraction = 0.05
     if not 0.0 <= fraction <= 1.0:
         raise ValueError("fraction must be in [0, 1]")
-    return min(num_blocks, int(math.ceil(num_blocks * fraction)))
+    if num_blocks <= 0 or fraction <= 0.0:
+        return 0
+    if fraction >= 1.0:
+        return num_blocks
+
+    # Fixed top_k under causal attention promotes:
+    #   k*n - k*(k-1)/2
+    # block pairs out of n*(n+1)/2 visible block pairs. Use the smaller
+    # quadratic root to match a requested causal FP16-pair budget.
+    b = -(2 * num_blocks + 1)
+    c = fraction * num_blocks * (num_blocks + 1)
+    discriminant = b * b - 4.0 * c
+    if discriminant < 0.0:
+        return num_blocks
+    top_k_float = (-b - math.sqrt(discriminant)) / 2.0
+    return max(1, min(num_blocks, round(top_k_float)))
 
 
 def block_means(x: torch.Tensor, *, block_size: int = 64) -> torch.Tensor:
@@ -75,7 +90,7 @@ def select_block_pairs(
 
     q_mean = block_means(q, block_size=block_size)
     k_mean = _expand_kv_heads(q, block_means(k, block_size=block_size))
-    if num_kv_blocks <= 1024:
+    if num_kv_blocks <= 2048:
         return get_extension().block_mean_topk(q_mean, k_mean, selected_count)
 
     scores = (
@@ -89,4 +104,8 @@ def select_block_pairs(
         diagonal=1,
     )
     scores.masked_fill_(mask.unsqueeze(0), float("-inf"))
-    return scores.topk(selected_count, dim=-1).indices.to(torch.int32).contiguous()
+    indices = scores.topk(selected_count, dim=-1).indices.to(torch.int32)
+    valid_counts = torch.arange(1, q_mean.shape[2] + 1, device=q.device).clamp(max=num_kv_blocks)
+    ranks = torch.arange(selected_count, device=q.device)
+    indices.masked_fill_(ranks.view(1, 1, -1) >= valid_counts.view(1, -1, 1), -1)
+    return indices.contiguous()

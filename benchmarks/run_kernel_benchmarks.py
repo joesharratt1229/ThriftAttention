@@ -165,7 +165,7 @@ def make_sage_fp4(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, causal: 
 
 
 def selected_top_k(seq_len: int, coverage: float, block_size: int = 64) -> int:
-    return min(seq_len // block_size, math.ceil((seq_len // block_size) * coverage))
+    return ta.resolve_top_k(seq_len // block_size, fraction=coverage)
 
 
 def build_specs(

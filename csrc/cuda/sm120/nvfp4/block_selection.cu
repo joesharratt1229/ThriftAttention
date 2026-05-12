@@ -95,12 +95,13 @@ void block_mean_topk_kernel(
             }
         }
 
-        if (lane_id == 0) out[k] = best_idx;
+        const bool found = best > -FLT_MAX * 0.5f;
+        if (lane_id == 0) out[k] = found ? best_idx : -1;
         best_idx = __shfl_sync(0xFFFFFFFF, best_idx, 0);
 
         #pragma unroll
         for (int i = 0; i < ITEMS_PER_LANE; i++) {
-            if (indices[i] == best_idx) values[i] = -FLT_MAX;
+            if (found && indices[i] == best_idx) values[i] = -FLT_MAX;
         }
     }
 }
@@ -142,8 +143,11 @@ void dispatch_block_mean_topk(
     } else if (num_kv_blocks <= 512) {
         launch_block_mean_topk<HEAD_DIM, 512>(
             q_mean, k_mean, topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count);
-    } else {
+    } else if (num_kv_blocks <= 1024) {
         launch_block_mean_topk<HEAD_DIM, 1024>(
+            q_mean, k_mean, topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count);
+    } else {
+        launch_block_mean_topk<HEAD_DIM, 2048>(
             q_mean, k_mean, topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count);
     }
 }
@@ -163,8 +167,8 @@ void block_mean_topk(
     const half* k_mean = reinterpret_cast<const half*>(k_mean_raw);
     int32_t* topk_out = reinterpret_cast<int32_t*>(topk_out_raw);
 
-    if (num_kv_blocks > 1024) {
-        fprintf(stderr, "block_mean_topk: num_kv_blocks=%d > 1024 not supported\n", num_kv_blocks);
+    if (num_kv_blocks > 2048) {
+        fprintf(stderr, "block_mean_topk: num_kv_blocks=%d > 2048 not supported\n", num_kv_blocks);
         return;
     }
 
