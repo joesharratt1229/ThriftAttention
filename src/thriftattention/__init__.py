@@ -5,7 +5,7 @@ from .quantization import (
     nvfp4_quantize_transposed,
     nvfp4_quantize_transposed_permuted,
 )
-from .selection import block_means, resolve_top_k, select_block_pairs, select_blocks
+from .selection import block_means, resolve_top_k, select_block_pairs
 
 __all__ = [
     "attention",
@@ -16,6 +16,5 @@ __all__ = [
     "nvfp4_quantize_transposed_permuted",
     "block_means",
     "resolve_top_k",
-    "select_blocks",
     "select_block_pairs",
 ]

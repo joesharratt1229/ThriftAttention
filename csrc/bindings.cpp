@@ -76,7 +76,7 @@ void block_mean_topk(
 void pack_topk_mask(
     const int32_t* topk,
     void* topk_mask,
-    int flat_heads,
+    int row_count,
     int topk_count,
     int total_units,
     int word_count);
@@ -126,8 +126,9 @@ static at::Tensor thrift_attention_causal_nvfp4_packed(
     check_packed_qkv(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t);
     TORCH_CHECK(selected_blocks.is_cuda(), "selected_blocks must be a CUDA tensor");
     TORCH_CHECK(selected_blocks.dtype() == at::kInt, "selected_blocks must be int32");
-    TORCH_CHECK(selected_blocks.dim() == 2,
-                "selected_blocks must be [batch * heads, top_k]");
+    TORCH_CHECK(selected_blocks.is_contiguous(), "selected_blocks must be contiguous");
+    TORCH_CHECK(selected_blocks.dim() == 3,
+                "selected_blocks must be [batch * heads, q_blocks, top_k]");
 
     const int batch = q_packed.size(0);
     const int num_q_heads = q_packed.size(1);
@@ -136,10 +137,14 @@ static at::Tensor thrift_attention_causal_nvfp4_packed(
     const int q_len = q_packed.size(2);
     const int kv_len = k_packed.size(2);
     const int head_dim = q_packed.size(3) * 2;
-    const int topk_count = selected_blocks.size(1);
+    constexpr int block_q = 64;
+    const int num_q_blocks = (q_len + block_q - 1) / block_q;
+    const int topk_count = selected_blocks.size(2);
     const int kv_capacity = static_cast<int>(k_packed.stride(1)) / (head_dim / 2);
     TORCH_CHECK(selected_blocks.size(0) == flat_q_heads,
                 "selected_blocks first dimension must equal batch * Q heads");
+    TORCH_CHECK(selected_blocks.size(1) == num_q_blocks,
+                "selected_blocks second dimension must equal number of Q blocks");
 
     if (topk_count == 0) {
         return fp4_attention_causal_nvfp4_packed(
@@ -154,11 +159,11 @@ static at::Tensor thrift_attention_causal_nvfp4_packed(
                 total_topk_units);
 
     auto mask_opts = at::TensorOptions().dtype(at::kLong).device(selected_blocks.device());
-    at::Tensor topk_mask = at::empty({flat_q_heads, topk_word_count}, mask_opts);
+    at::Tensor topk_mask = at::empty({flat_q_heads, num_q_blocks, topk_word_count}, mask_opts);
     pack_topk_mask(
         static_cast<const int32_t*>(selected_blocks.data_ptr()),
         topk_mask.data_ptr(),
-        flat_q_heads, topk_count, total_topk_units, topk_word_count);
+        flat_q_heads * num_q_blocks, topk_count, total_topk_units, topk_word_count);
 
     at::Tensor out = at::empty({batch, num_q_heads, q_len, head_dim},
         at::TensorOptions().dtype(at::kHalf).device(q_packed.device()));

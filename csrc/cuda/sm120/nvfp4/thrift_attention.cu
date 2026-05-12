@@ -146,8 +146,10 @@ void thrift_attention_causal_kernel(
     const int num_kv_words = min(min(ta_cdiv(total_topk_units, 64), topk_word_count), MAX_KV_BLOCK_WORDS);
     __shared__ unsigned long long topk_mask[MAX_KV_BLOCK_WORDS];
     if (tid < MAX_KV_BLOCK_WORDS) {
+        const int64_t mask_row =
+            (static_cast<int64_t>(q_bid) * num_q_blocks + q_block_id) * topk_word_count;
         topk_mask[tid] = (tid < num_kv_words)
-            ? topk_mask_in[static_cast<int64_t>(q_bid) * topk_word_count + tid]
+            ? topk_mask_in[mask_row + tid]
             : 0ULL;
     }
     __syncthreads();

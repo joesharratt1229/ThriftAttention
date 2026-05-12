@@ -183,20 +183,19 @@ __global__ __launch_bounds__(256)
 void pack_topk_mask_kernel(
     const int32_t* __restrict__ topk,
     unsigned long long* __restrict__ topk_mask,
-    int flat_heads,
     int topk_count,
     int total_units,
     int word_count) {
-    const int head_id = blockIdx.x;
+    const int row_id = blockIdx.x;
     const int tid = threadIdx.x;
-    unsigned long long* mask_row = topk_mask + static_cast<int64_t>(head_id) * word_count;
+    unsigned long long* mask_row = topk_mask + static_cast<int64_t>(row_id) * word_count;
 
     for (int word = tid; word < word_count; word += blockDim.x) {
         mask_row[word] = 0ULL;
     }
     __syncthreads();
 
-    const int32_t* topk_row = topk + static_cast<int64_t>(head_id) * topk_count;
+    const int32_t* topk_row = topk + static_cast<int64_t>(row_id) * topk_count;
     for (int i = tid; i < topk_count; i += blockDim.x) {
         const int unit_id = topk_row[i];
         if (unit_id >= 0 && unit_id < total_units) {
@@ -211,17 +210,17 @@ void pack_topk_mask_kernel(
 void pack_topk_mask(
     const int32_t* topk,
     void* topk_mask_raw,
-    int flat_heads,
+    int row_count,
     int topk_count,
     int total_units,
     int word_count) {
     auto topk_mask = reinterpret_cast<unsigned long long*>(topk_mask_raw);
-    if (flat_heads <= 0 || word_count <= 0) {
+    if (row_count <= 0 || word_count <= 0) {
         return;
     }
 
-    pack_topk_mask_kernel<<<flat_heads, 256>>>(
-        topk, topk_mask, flat_heads, topk_count, total_units, word_count);
+    pack_topk_mask_kernel<<<row_count, 256>>>(
+        topk, topk_mask, topk_count, total_units, word_count);
 
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {

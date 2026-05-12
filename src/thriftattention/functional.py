@@ -5,7 +5,7 @@ import torch
 from ._checks import check_qkv, require_block_aligned, require_causal
 from ._extension import get_extension
 from .quantization import nvfp4_quantize, nvfp4_quantize_transposed
-from .selection import select_blocks
+from .selection import select_block_pairs
 
 
 def _quantize_qkv(
@@ -57,7 +57,7 @@ def attention(
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
-    selected_blocks = select_blocks(
+    selected_blocks = select_block_pairs(
         q,
         k,
         causal=causal,

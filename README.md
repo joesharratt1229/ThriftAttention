@@ -26,7 +26,7 @@ import thriftattention as ta
 
 out = ta.attention(q, k, v, top_k=4)
 baseline = ta.fp4_attention(q, k, v)
-selected = ta.select_blocks(q, k, top_k=4)
+selected = ta.select_block_pairs(q, k, top_k=4)
 ```
 
 Inputs are `torch.float16` CUDA tensors shaped `[batch, heads, seq, head_dim]`.

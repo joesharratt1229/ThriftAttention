@@ -7,4 +7,4 @@ def test_public_imports():
 
     assert callable(ta.attention)
     assert callable(ta.fp4_attention)
-    assert callable(ta.select_blocks)
+    assert callable(ta.select_block_pairs)

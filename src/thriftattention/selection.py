@@ -44,40 +44,6 @@ def _expand_kv_heads(q: torch.Tensor, k_mean: torch.Tensor) -> torch.Tensor:
     return k_mean.repeat_interleave(groups, dim=1).contiguous()
 
 
-def select_blocks(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    *,
-    causal: bool = True,
-    method: str = "block_mean",
-    top_k: int | None = None,
-    fraction: float | None = 0.05,
-    block_size: int = 64,
-) -> torch.Tensor:
-    """Return one selected KV-block list per flattened query head."""
-    if method != "block_mean":
-        raise NotImplementedError(f"selector {method!r} is not implemented")
-    require_causal(causal)
-    check_qkv(q, k, k)
-    require_block_aligned("k", k.shape[2], block_size)
-
-    num_kv_blocks = k.shape[2] // block_size
-    selected_count = resolve_top_k(num_kv_blocks, top_k=top_k, fraction=fraction)
-    if selected_count == 0:
-        return torch.empty(q.shape[0] * q.shape[1], 0, device=q.device, dtype=torch.int32)
-
-    k_mean = _expand_kv_heads(q, block_means(k, block_size=block_size))
-    q_summary = q.float().mean(dim=2)
-    scores = (q_summary.unsqueeze(2) * k_mean.float()).sum(dim=-1)
-    return (
-        scores.reshape(q.shape[0] * q.shape[1], num_kv_blocks)
-        .topk(selected_count, dim=-1)
-        .indices
-        .to(torch.int32)
-        .contiguous()
-    )
-
-
 def select_block_pairs(
     q: torch.Tensor,
     k: torch.Tensor,
