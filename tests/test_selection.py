@@ -15,6 +15,12 @@ def test_resolve_top_k_uses_fraction():
     assert resolve_top_k(2048, fraction=0.25) == 274
 
 
+def test_resolve_top_k_uses_dense_fraction_for_noncausal():
+    assert resolve_top_k(2048, causal=False, fraction=0.05) == 102
+    assert resolve_top_k(2048, causal=False, fraction=0.10) == 205
+    assert resolve_top_k(2048, causal=False, fraction=0.25) == 512
+
+
 def test_resolve_top_k_rejects_negative_value():
     with pytest.raises(ValueError, match="top_k"):
         resolve_top_k(8, top_k=-1)
