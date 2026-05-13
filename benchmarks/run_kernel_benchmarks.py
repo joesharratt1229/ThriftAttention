@@ -213,7 +213,7 @@ def build_specs(
                 BenchmarkSpec(
                     f"thrift_{coverage * 100:g}pct",
                     coverage,
-                    selected_top_k(seq_len, coverage, causal=args.causal),
+                    selected_top_k(seq_len, coverage, causal=args.causal and q.shape[2] != 1),
                     lambda coverage=coverage: ta.attention(
                         q,
                         k,
