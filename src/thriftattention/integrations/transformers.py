@@ -217,7 +217,7 @@ def _fast_path_rejection_reason(
     if not _is_expected_scaling(scaling, expected_scaling):
         return "ThriftAttention kernels use the default 1/sqrt(head_dim) scaling"
 
-    if query.shape[2] % config.block_size != 0:
+    if query.shape[2] != 1 and query.shape[2] % config.block_size != 0:
         return f"query length must be divisible by {config.block_size}"
     if key.shape[2] % config.block_size != 0:
         return f"key/value length must be divisible by {config.block_size}"
@@ -230,7 +230,7 @@ def _fast_path_rejection_reason(
             top_k=config.top_k,
             fraction=config.fp16_fraction,
         )
-        if selected > 0 and kv_blocks > 2048:
+        if query.shape[2] != 1 and selected > 0 and kv_blocks > 2048:
             return "ThriftAttention currently supports at most 2048 selected KV blocks"
 
     return None

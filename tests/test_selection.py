@@ -1,6 +1,6 @@
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
 from thriftattention.selection import resolve_top_k
 
@@ -29,3 +29,27 @@ def test_resolve_top_k_rejects_negative_value():
 def test_resolve_top_k_rejects_invalid_fraction():
     with pytest.raises(ValueError, match="fraction"):
         resolve_top_k(8, fraction=1.5)
+
+
+def test_select_key_blocks_groups_gqa(monkeypatch):
+    from thriftattention import selection
+
+    monkeypatch.setattr(selection, "check_qkv", lambda *args, **kwargs: None)
+
+    q = torch.tensor(
+        [[[[10.0, 0.0]], [[0.0, 1.0]], [[1.0, 0.0]], [[0.0, 10.0]]]],
+        dtype=torch.float16,
+    )
+    k = torch.tensor(
+        [
+            [
+                [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]],
+                [[0.0, 1.0], [0.0, 1.0], [1.0, 0.0], [1.0, 0.0]],
+            ]
+        ],
+        dtype=torch.float16,
+    )
+
+    selected = selection.select_key_blocks(q, k, top_k=1, block_size=2)
+
+    assert selected.tolist() == [[0], [0]]

@@ -13,7 +13,9 @@ def cuda_extension() -> CUDAExtension:
     sources = [
         "csrc/bindings.cpp",
         "csrc/cuda/sm120/nvfp4/fp4_attention.cu",
+        "csrc/cuda/sm120/nvfp4/single_query_fp4_attention.cu",
         "csrc/cuda/sm120/nvfp4/thrift_attention.cu",
+        "csrc/cuda/sm120/nvfp4/single_query_attention.cu",
         "csrc/cuda/sm120/nvfp4/quantization.cu",
         "csrc/cuda/sm120/nvfp4/block_selection.cu",
     ]

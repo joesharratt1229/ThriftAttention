@@ -119,3 +119,45 @@ def select_block_pairs(
         ranks = torch.arange(selected_count, device=q.device)
         indices.masked_fill_(ranks.view(1, 1, -1) >= valid_counts.view(1, -1, 1), -1)
     return indices.contiguous()
+
+
+def select_key_blocks(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    *,
+    method: str = "block_mean",
+    top_k: int | None = None,
+    fraction: float | None = 0.05,
+    block_size: int = 64,
+) -> torch.Tensor:
+    """Return selected KV blocks for single-query attention."""
+    if method != "block_mean":
+        raise NotImplementedError(f"selector {method!r} is not implemented")
+    check_qkv(q, k, k)
+    if q.shape[2] != 1:
+        raise ValueError("single-query block selection expects q sequence length 1")
+    require_block_aligned("k", k.shape[2], block_size)
+
+    num_kv_blocks = k.shape[2] // block_size
+    selected_count = resolve_top_k(
+        num_kv_blocks,
+        causal=False,
+        top_k=top_k,
+        fraction=fraction,
+    )
+    batch, q_heads, _, head_dim = q.shape
+    kv_heads = k.shape[1]
+    groups = q_heads // kv_heads
+    if selected_count == 0:
+        return torch.empty(
+            batch * kv_heads,
+            0,
+            device=q.device,
+            dtype=torch.int32,
+        )
+
+    q_grouped = q.reshape(batch, kv_heads, groups, head_dim)
+    k_mean = block_means(k, block_size=block_size)
+    scores = (q_grouped.float().unsqueeze(3) * k_mean.float().unsqueeze(2)).sum(dim=-1)
+    scores = scores.amax(dim=2).reshape(batch * kv_heads, num_kv_blocks)
+    return scores.topk(selected_count, dim=-1).indices.to(torch.int32).contiguous()

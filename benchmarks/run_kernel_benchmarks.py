@@ -106,11 +106,20 @@ def format_coverage(coverage: float | None) -> str:
     return f"{coverage * 100:.2f}%"
 
 
+def query_len(args: argparse.Namespace, seq_len: int) -> int:
+    return seq_len if args.q_len is None else args.q_len
+
+
+def attention_implementation(q_len: int) -> str:
+    return "single_query" if q_len == 1 else "tiled"
+
+
 def make_qkv(args: argparse.Namespace, seq_len: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     generator = torch.Generator(device=args.device)
-    generator.manual_seed(args.seed + seq_len)
+    q_len = query_len(args, seq_len)
+    generator.manual_seed(args.seed + seq_len + q_len)
 
-    shape_q = (args.batch_size, args.heads, seq_len, args.head_dim)
+    shape_q = (args.batch_size, args.heads, q_len, args.head_dim)
     shape_kv = (args.batch_size, args.kv_heads, seq_len, args.head_dim)
     q = torch.randn(shape_q, device=args.device, dtype=torch.float16, generator=generator)
     k = torch.randn(shape_kv, device=args.device, dtype=torch.float16, generator=generator)
@@ -176,6 +185,7 @@ def build_specs(
     seq_len: int,
 ) -> list[BenchmarkSpec]:
     specs: list[BenchmarkSpec] = []
+    impl = attention_implementation(q.shape[2])
 
     if not args.skip_fp16:
         if args.fp16_backend == "flash-attn":
@@ -194,7 +204,7 @@ def build_specs(
                 "ta_fp4_attention",
                 None,
                 None,
-                lambda: ta.fp4_attention(q, k, v, causal=args.causal),
+                lambda: ta.fp4_attention(q, k, v, causal=args.causal, _implementation=impl),
             )
         )
     if not args.skip_thrift:
@@ -210,6 +220,7 @@ def build_specs(
                         v,
                         causal=args.causal,
                         fraction=coverage,
+                        _implementation=impl,
                     ),
                 )
             )
@@ -344,8 +355,15 @@ def validate_args(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for these benchmarks")
     for seq_len in args.seq_lens:
+        q_len = query_len(args, seq_len)
         if seq_len <= 0:
             raise SystemExit("sequence lengths must be positive")
+        if q_len <= 0:
+            raise SystemExit("--q-len must be positive")
+        if q_len != 1 and q_len % 64 != 0 and not args.skip_thrift:
+            raise SystemExit("query lengths must be 1 or divisible by 64 for ThriftAttention")
+        if q_len != 1 and q_len % 64 != 0 and not args.skip_fp4:
+            raise SystemExit("query lengths must be 1 or divisible by 64 for FP4 paths")
         if seq_len % 64 != 0 and not args.skip_thrift:
             raise SystemExit("sequence lengths must be divisible by 64 for ThriftAttention")
         if seq_len % 64 != 0 and not args.skip_fp4:
@@ -367,6 +385,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--heads", type=int, default=16)
     parser.add_argument("--kv-heads", type=int, default=16)
+    parser.add_argument("--q-len", type=int, default=None, help="Query length. Defaults to each sequence length; use 1 for decode.")
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=50)
@@ -393,7 +412,12 @@ def main() -> None:
     all_results: list[BenchmarkResult] = []
     for seq_len in args.seq_lens:
         q, k, v = make_qkv(args, seq_len)
-        print(f"Running seq={seq_len}, batch={args.batch_size}, heads={args.heads}, kv_heads={args.kv_heads}, dim={args.head_dim}")
+        q_len = q.shape[2]
+        impl = attention_implementation(q_len)
+        print(
+            f"Running q={q_len}, kv={seq_len}, implementation={impl}, batch={args.batch_size}, "
+            f"heads={args.heads}, kv_heads={args.kv_heads}, dim={args.head_dim}"
+        )
         specs = build_specs(args, q, k, v, seq_len)
 
         for spec in specs:
