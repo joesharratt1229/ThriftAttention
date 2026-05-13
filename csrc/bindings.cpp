@@ -45,9 +45,23 @@ void fp4_attention_causal_nvfp4(
     const void* S_Q, const void* S_K, const void* S_V,
     void* O, int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads, int head_dim);
+void fp4_attention_noncausal_nvfp4(
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim);
 
 // Implemented in csrc/cuda/sm120/nvfp4/thrift_attention.cu.
 void thrift_attention_causal_nvfp4(
+    const void* Q_fp16, const void* K_fp16, const void* V_fp16,
+    const void* selected_blocks, int topk_count,
+    const void* topk_mask, int topk_word_count,
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, void* rowmax_state, void* rowsum_state,
+    int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim);
+void thrift_attention_noncausal_nvfp4(
     const void* Q_fp16, const void* K_fp16, const void* V_fp16,
     const void* selected_blocks, int topk_count,
     const void* topk_mask, int topk_word_count,
@@ -74,7 +88,8 @@ void block_mean_topk(
     int num_q_blocks,
     int num_kv_blocks,
     int head_dim,
-    int topk_count);
+    int topk_count,
+    bool causal);
 void pack_topk_mask(
     const int32_t* topk,
     void* topk_mask,
@@ -83,13 +98,14 @@ void pack_topk_mask(
     int total_units,
     int word_count);
 
-static at::Tensor fp4_attention_causal_nvfp4_packed(
+static at::Tensor fp4_attention_nvfp4_packed(
     const at::Tensor& q_packed,
     const at::Tensor& k_packed,
     const at::Tensor& v_packed_t,
     const at::Tensor& q_scale,
     const at::Tensor& k_scale,
-    const at::Tensor& v_scale_t) {
+    const at::Tensor& v_scale_t,
+    bool causal) {
     check_packed_qkv(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t);
 
     const int batch = q_packed.size(0);
@@ -104,16 +120,46 @@ static at::Tensor fp4_attention_causal_nvfp4_packed(
     at::Tensor out = at::empty({batch, num_q_heads, q_len, head_dim},
         at::TensorOptions().dtype(at::kHalf).device(q_packed.device()));
 
-    fp4_attention_causal_nvfp4(
-        q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
-        q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
-        out.data_ptr(), flat_q_heads, q_len, kv_len, kv_capacity,
-        num_q_heads, num_kv_heads, head_dim);
+    if (causal) {
+        fp4_attention_causal_nvfp4(
+            q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+            q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+            out.data_ptr(), flat_q_heads, q_len, kv_len, kv_capacity,
+            num_q_heads, num_kv_heads, head_dim);
+    } else {
+        fp4_attention_noncausal_nvfp4(
+            q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+            q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+            out.data_ptr(), flat_q_heads, q_len, kv_len, kv_capacity,
+            num_q_heads, num_kv_heads, head_dim);
+    }
 
     return out;
 }
 
-static at::Tensor thrift_attention_causal_nvfp4_packed(
+static at::Tensor fp4_attention_causal_nvfp4_packed(
+    const at::Tensor& q_packed,
+    const at::Tensor& k_packed,
+    const at::Tensor& v_packed_t,
+    const at::Tensor& q_scale,
+    const at::Tensor& k_scale,
+    const at::Tensor& v_scale_t) {
+    return fp4_attention_nvfp4_packed(
+        q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, true);
+}
+
+static at::Tensor fp4_attention_noncausal_nvfp4_packed(
+    const at::Tensor& q_packed,
+    const at::Tensor& k_packed,
+    const at::Tensor& v_packed_t,
+    const at::Tensor& q_scale,
+    const at::Tensor& k_scale,
+    const at::Tensor& v_scale_t) {
+    return fp4_attention_nvfp4_packed(
+        q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, false);
+}
+
+static at::Tensor thrift_attention_nvfp4_packed(
     const at::Tensor& q_fp16,
     const at::Tensor& k_fp16,
     const at::Tensor& v_fp16,
@@ -123,7 +169,8 @@ static at::Tensor thrift_attention_causal_nvfp4_packed(
     const at::Tensor& v_packed_t,
     const at::Tensor& q_scale,
     const at::Tensor& k_scale,
-    const at::Tensor& v_scale_t) {
+    const at::Tensor& v_scale_t,
+    bool causal) {
     check_fp16_qkv(q_fp16, k_fp16, v_fp16);
     check_packed_qkv(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t);
     TORCH_CHECK(selected_blocks.is_cuda(), "selected_blocks must be a CUDA tensor");
@@ -149,8 +196,8 @@ static at::Tensor thrift_attention_causal_nvfp4_packed(
                 "selected_blocks second dimension must equal number of Q blocks");
 
     if (topk_count == 0) {
-        return fp4_attention_causal_nvfp4_packed(
-            q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t);
+        return fp4_attention_nvfp4_packed(
+            q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, causal);
     }
 
     constexpr int topk_unit_tokens = 64;
@@ -173,17 +220,61 @@ static at::Tensor thrift_attention_causal_nvfp4_packed(
     at::Tensor rowmax_state = at::empty({batch, num_q_heads, q_len}, state_opts);
     at::Tensor rowsum_state = at::empty({batch, num_q_heads, q_len}, state_opts);
 
-    thrift_attention_causal_nvfp4(
-        q_fp16.data_ptr(), k_fp16.data_ptr(), v_fp16.data_ptr(),
-        selected_blocks.data_ptr(), topk_count,
-        topk_mask.data_ptr(), topk_word_count,
-        q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
-        q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
-        out.data_ptr(), rowmax_state.data_ptr(), rowsum_state.data_ptr(),
-        flat_q_heads, q_len, kv_len, kv_capacity,
-        num_q_heads, num_kv_heads, head_dim);
+    if (causal) {
+        thrift_attention_causal_nvfp4(
+            q_fp16.data_ptr(), k_fp16.data_ptr(), v_fp16.data_ptr(),
+            selected_blocks.data_ptr(), topk_count,
+            topk_mask.data_ptr(), topk_word_count,
+            q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+            q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+            out.data_ptr(), rowmax_state.data_ptr(), rowsum_state.data_ptr(),
+            flat_q_heads, q_len, kv_len, kv_capacity,
+            num_q_heads, num_kv_heads, head_dim);
+    } else {
+        thrift_attention_noncausal_nvfp4(
+            q_fp16.data_ptr(), k_fp16.data_ptr(), v_fp16.data_ptr(),
+            selected_blocks.data_ptr(), topk_count,
+            topk_mask.data_ptr(), topk_word_count,
+            q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+            q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+            out.data_ptr(), rowmax_state.data_ptr(), rowsum_state.data_ptr(),
+            flat_q_heads, q_len, kv_len, kv_capacity,
+            num_q_heads, num_kv_heads, head_dim);
+    }
 
     return out;
+}
+
+static at::Tensor thrift_attention_causal_nvfp4_packed(
+    const at::Tensor& q_fp16,
+    const at::Tensor& k_fp16,
+    const at::Tensor& v_fp16,
+    const at::Tensor& selected_blocks,
+    const at::Tensor& q_packed,
+    const at::Tensor& k_packed,
+    const at::Tensor& v_packed_t,
+    const at::Tensor& q_scale,
+    const at::Tensor& k_scale,
+    const at::Tensor& v_scale_t) {
+    return thrift_attention_nvfp4_packed(
+        q_fp16, k_fp16, v_fp16, selected_blocks,
+        q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, true);
+}
+
+static at::Tensor thrift_attention_noncausal_nvfp4_packed(
+    const at::Tensor& q_fp16,
+    const at::Tensor& k_fp16,
+    const at::Tensor& v_fp16,
+    const at::Tensor& selected_blocks,
+    const at::Tensor& q_packed,
+    const at::Tensor& k_packed,
+    const at::Tensor& v_packed_t,
+    const at::Tensor& q_scale,
+    const at::Tensor& k_scale,
+    const at::Tensor& v_scale_t) {
+    return thrift_attention_nvfp4_packed(
+        q_fp16, k_fp16, v_fp16, selected_blocks,
+        q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, false);
 }
 
 static std::vector<at::Tensor> nvfp4_quantize(const at::Tensor& x) {
@@ -293,7 +384,8 @@ static std::vector<at::Tensor> nvfp4_quantize_transposed_permuted(const at::Tens
 static at::Tensor block_mean_topk_impl(
     const at::Tensor& q_mean,
     const at::Tensor& k_mean,
-    int topk_count) {
+    int topk_count,
+    bool causal = true) {
     TORCH_CHECK(q_mean.is_cuda() && k_mean.is_cuda(),
                 "q_mean and k_mean must be CUDA tensors");
     TORCH_CHECK(q_mean.is_contiguous() && k_mean.is_contiguous(),
@@ -330,7 +422,7 @@ static at::Tensor block_mean_topk_impl(
 
     block_mean_topk(
         q_mean.data_ptr(), k_mean.data_ptr(), topk.data_ptr(),
-        flat_heads, num_q_blocks, num_kv_blocks, head_dim, topk_count);
+        flat_heads, num_q_blocks, num_kv_blocks, head_dim, topk_count, causal);
 
     return topk;
 }
@@ -338,8 +430,12 @@ static at::Tensor block_mean_topk_impl(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fp4_attention_causal_nvfp4_packed", &fp4_attention_causal_nvfp4_packed,
           "Pure NVFP4 causal attention over packed tensors");
+    m.def("fp4_attention_noncausal_nvfp4_packed", &fp4_attention_noncausal_nvfp4_packed,
+          "Pure NVFP4 non-causal attention over packed tensors");
     m.def("thrift_attention_causal_nvfp4_packed", &thrift_attention_causal_nvfp4_packed,
           "ThriftAttention causal attention over packed tensors");
+    m.def("thrift_attention_noncausal_nvfp4_packed", &thrift_attention_noncausal_nvfp4_packed,
+          "ThriftAttention non-causal attention over packed tensors");
     m.def("nvfp4_quantize", &nvfp4_quantize,
           "Quantize contiguous FP16 tensors to packed NVFP4 with FP8 scales");
     m.def("nvfp4_quantize_permuted", &nvfp4_quantize_permuted,
@@ -349,5 +445,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_quantize_transposed_permuted", &nvfp4_quantize_transposed_permuted,
           "Quantize contiguous FP16 tensors to transposed packed NVFP4 with Sage-style sequence permutation");
     m.def("block_mean_topk", &block_mean_topk_impl,
+          pybind11::arg("q_mean"),
+          pybind11::arg("k_mean"),
+          pybind11::arg("topk_count"),
+          pybind11::arg("causal") = true,
           "Select KV blocks using block-mean QK scores");
 }

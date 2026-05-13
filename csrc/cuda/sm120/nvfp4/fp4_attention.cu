@@ -1,4 +1,4 @@
-// SM120 NVFP4 causal attention baseline
+// SM120 NVFP4 attention baseline
 
 #include <cstdint>
 #include <float.h>
@@ -9,12 +9,12 @@
 
 #include "thriftattention/sm120/cuda_common.cuh"
 
-template<int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
+template<bool CAUSAL, int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
          int HEAD_DIM_2, int SCALE_DIM,
          int NUM_WARPS, int WARP_Q>
 __launch_bounds__(NUM_WARPS * TA_WARP_SIZE)
 __global__
-void fp4_attention_causal_kernel(
+void fp4_attention_kernel(
     const __nv_fp4x2_e2m1* Q,
     const __nv_fp4x2_e2m1* K,
     const __nv_fp4x2_e2m1* V,
@@ -125,13 +125,16 @@ void fp4_attention_causal_kernel(
         }
     }
 
-    // ---- KV loop (causal: only iterate up to the diagonal block) ----
+    // ---- KV loop ----
     __syncthreads();
     const uint32_t K_smem = __cvta_generic_to_shared(smem);
     const uint32_t K_sf_smem = K_smem + BLOCK_KV * HEAD_DIM_2 * sizeof(__nv_fp4x2_e2m1);
 
+    const int total_kv_iters = ta_cdiv(kv_len, BLOCK_KV);
     const int max_kv_pos = q_block_id * BLOCK_Q + BLOCK_Q - 1;
-    const int num_kv_iters = min(max_kv_pos / BLOCK_KV + 1, ta_cdiv(kv_len, BLOCK_KV));
+    const int num_kv_iters = CAUSAL
+        ? min(max_kv_pos / BLOCK_KV + 1, total_kv_iters)
+        : total_kv_iters;
 
     // Pre-compute base address for K ldmatrix.
     uint32_t K_ld_base;
@@ -155,7 +158,7 @@ void fp4_attention_causal_kernel(
         uint32_t S_fp4_s_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_K];
 
         const int k_block_start = kv_iter * BLOCK_KV;
-        const bool needs_causal_mask = (k_block_start + BLOCK_KV - 1) > q_block_start;
+        const bool needs_causal_mask = CAUSAL && ((k_block_start + BLOCK_KV - 1) > q_block_start);
 
         // Load K first; issue V in a second async group so QK can overlap
         // with the V transfer.
@@ -206,20 +209,22 @@ void fp4_attention_causal_kernel(
                         S_rmem[mma_id_q][mma_id_kv]);
 
         // ---- Apply causal mask on blocks overlapping the query tile ----
-        if (needs_causal_mask) {
-            for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
-                for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
-                    const int k_phys_0 = mma_id_kv * MMA_N + k_col_base;
-                    const int k_phys_1 = k_phys_0 + 1;
-                    const int k_col_0 = k_block_start + ta_kv_logical_from_physical(k_phys_0);
-                    const int k_col_1 = k_block_start + ta_kv_logical_from_physical(k_phys_1);
+        if constexpr (CAUSAL) {
+            if (needs_causal_mask) {
+                for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+                    for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+                        const int k_phys_0 = mma_id_kv * MMA_N + k_col_base;
+                        const int k_phys_1 = k_phys_0 + 1;
+                        const int k_col_0 = k_block_start + ta_kv_logical_from_physical(k_phys_0);
+                        const int k_col_1 = k_block_start + ta_kv_logical_from_physical(k_phys_1);
 
-                    // regs[0]: (q_row_upper, k_col_0), regs[1]: (q_row_upper, k_col_1)
-                    // regs[2]: (q_row_lower, k_col_0), regs[3]: (q_row_lower, k_col_1)
-                    if (k_col_0 > q_row_upper_global) S_rmem[mma_id_q][mma_id_kv][0] = -INFINITY;
-                    if (k_col_1 > q_row_upper_global) S_rmem[mma_id_q][mma_id_kv][1] = -INFINITY;
-                    if (k_col_0 > q_row_lower_global) S_rmem[mma_id_q][mma_id_kv][2] = -INFINITY;
-                    if (k_col_1 > q_row_lower_global) S_rmem[mma_id_q][mma_id_kv][3] = -INFINITY;
+                        // regs[0]: (q_row_upper, k_col_0), regs[1]: (q_row_upper, k_col_1)
+                        // regs[2]: (q_row_lower, k_col_0), regs[3]: (q_row_lower, k_col_1)
+                        if (k_col_0 > q_row_upper_global) S_rmem[mma_id_q][mma_id_kv][0] = -INFINITY;
+                        if (k_col_1 > q_row_upper_global) S_rmem[mma_id_q][mma_id_kv][1] = -INFINITY;
+                        if (k_col_0 > q_row_lower_global) S_rmem[mma_id_q][mma_id_kv][2] = -INFINITY;
+                        if (k_col_1 > q_row_lower_global) S_rmem[mma_id_q][mma_id_kv][3] = -INFINITY;
+                    }
                 }
             }
         }
@@ -410,8 +415,8 @@ void fp4_attention_causal_kernel(
         }
 }
 
-template<int HEAD_DIM>
-static void launch_fp4_attention_causal(
+template<bool CAUSAL, int HEAD_DIM>
+static void launch_fp4_attention(
     const __nv_fp4x2_e2m1* Q, const __nv_fp4x2_e2m1* K, const __nv_fp4x2_e2m1* V,
     const __nv_fp8_e4m3* S_Q, const __nv_fp8_e4m3* S_K, const __nv_fp8_e4m3* S_V,
     __half* O, int bs, int q_len, int kv_len, int kv_capacity,
@@ -436,14 +441,41 @@ static void launch_fp4_attention_causal(
     constexpr int smem_size = q_phase_smem + v_phase_smem > k_phase_smem
                             ? q_phase_smem + v_phase_smem : k_phase_smem;
 
-    auto kernel = fp4_attention_causal_kernel<BLOCK_Q, BLOCK_KV, HEAD_DIM,
-                                         HEAD_DIM_2, SCALE_DIM,
-                                         NUM_WARPS, WARP_Q>;
+    auto kernel = fp4_attention_kernel<CAUSAL, BLOCK_Q, BLOCK_KV, HEAD_DIM,
+                                       HEAD_DIM_2, SCALE_DIM,
+                                       NUM_WARPS, WARP_Q>;
 
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     kernel<<<num_blocks, TB_SIZE, smem_size>>>(
         Q, K, V, S_Q, S_K, S_V, O,
         bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+}
+
+template<bool CAUSAL>
+static void dispatch_fp4_attention(
+    const __nv_fp4x2_e2m1* Q,
+    const __nv_fp4x2_e2m1* K,
+    const __nv_fp4x2_e2m1* V,
+    const __nv_fp8_e4m3* S_Q,
+    const __nv_fp8_e4m3* S_K,
+    const __nv_fp8_e4m3* S_V,
+    __half* O,
+    int bs,
+    int q_len,
+    int kv_len,
+    int kv_capacity,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim) {
+    if (head_dim == 64) {
+        launch_fp4_attention<CAUSAL, 64>(
+            Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
+            kv_capacity, num_q_heads, num_kv_heads);
+    } else {
+        launch_fp4_attention<CAUSAL, 128>(
+            Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
+            kv_capacity, num_q_heads, num_kv_heads);
+    }
 }
 
 void fp4_attention_causal_nvfp4(
@@ -470,12 +502,36 @@ void fp4_attention_causal_nvfp4(
     auto S_V = reinterpret_cast<const __nv_fp8_e4m3*>(S_V_raw);
     auto O = reinterpret_cast<__half*>(O_raw);
 
-    if (head_dim == 64)
-        launch_fp4_attention_causal<64>(
-            Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
-            kv_capacity, num_q_heads, num_kv_heads);
-    else
-        launch_fp4_attention_causal<128>(
-            Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
-            kv_capacity, num_q_heads, num_kv_heads);
+    dispatch_fp4_attention<true>(
+        Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
+        kv_capacity, num_q_heads, num_kv_heads, head_dim);
+}
+
+void fp4_attention_noncausal_nvfp4(
+    const void* Q_raw,
+    const void* K_raw,
+    const void* V_raw,
+    const void* S_Q_raw,
+    const void* S_K_raw,
+    const void* S_V_raw,
+    void* O_raw,
+    int bs,
+    int q_len,
+    int kv_len,
+    int kv_capacity,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim) {
+
+    auto Q = reinterpret_cast<const __nv_fp4x2_e2m1*>(Q_raw);
+    auto K = reinterpret_cast<const __nv_fp4x2_e2m1*>(K_raw);
+    auto V = reinterpret_cast<const __nv_fp4x2_e2m1*>(V_raw);
+    auto S_Q = reinterpret_cast<const __nv_fp8_e4m3*>(S_Q_raw);
+    auto S_K = reinterpret_cast<const __nv_fp8_e4m3*>(S_K_raw);
+    auto S_V = reinterpret_cast<const __nv_fp8_e4m3*>(S_V_raw);
+    auto O = reinterpret_cast<__half*>(O_raw);
+
+    dispatch_fp4_attention<false>(
+        Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
+        kv_capacity, num_q_heads, num_kv_heads, head_dim);
 }
