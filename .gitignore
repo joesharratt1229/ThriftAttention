@@ -1,2 +1,3 @@
-*_cache*
+*pycache*
 *cpython*
+*egg-info*
