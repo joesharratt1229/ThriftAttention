@@ -35,10 +35,7 @@ def check_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
 
 
 def require_causal(causal: bool) -> None:
-    if not causal:
-        raise NotImplementedError(
-            "non-causal kernels are planned but are not part of this migration yet"
-        )
+    return None
 
 
 def require_block_aligned(name: str, seq_len: int, block_size: int) -> None:

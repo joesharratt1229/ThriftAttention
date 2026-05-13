@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from ._checks import check_qkv, require_block_aligned, require_causal
+from ._checks import check_qkv, require_block_aligned
 from ._extension import get_extension
 from .quantization import (
     nvfp4_quantize,
@@ -30,13 +30,15 @@ def fp4_attention(
     *,
     causal: bool = True,
 ) -> torch.Tensor:
-    """Run the pure NVFP4 causal attention baseline."""
-    require_causal(causal)
+    """Run the pure NVFP4 attention baseline."""
     check_qkv(q, k, v)
     require_block_aligned("q", q.shape[2], 64)
     require_block_aligned("k", k.shape[2], 64)
     packed = _quantize_qkv(q.contiguous(), k.contiguous(), v.contiguous())
-    return get_extension().fp4_attention_causal_nvfp4_packed(*packed)
+    ext = get_extension()
+    if causal:
+        return ext.fp4_attention_causal_nvfp4_packed(*packed)
+    return ext.fp4_attention_noncausal_nvfp4_packed(*packed)
 
 
 def attention(
@@ -51,7 +53,6 @@ def attention(
     block_size: int = 64,
 ) -> torch.Tensor:
     """Run ThriftAttention with separate block selection and NVFP4 quantization."""
-    require_causal(causal)
     check_qkv(q, k, v)
     if block_size != 64:
         raise NotImplementedError("the current CUDA attention kernel uses 64-token KV blocks")
@@ -71,7 +72,13 @@ def attention(
         block_size=block_size,
     )
     packed = _quantize_qkv(q, k, v)
-    return get_extension().thrift_attention_causal_nvfp4_packed(
+    ext = get_extension()
+    fn = (
+        ext.thrift_attention_causal_nvfp4_packed
+        if causal
+        else ext.thrift_attention_noncausal_nvfp4_packed
+    )
+    return fn(
         q,
         k,
         v,

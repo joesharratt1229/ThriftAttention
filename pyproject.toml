@@ -10,5 +10,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["torch"]
 
+[project.optional-dependencies]
+hf = ["transformers>=4.52"]
+
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -17,6 +17,12 @@ The fused quantize-and-mean experiment is intentionally not part of this library
 pip install -e .
 ```
 
+Install the optional Hugging Face Transformers integration with:
+
+```bash
+pip install -e ".[hf]"
+```
+
 The current CUDA extension targets SM120 (`TORCH_CUDA_ARCH_LIST=12.0a`).
 
 ## API Sketch
