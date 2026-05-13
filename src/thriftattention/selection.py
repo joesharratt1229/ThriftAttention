@@ -4,13 +4,14 @@ import math
 
 import torch
 
-from ._checks import check_qkv, require_block_aligned, require_causal
+from ._checks import check_qkv, require_block_aligned
 from ._extension import get_extension
 
 
 def resolve_top_k(
     num_blocks: int,
     *,
+    causal: bool = True,
     top_k: int | None = None,
     fraction: float | None = None,
 ) -> int:
@@ -26,6 +27,9 @@ def resolve_top_k(
         return 0
     if fraction >= 1.0:
         return num_blocks
+
+    if not causal:
+        return max(1, min(num_blocks, round(fraction * num_blocks)))
 
     # Fixed top_k under causal attention promotes:
     #   k*n - k*(k-1)/2
@@ -72,13 +76,17 @@ def select_block_pairs(
     """Return selected KV blocks for each query block."""
     if method != "block_mean":
         raise NotImplementedError(f"selector {method!r} is not implemented")
-    require_causal(causal)
     check_qkv(q, k, k)
     require_block_aligned("q", q.shape[2], block_size)
     require_block_aligned("k", k.shape[2], block_size)
 
     num_kv_blocks = k.shape[2] // block_size
-    selected_count = resolve_top_k(num_kv_blocks, top_k=top_k, fraction=fraction)
+    selected_count = resolve_top_k(
+        num_kv_blocks,
+        causal=causal,
+        top_k=top_k,
+        fraction=fraction,
+    )
     if selected_count == 0:
         return torch.empty(
             q.shape[0] * q.shape[1],
@@ -91,7 +99,7 @@ def select_block_pairs(
     q_mean = block_means(q, block_size=block_size)
     k_mean = _expand_kv_heads(q, block_means(k, block_size=block_size))
     if num_kv_blocks <= 2048:
-        return get_extension().block_mean_topk(q_mean, k_mean, selected_count)
+        return get_extension().block_mean_topk(q_mean, k_mean, selected_count, causal)
 
     scores = (
         q_mean.reshape(q.shape[0] * q.shape[1], q_mean.shape[2], q.shape[3]).float()
@@ -99,13 +107,15 @@ def select_block_pairs(
         .float()
         .transpose(-1, -2)
     )
-    mask = torch.triu(
-        torch.ones(q_mean.shape[2], num_kv_blocks, device=q.device, dtype=torch.bool),
-        diagonal=1,
-    )
-    scores.masked_fill_(mask.unsqueeze(0), float("-inf"))
+    if causal:
+        mask = torch.triu(
+            torch.ones(q_mean.shape[2], num_kv_blocks, device=q.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        scores.masked_fill_(mask.unsqueeze(0), float("-inf"))
     indices = scores.topk(selected_count, dim=-1).indices.to(torch.int32)
-    valid_counts = torch.arange(1, q_mean.shape[2] + 1, device=q.device).clamp(max=num_kv_blocks)
-    ranks = torch.arange(selected_count, device=q.device)
-    indices.masked_fill_(ranks.view(1, 1, -1) >= valid_counts.view(1, -1, 1), -1)
+    if causal:
+        valid_counts = torch.arange(1, q_mean.shape[2] + 1, device=q.device).clamp(max=num_kv_blocks)
+        ranks = torch.arange(selected_count, device=q.device)
+        indices.masked_fill_(ranks.view(1, 1, -1) >= valid_counts.view(1, -1, 1), -1)
     return indices.contiguous()

@@ -164,8 +164,8 @@ def make_sage_fp4(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, causal: 
     return run
 
 
-def selected_top_k(seq_len: int, coverage: float, block_size: int = 64) -> int:
-    return ta.resolve_top_k(seq_len // block_size, fraction=coverage)
+def selected_top_k(seq_len: int, coverage: float, *, causal: bool, block_size: int = 64) -> int:
+    return ta.resolve_top_k(seq_len // block_size, causal=causal, fraction=coverage)
 
 
 def build_specs(
@@ -188,23 +188,29 @@ def build_specs(
                     fn,
                 )
             )
-    if args.causal and not args.skip_fp4:
+    if not args.skip_fp4:
         specs.append(
             BenchmarkSpec(
                 "ta_fp4_attention",
                 None,
                 None,
-                lambda: ta.fp4_attention(q, k, v, causal=True),
+                lambda: ta.fp4_attention(q, k, v, causal=args.causal),
             )
         )
-    if args.causal and not args.skip_thrift:
+    if not args.skip_thrift:
         for coverage in args.coverages:
             specs.append(
                 BenchmarkSpec(
                     f"thrift_{coverage * 100:g}pct",
                     coverage,
-                    selected_top_k(seq_len, coverage),
-                    lambda coverage=coverage: ta.attention(q, k, v, causal=True, fraction=coverage),
+                    selected_top_k(seq_len, coverage, causal=args.causal),
+                    lambda coverage=coverage: ta.attention(
+                        q,
+                        k,
+                        v,
+                        causal=args.causal,
+                        fraction=coverage,
+                    ),
                 )
             )
 
@@ -389,18 +395,6 @@ def main() -> None:
         q, k, v = make_qkv(args, seq_len)
         print(f"Running seq={seq_len}, batch={args.batch_size}, heads={args.heads}, kv_heads={args.kv_heads}, dim={args.head_dim}")
         specs = build_specs(args, q, k, v, seq_len)
-
-        if not args.skip_thrift and not args.causal:
-            result = BenchmarkResult(
-                seq_len,
-                "thrift",
-                None,
-                None,
-                "skip",
-                note="ThriftAttention currently exposes causal kernels only",
-            )
-            all_results.append(result)
-            print(f"  SKIP thrift: {result.note}")
 
         for spec in specs:
             result = run_spec(args, seq_len, spec)
