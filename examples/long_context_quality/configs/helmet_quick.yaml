@@ -1,0 +1,9 @@
+model: Qwen/Qwen3-8B
+lengths: [4096, 8192]
+tasks: [json_kv, retrieval, long_qa]
+methods: [fp16, fp4, thrift]
+fraction: 0.05
+num_examples: 2
+seed: 1234
+device: cuda
+output: results/long_context_quality

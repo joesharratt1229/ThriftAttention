@@ -1,0 +1,10 @@
+model: Qwen/Qwen3-8B
+dataset: pg19
+dataset_split: test
+lengths: [8192, 32768, 65536, 131072]
+methods: [fp16, fp4, thrift]
+fractions: [0.05, 0.10, 0.25]
+num_docs: 4
+seed: 1234
+device: cuda
+output: results/long_context_quality
