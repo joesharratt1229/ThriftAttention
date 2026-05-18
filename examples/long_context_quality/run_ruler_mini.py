@@ -38,9 +38,11 @@ def main() -> None:
     args = parser.parse_args()
 
     import torch
-    import thriftattention as ta
-    from thriftattention.config import AttentionConfig
-    from thriftattention.integrations.transformers import prepare_transformers_generation_cache
+    from thriftattention.integrations.transformers import (
+        TransformersAttentionConfig,
+        prepare_transformers_generation_cache,
+        register_transformers_attention,
+    )
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     lengths = [int(x) for x in args.lengths.replace(" ", ",").split(",") if x.strip()]
@@ -76,21 +78,22 @@ def main() -> None:
         run_fractions = fractions if method == "thrift" else [None]
 
         for fraction in run_fractions:
-            ta.unpatch_model(model, backend="hf")
             config = None
             label = f"thrift_{fraction * 100:g}pct".replace(".", "p") if method == "thrift" else method
 
             if method == "fp16":
+                model.set_attn_implementation(FLASH_ATTN_IMPLEMENTATION)
                 print(f"\n{label}: fp16 FlashAttention 2")
             else:
-                config = AttentionConfig(
+                impl_name = "thrift_fp4" if method == "fp4" else f"thrift_attention_{fraction * 100:g}pct".replace(".", "p")
+                config = TransformersAttentionConfig(
+                    name=impl_name,
                     mode="fp4" if method == "fp4" else "thrift",
                     fp16_fraction=0.0 if fraction is None else fraction,
-                    backend="hf",
-                    patch_generation=False,
                 )
-                ta.patch_model(model, backend="hf", mode=config.mode, fp16_fraction=config.fp16_fraction, patch_generation=False)
-                print(f"\n{label}: patched {config.mode}")
+                attn_impl = register_transformers_attention(config)
+                model.set_attn_implementation(attn_impl)
+                print(f"\n{label}: registered {attn_impl}")
 
             for length in lengths:
                 for task in tasks:

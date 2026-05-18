@@ -22,7 +22,7 @@ METHODS = {
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Mini forward/NLL benchmark for patched HF models.")
+    parser = argparse.ArgumentParser(description="Mini forward/NLL benchmark for registered HF attention implementations.")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--lengths", default="131072")
     parser.add_argument("--methods", default="fp16,fp4,thrift")
@@ -37,7 +37,10 @@ def main() -> None:
 
     import torch
     import torch.nn.functional as F
-    import thriftattention as ta
+    from thriftattention.integrations.transformers import (
+        TransformersAttentionConfig,
+        register_transformers_attention,
+    )
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     lengths = [int(x) for x in args.lengths.replace(" ", ",").split(",") if x.strip()]
@@ -81,20 +84,22 @@ def main() -> None:
         run_fractions = fractions if method == "thrift" else [None]
 
         for fraction in run_fractions:
-            ta.unpatch_model(model, backend="hf")
             label = f"thrift_{fraction * 100:g}pct".replace(".", "p") if method == "thrift" else method
 
             if method == "fp16":
+                model.set_attn_implementation(FLASH_ATTN_IMPLEMENTATION)
                 print(f"\n{label}: fp16 FlashAttention 2")
             else:
-                ta.patch_model(
-                    model,
-                    backend="hf",
-                    mode="fp4" if method == "fp4" else "thrift",
-                    fp16_fraction=0.0 if fraction is None else fraction,
-                    patch_generation=False,
+                impl_name = "thrift_fp4" if method == "fp4" else f"thrift_attention_{fraction * 100:g}pct".replace(".", "p")
+                attn_impl = register_transformers_attention(
+                    TransformersAttentionConfig(
+                        name=impl_name,
+                        mode="fp4" if method == "fp4" else "thrift",
+                        fp16_fraction=0.0 if fraction is None else fraction,
+                    )
                 )
-                print(f"\n{label}: patched {method}")
+                model.set_attn_implementation(attn_impl)
+                print(f"\n{label}: registered {attn_impl}")
 
             for length in lengths:
                 values, seconds = [], []

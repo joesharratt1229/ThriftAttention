@@ -343,7 +343,7 @@ def _fast_path_rejection_reason(
     kwargs: dict[str, Any],
 ) -> str | None:
     if getattr(module, "training", False):
-        return "ThriftAttention inference patch does not run while the attention module is in training mode"
+        return "ThriftAttention registered attention does not run while the attention module is in training mode"
     if kwargs.get("output_attentions", False):
         return "ThriftAttention does not return attention weights"
 
