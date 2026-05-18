@@ -4,17 +4,23 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-AttentionMode = Literal["thrift", "fp4"]
+AttentionMethod = Literal["thrift", "fp4"]
 SelectionMethod = Literal["block_mean"]
+QuantFormatName = Literal["nvfp4"]
+AttentionBackendName = Literal["auto", "sm120"]
+AttentionImplementation = Literal["auto", "tiled", "single_query"]
 FallbackBackend = Literal["error"]
 
 
 @dataclass(frozen=True)
 class AttentionConfig:
-    mode: AttentionMode = "thrift"
+    method: AttentionMethod = "thrift"
     causal: bool = True
-    selector: SelectionMethod = "block_mean"
-    fp16_fraction: float = 0.05
+    selection: SelectionMethod = "block_mean"
+    fraction: float | None = 0.05
     top_k: int | None = None
     block_size: int = 64
+    quant_format: QuantFormatName = "nvfp4"
+    backend: AttentionBackendName = "auto"
+    implementation: AttentionImplementation = "auto"
     fallback: FallbackBackend = "error"

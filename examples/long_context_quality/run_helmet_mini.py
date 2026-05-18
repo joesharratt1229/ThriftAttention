@@ -16,9 +16,6 @@ DEFAULT_MODEL = "Qwen/Qwen3-8B"
 FLASH_ATTN_IMPLEMENTATION = "flash_attention_2"
 METHODS = {
     "fp16": "fp16",
-    "flash": "fp16",
-    "flashattn": "fp16",
-    "flash-attn": "fp16",
     "fp4": "fp4",
     "thrift": "thrift",
 }
@@ -91,8 +88,8 @@ def main() -> None:
                 impl_name = "thrift_fp4" if method == "fp4" else f"thrift_attention_{fraction * 100:g}pct".replace(".", "p")
                 config = TransformersAttentionConfig(
                     name=impl_name,
-                    mode="fp4" if method == "fp4" else "thrift",
-                    fp16_fraction=0.0 if fraction is None else fraction,
+                    method="fp4" if method == "fp4" else "thrift",
+                    fraction=0.0 if fraction is None else fraction,
                 )
                 attn_impl = register_transformers_attention(config)
                 model.set_attn_implementation(attn_impl)

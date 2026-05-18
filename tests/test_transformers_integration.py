@@ -40,13 +40,13 @@ def test_register_transformers_attention_registers_custom_name(monkeypatch):
     monkeypatch.setattr(hf, "_register_attention_mask", register_mask)
 
     name = hf.register_transformers_attention(
-        hf.TransformersAttentionConfig(name="unit_thrift_attention", mode="fp4")
+        hf.TransformersAttentionConfig(name="unit_thrift_attention", method="fp4")
     )
 
     assert name == "unit_thrift_attention"
     assert registered["unit_thrift_attention"] is hf.thriftattention_forward
     assert masks["unit_thrift_attention"] is True
-    assert hf.get_registered_transformers_attention_config("unit_thrift_attention").mode == "fp4"
+    assert hf.get_registered_transformers_attention_config("unit_thrift_attention").method == "fp4"
 
 
 def test_registered_attention_config_is_used_without_model_mutation(monkeypatch):
@@ -86,7 +86,7 @@ def test_prepare_transformers_generation_cache_uses_registered_model_config(monk
 
     _stub_attention_registry(monkeypatch, hf)
     hf.register_transformers_attention(
-        hf.TransformersAttentionConfig(name="unit_cache", fp16_fraction=0.05)
+        hf.TransformersAttentionConfig(name="unit_cache", fraction=0.05)
     )
 
     child = SimpleNamespace()
@@ -123,14 +123,14 @@ def test_active_cache_config_overrides_registered_config(monkeypatch):
     )
 
     _stub_attention_registry(monkeypatch, hf)
-    hf.register_transformers_attention(hf.TransformersAttentionConfig(name="unit_cache_override", mode="fp4"))
+    hf.register_transformers_attention(hf.TransformersAttentionConfig(name="unit_cache_override", method="fp4"))
     module = SimpleNamespace(config=SimpleNamespace(_attn_implementation="unit_cache_override"))
-    cache = ThriftAttentionCache(config=AttentionConfig(mode="thrift", top_k=7))
+    cache = ThriftAttentionCache(config=AttentionConfig(method="thrift", top_k=7))
 
     with use_thriftattention_cache(cache):
         resolved = hf._module_config(module)
 
-    assert resolved.mode == "thrift"
+    assert resolved.method == "thrift"
     assert resolved.top_k == 7
 
 
@@ -182,7 +182,7 @@ def test_adapter_fast_path_transposes_thrift_output(monkeypatch):
     value = torch.randn(1, 2, 64, 64)
 
     def fake_attention(q, k, v, **kwargs):
-        assert kwargs["selector"] == "block_mean"
+        assert kwargs["config"].selection == "block_mean"
         return torch.zeros(1, 2, 64, 64)
 
     monkeypatch.setattr(hf, "_fast_path_rejection_reason", lambda *args, **kwargs: None)
@@ -211,7 +211,7 @@ def test_adapter_fast_path_passes_noncausal_mode(monkeypatch):
     value = torch.randn(1, 2, 64, 64)
 
     def fake_attention(q, k, v, **kwargs):
-        assert kwargs["causal"] is False
+        assert kwargs["config"].causal is False
         return torch.zeros(1, 2, 64, 64)
 
     monkeypatch.setattr(hf, "_fast_path_rejection_reason", lambda *args, **kwargs: None)

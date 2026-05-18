@@ -94,8 +94,8 @@ def main() -> None:
                 attn_impl = register_transformers_attention(
                     TransformersAttentionConfig(
                         name=impl_name,
-                        mode="fp4" if method == "fp4" else "thrift",
-                        fp16_fraction=0.0 if fraction is None else fraction,
+                        method="fp4" if method == "fp4" else "thrift",
+                        fraction=0.0 if fraction is None else fraction,
                     )
                 )
                 model.set_attn_implementation(attn_impl)

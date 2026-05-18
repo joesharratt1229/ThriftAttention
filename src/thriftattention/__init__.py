@@ -1,22 +1,16 @@
-from .functional import attention, fp4_attention
+from .config import AttentionConfig
+from .functional import attention
 from .integrations.transformers_cache import ThriftAttentionCache
-from .quantization import (
-    nvfp4_quantize,
-    nvfp4_quantize_permuted,
-    nvfp4_quantize_transposed,
-    nvfp4_quantize_transposed_permuted,
-)
-from .selection import block_means, resolve_top_k, select_block_pairs
+from .quant import QuantFormat, get_quant_format
+from .selection import SelectionConfig, get_selection_policy, resolve_top_k
 
 __all__ = [
+    "AttentionConfig",
     "attention",
-    "fp4_attention",
     "ThriftAttentionCache",
-    "nvfp4_quantize",
-    "nvfp4_quantize_permuted",
-    "nvfp4_quantize_transposed",
-    "nvfp4_quantize_transposed_permuted",
-    "block_means",
+    "QuantFormat",
+    "get_quant_format",
+    "SelectionConfig",
+    "get_selection_policy",
     "resolve_top_k",
-    "select_block_pairs",
 ]

@@ -6,9 +6,16 @@ from typing import Any, Callable
 
 import torch
 
-from ..config import AttentionConfig, AttentionMode, FallbackBackend, SelectionMethod
+from ..config import (
+    AttentionBackendName,
+    AttentionConfig,
+    AttentionImplementation,
+    AttentionMethod,
+    FallbackBackend,
+    QuantFormatName,
+    SelectionMethod,
+)
 from ..functional import attention as thrift_attention
-from ..functional import fp4_attention
 from ..selection import resolve_top_k
 from .transformers_cache import (
     ThriftAttentionCache,
@@ -26,22 +33,32 @@ _REGISTERED_CONFIGS: dict[str, AttentionConfig] = {}
 @dataclass(frozen=True)
 class TransformersAttentionConfig:
     name: str = DEFAULT_TRANSFORMERS_ATTENTION_NAME
-    mode: AttentionMode = "thrift"
+    method: AttentionMethod = "thrift"
     causal: bool = True
-    selector: SelectionMethod = "block_mean"
-    fp16_fraction: float = 0.05
+    selection: SelectionMethod = "block_mean"
+    fraction: float | None = 0.05
     top_k: int | None = None
     block_size: int = 64
+    quant_format: QuantFormatName = "nvfp4"
+    backend: AttentionBackendName = "auto"
+    implementation: AttentionImplementation = "auto"
     fallback: FallbackBackend = "error"
 
     def attention_config(self) -> AttentionConfig:
         return AttentionConfig(
-            mode=_validate_choice("mode", self.mode, ("thrift", "fp4")),
+            method=_validate_choice("method", self.method, ("thrift", "fp4")),
             causal=bool(self.causal),
-            selector=_validate_choice("selector", self.selector, ("block_mean",)),
-            fp16_fraction=_validate_fraction(self.fp16_fraction),
+            selection=_validate_choice("selection", self.selection, ("block_mean",)),
+            fraction=_validate_fraction(self.fraction),
             top_k=_validate_top_k(self.top_k),
             block_size=_validate_block_size(self.block_size),
+            quant_format=_validate_choice("quant_format", self.quant_format, ("nvfp4",)),
+            backend=_validate_choice("backend", self.backend, ("auto", "sm120")),
+            implementation=_validate_choice(
+                "implementation",
+                self.implementation,
+                ("auto", "tiled", "single_query"),
+            ),
             fallback=_validate_choice("fallback", self.fallback, ("error",)),
         )
 
@@ -179,22 +196,7 @@ def thriftattention_forward(
             **kwargs,
         )
 
-    if config.mode == "thrift":
-        output = thrift_attention(
-            query,
-            key,
-            value,
-            causal=config.causal,
-            selector=config.selector,
-            top_k=config.top_k,
-            fraction=config.fp16_fraction,
-            block_size=config.block_size,
-        )
-    elif config.mode == "fp4":
-        output = fp4_attention(query, key, value, causal=config.causal)
-    else:
-        raise ValueError(f"unsupported ThriftAttention mode {config.mode!r}")
-
+    output = thrift_attention(query, key, value, config=config)
     return output.transpose(1, 2).contiguous(), None
 
 
@@ -277,10 +279,10 @@ def _coerce_attention_config(config: AttentionConfig | TransformersAttentionConf
 
 
 def _generation_cache_config(config: AttentionConfig, prompt_length: int) -> AttentionConfig:
-    if config.mode != "thrift" or config.top_k is not None:
+    if config.method != "thrift" or config.top_k is not None:
         return config
     blocks = max(prompt_length // config.block_size, 1)
-    top_k = resolve_top_k(blocks, causal=True, fraction=config.fp16_fraction)
+    top_k = resolve_top_k(blocks, causal=True, fraction=config.fraction)
     return replace(config, top_k=top_k)
 
 
@@ -310,10 +312,12 @@ def _validate_choice(name: str, value: str, choices: tuple[str, ...]) -> str:
     return value
 
 
-def _validate_fraction(value: float) -> float:
+def _validate_fraction(value: float | None) -> float | None:
+    if value is None:
+        return None
     value = float(value)
     if not 0.0 <= value <= 1.0:
-        raise ValueError(f"fp16_fraction must be in [0, 1], got {value!r}")
+        raise ValueError(f"fraction must be in [0, 1], got {value!r}")
     return value
 
 
@@ -382,13 +386,13 @@ def _fast_path_rejection_reason(
     if key.shape[2] % config.block_size != 0:
         return f"key/value length must be divisible by {config.block_size}"
 
-    if config.mode == "thrift":
+    if config.method == "thrift":
         kv_blocks = key.shape[2] // config.block_size
         selected = resolve_top_k(
             kv_blocks,
             causal=config.causal,
             top_k=config.top_k,
-            fraction=config.fp16_fraction,
+            fraction=config.fraction,
         )
         if query.shape[2] != 1 and selected > 0 and kv_blocks > 2048:
             return "ThriftAttention currently supports at most 2048 selected KV blocks"

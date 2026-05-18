@@ -204,7 +204,16 @@ def build_specs(
                 "ta_fp4_attention",
                 None,
                 None,
-                lambda: ta.fp4_attention(q, k, v, causal=args.causal, _implementation=impl),
+                lambda: ta.attention(
+                    q,
+                    k,
+                    v,
+                    config=ta.AttentionConfig(
+                        method="fp4",
+                        causal=args.causal,
+                        implementation=impl,
+                    ),
+                ),
             )
         )
     if not args.skip_thrift:
@@ -218,9 +227,12 @@ def build_specs(
                         q,
                         k,
                         v,
-                        causal=args.causal,
-                        fraction=coverage,
-                        _implementation=impl,
+                        config=ta.AttentionConfig(
+                            method="thrift",
+                            causal=args.causal,
+                            fraction=coverage,
+                            implementation=impl,
+                        ),
                     ),
                 )
             )

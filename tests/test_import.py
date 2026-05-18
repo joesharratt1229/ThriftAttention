@@ -6,5 +6,6 @@ def test_public_imports():
     import thriftattention as ta
 
     assert callable(ta.attention)
-    assert callable(ta.fp4_attention)
-    assert callable(ta.select_block_pairs)
+    assert ta.AttentionConfig().method == "thrift"
+    assert callable(ta.get_quant_format)
+    assert callable(ta.get_selection_policy)

@@ -4,8 +4,9 @@ import math
 
 import torch
 
-from ._checks import check_qkv, require_block_aligned
-from ._extension import get_extension
+from thriftattention._checks import check_qkv, require_block_aligned
+from thriftattention._extension import get_extension
+from thriftattention.selection.base import SelectionConfig
 
 
 def resolve_top_k(
@@ -64,14 +65,11 @@ def select_block_pairs(
     k: torch.Tensor,
     *,
     causal: bool = True,
-    method: str = "block_mean",
     top_k: int | None = None,
     fraction: float | None = 0.05,
     block_size: int = 64,
 ) -> torch.Tensor:
     """Return selected KV blocks for each query block."""
-    if method != "block_mean":
-        raise NotImplementedError(f"selector {method!r} is not implemented")
     check_qkv(q, k, k)
     require_block_aligned("q", q.shape[2], block_size)
     require_block_aligned("k", k.shape[2], block_size)
@@ -121,14 +119,11 @@ def select_key_blocks(
     q: torch.Tensor,
     k: torch.Tensor,
     *,
-    method: str = "block_mean",
     top_k: int | None = None,
     fraction: float | None = 0.05,
     block_size: int = 64,
 ) -> torch.Tensor:
     """Return selected KV blocks for single-query attention."""
-    if method != "block_mean":
-        raise NotImplementedError(f"selector {method!r} is not implemented")
     check_qkv(q, k, k)
     if q.shape[2] != 1:
         raise ValueError("single-query block selection expects q sequence length 1")
@@ -157,3 +152,34 @@ def select_key_blocks(
     scores = (q_grouped.float().unsqueeze(3) * k_mean.float().unsqueeze(2)).sum(dim=-1)
     scores = scores.amax(dim=2).reshape(batch * kv_heads, num_kv_blocks)
     return scores.topk(selected_count, dim=-1).indices.to(torch.int32).contiguous()
+
+
+class BlockMeanSelectionPolicy:
+    name = "block_mean"
+
+    def select(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        *,
+        config: SelectionConfig,
+        causal: bool,
+    ) -> torch.Tensor:
+        if config.name != self.name:
+            raise ValueError(f"selection config {config.name!r} does not match block_mean policy")
+        if q.shape[2] == 1:
+            return select_key_blocks(
+                q,
+                k,
+                top_k=config.top_k,
+                fraction=config.fraction,
+                block_size=config.block_size,
+            )
+        return select_block_pairs(
+            q,
+            k,
+            causal=causal,
+            top_k=config.top_k,
+            fraction=config.fraction,
+            block_size=config.block_size,
+        )

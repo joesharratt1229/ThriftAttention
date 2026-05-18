@@ -8,8 +8,9 @@ from typing import Any, Iterator
 import torch
 
 from ..config import AttentionConfig
-from ..functional import _group_single_query, _ungroup_single_query
-from ..quantization import nvfp4_quantize, nvfp4_quantize_permuted, nvfp4_quantize_transposed
+from ..backends.single_query import _group_single_query, _ungroup_single_query
+from ..quant.formats import get_quant_format
+from ..quantization import nvfp4_quantize, nvfp4_quantize_transposed
 from ..selection import resolve_top_k
 from .._extension import get_extension
 
@@ -563,10 +564,11 @@ def cached_decode_attention(
     q = query.contiguous()
     kv_heads = layer.key_view().shape[1]
     q_grouped = _group_single_query(q, kv_heads)
-    q_packed, q_scale = nvfp4_quantize(q_grouped)
+    quant_format = get_quant_format(config.quant_format)
+    q_packed, q_scale = quant_format.quantize(q_grouped)
     k_packed, v_packed_t, k_scale, v_scale_t = layer.packed_views()
 
-    if config.mode == "fp4":
+    if config.method == "fp4":
         out = get_extension().fp4_attention_single_query_nvfp4_packed(
             q_packed,
             k_packed,
@@ -577,13 +579,13 @@ def cached_decode_attention(
         )
         return _ungroup_single_query(out, q.shape[1])
 
-    if config.mode != "thrift":
-        raise ValueError(f"unsupported ThriftAttention mode {config.mode!r}")
+    if config.method != "thrift":
+        raise ValueError(f"unsupported ThriftAttention method {config.method!r}")
 
     selected_blocks = layer.select_key_blocks(
         q_grouped,
         top_k=config.top_k,
-        fraction=config.fp16_fraction,
+        fraction=config.fraction,
         block_size=config.block_size,
     )
     out = get_extension().thrift_attention_single_query_nvfp4_packed(
@@ -611,12 +613,15 @@ def cached_prefill_attention(
     q = query.contiguous()
     k_fp16 = layer.key_view().contiguous()
     v_fp16 = layer.value_view().contiguous()
-    q_packed, q_scale = nvfp4_quantize(q)
-    k_packed, k_scale = nvfp4_quantize_permuted(k_fp16)
-    v_packed_t, v_scale_t = nvfp4_quantize_transposed(v_fp16)
+    quant_format = get_quant_format(config.quant_format)
+    q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t = quant_format.quantize_qkv(
+        q,
+        k_fp16,
+        v_fp16,
+    )
     ext = get_extension()
 
-    if config.mode == "fp4":
+    if config.method == "fp4":
         fn = (
             ext.fp4_attention_causal_nvfp4_packed
             if config.causal
@@ -624,8 +629,8 @@ def cached_prefill_attention(
         )
         return fn(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t)
 
-    if config.mode != "thrift":
-        raise ValueError(f"unsupported ThriftAttention mode {config.mode!r}")
+    if config.method != "thrift":
+        raise ValueError(f"unsupported ThriftAttention method {config.method!r}")
 
     selected_blocks = _select_block_pairs_from_cached_means(
         q,
@@ -669,7 +674,7 @@ def _select_block_pairs_from_cached_means(
         num_kv_blocks,
         causal=config.causal,
         top_k=config.top_k,
-        fraction=config.fp16_fraction,
+        fraction=config.fraction,
     )
     if selected_count == 0:
         return torch.empty(
