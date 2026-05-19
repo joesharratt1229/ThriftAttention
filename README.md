@@ -60,3 +60,6 @@ Prerequisites:
 python -m pip install 'torch>=2.8.0'
 python -m pip install -e . --no-build-isolation
 ```
+
+## Citation
+TODO
