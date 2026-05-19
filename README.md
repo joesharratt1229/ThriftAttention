@@ -2,8 +2,6 @@
 
 **ThriftAttention: Selective Mixed Precision for Long-Context FP4 Attention**
 
-Joe Sharratt
-
 Paper: TODO add arxiv Link
 
 <figure>
