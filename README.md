@@ -31,7 +31,7 @@ Paper: TODO add arxiv Link
 
 Average performance of Qwen3-8B, Ministral3-8B and Llama3-8B on Helmet, Ruler and LongBench-V1 long context benchmarks
 
-## API
+## Usage
 
 ```python
 import torch
@@ -46,6 +46,7 @@ out = ta.attention(q, k, v)
 
 Q is shaped `[batch, query_heads, query_len, head_dim]`; K and V are shaped `[batch, kv_heads, kv_len, head_dim]`.
 
+## Integration with Transformers library
 ```python
 import torch
 from transformers import AutoModelForCausalLM
