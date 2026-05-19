@@ -39,12 +39,11 @@ Average performance of Qwen3-8B, Ministral3-8B and Llama3-8B on Helmet, Ruler an
 import torch
 import thriftattention as ta
 
-q = torch.randn(1, 32, 4096, 128, device="cuda", dtype=torch.float16)
-k = torch.randn(1, 32, 4096, 128, device="cuda", dtype=torch.float16)
-v = torch.randn(1, 32, 4096, 128, device="cuda", dtype=torch.float16)
+q = torch.randn(1, 32, 32768, 128, device="cuda", dtype=torch.float16)
+k = torch.randn(1, 32, 32768, 128, device="cuda", dtype=torch.float16)
+v = torch.randn(1, 32, 32768, 128, device="cuda", dtype=torch.float16)
 
 out = ta.attention(q, k, v)
-assert out.shape == q.shape
 ```
 
 Q is shaped `[batch, query_heads, query_len, head_dim]`; K and V are shaped `[batch, kv_heads, kv_len, head_dim]`.
