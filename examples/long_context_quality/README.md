@@ -9,7 +9,7 @@ pip install -r examples/long_context_quality/requirements.txt
 
 ## Forward / NLL
 
-Runs forward pass of chosen model and records mean NLL across token positions between fp4, fp16 and ThriftAttention. Pass `--text-file` for a local corpus.
+Runs forward pass of chosen model and records mean NLL across token positions between fp4, fp16 and ThriftAttention. By default it streams real text from `emozilla/pg19`; pass `--text-file` for a local corpus.
 
 ```bash
 python examples/long_context_quality/run_nll_mini.py --lengths 65536 --methods fp16,fp4,thrift

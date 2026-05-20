@@ -13,6 +13,7 @@ from statistics import fmean
 
 
 DEFAULT_MODEL = "Qwen/Qwen3-8B"
+DEFAULT_DATASET = "emozilla/pg19"
 FLASH_ATTN_IMPLEMENTATION = "flash_attention_2"
 METHODS = {
     "fp16": "fp16",
@@ -21,9 +22,43 @@ METHODS = {
 }
 
 
+def load_text_file_docs(tokenizer, path: Path, *, length: int, num_docs: int) -> list[list[int]]:
+    text = path.read_text(encoding="utf-8")
+    ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    required = length * num_docs
+    if len(ids) < required:
+        raise SystemExit(
+            f"{path} only tokenized to {len(ids)} tokens, but this run needs "
+            f"{required} tokens ({num_docs} docs x {length})."
+        )
+    return [ids[i * length : (i + 1) * length] for i in range(num_docs)]
+
+
+def load_pg19_docs(tokenizer, *, dataset: str, length: int, num_docs: int, seed: int) -> list[list[int]]:
+    from datasets import load_dataset
+
+    required = length * num_docs
+    eos = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.bos_token_id
+    buffer: list[int] = []
+
+    print(f"Loading {num_docs} x {length} real tokens from {dataset}")
+    ds = load_dataset(dataset, split="train", streaming=True).shuffle(seed=seed, buffer_size=200)
+    for sample in ds:
+        buffer.extend(tokenizer(sample["text"], add_special_tokens=False)["input_ids"])
+        if eos is not None:
+            buffer.append(eos)
+        if len(buffer) >= required:
+            break
+
+    if len(buffer) < required:
+        raise SystemExit(f"{dataset} only yielded {len(buffer)} tokens, but this run needs {required}.")
+    return [buffer[i * length : (i + 1) * length] for i in range(num_docs)]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Mini forward/NLL benchmark for registered HF attention implementations.")
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--lengths", default="131072")
     parser.add_argument("--methods", default="fp16,fp4,thrift")
     parser.add_argument("--fractions", default="0.05")
@@ -69,10 +104,18 @@ def main() -> None:
         attn_implementation=FLASH_ATTN_IMPLEMENTATION,
     ).to(args.device).eval()
 
-    text = args.text_file.read_text(encoding="utf-8") if args.text_file else "ThriftAttention mini NLL text. "
-    ids = tokenizer(text, add_special_tokens=False)["input_ids"] or [tokenizer.eos_token_id or 0]
-    ids = (ids * math.ceil(max(lengths) / len(ids)))[: max(lengths)]
-    docs = [ids[:] for _ in range(args.num_docs)]
+    max_length = max(lengths)
+    docs = (
+        load_text_file_docs(tokenizer, args.text_file, length=max_length, num_docs=args.num_docs)
+        if args.text_file
+        else load_pg19_docs(
+            tokenizer,
+            dataset=args.dataset,
+            length=max_length,
+            num_docs=args.num_docs,
+            seed=args.seed,
+        )
+    )
 
     body = getattr(model, getattr(model, "base_model_prefix", ""), None)
     for name in ("model", "transformer", "gpt_neox", "backbone"):
