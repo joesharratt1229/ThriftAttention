@@ -76,7 +76,7 @@ def main() -> None:
         TransformersAttentionConfig,
         register_transformers_attention,
     )
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     lengths = [int(x) for x in args.lengths.replace(" ", ",").split(",") if x.strip()]
     methods = [x.strip() for x in args.methods.split(",") if x.strip()]
@@ -98,8 +98,19 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
+    config = AutoConfig.from_pretrained(args.model)
+    if max(lengths) > 32768:
+        max_pos = max(lengths)
+        original = 32768
+        config.max_position_embeddings = max_pos
+        config.rope_scaling = {
+            "rope_type": "yarn",
+            "factor": max_pos / original,
+            "original_max_position_embeddings": original,
+        }
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
+        config=config,
         torch_dtype=dtype,
         attn_implementation=FLASH_ATTN_IMPLEMENTATION,
     ).to(args.device).eval()
