@@ -103,6 +103,8 @@ def main() -> None:
         max_pos = max(lengths)
         original = 32768
         config.max_position_embeddings = max_pos
+        if getattr(config, "rope_theta", None) is None:
+            config.rope_theta = 1000000.0
         config.rope_scaling = {
             "rope_type": "yarn",
             "factor": max_pos / original,
