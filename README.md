@@ -8,7 +8,7 @@ Paper: TODO add arxiv Link
   <img width="1414" height="987" alt="pareto_frontier_131072" src="https://github.com/user-attachments/assets/25599d12-a851-4147-8e1a-36201eff4b04" />
 
   <figcaption>
-    <strong>Figure 1:</strong> Pareto frontier of performance vs inference efficiency trade-off at 131k context length. Quality recovery is measured as the percentage of the FP4-to-FP16 NLL gap recovered. 
+    <strong>Figure 1:</strong> Pareto frontier of quality vs inference efficiency trade-off at 131k context length. Quality recovery is measured as the percentage of the FP4-to-FP16 NLL gap recovered. 
   </figcaption>
 </figure>
 
