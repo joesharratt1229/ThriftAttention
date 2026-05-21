@@ -5,17 +5,12 @@
 Paper: TODO add arxiv Link
 
 <figure>
-  <img
-    width="1414"
-    height="987"
-    alt="Pareto frontier of ThriftAttention decode speedup and quality recovery at 131k context"
-    src="https://github.com/user-attachments/assets/46ec240a-40bf-4f5a-80a7-1d5832136801"
-  />
+  <img width="1414" height="987" alt="pareto_frontier_131072" src="https://github.com/user-attachments/assets/25599d12-a851-4147-8e1a-36201eff4b04" />
+
   <figcaption>
-    <strong>Figure 1:</strong> ThriftAttention approaches FP4 decode latency while preserving near-FP16 quality. Pareto frontier of performance vs inference efficiency trade-off at 131k context length on Qwen3-8B.
+    <strong>Figure 1:</strong> Pareto frontier of performance vs inference efficiency trade-off at 131k context length. Quality recovery is measured as the percentage of the FP4-to-FP16 NLL gap recovered. 
   </figcaption>
 </figure>
-\begin{tabular}{lcc}
 \toprule
 
 
