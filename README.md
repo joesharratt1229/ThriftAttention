@@ -8,8 +8,7 @@ Paper: TODO add arxiv Link
   <img width="1414" height="987" alt="pareto_frontier_131072" src="https://github.com/user-attachments/assets/25599d12-a851-4147-8e1a-36201eff4b04" />
 
   <figcaption>
-    <strong>Figure 1:</strong> Pareto frontier of NLL recovery vs inference efficiency at 131k context.
-  > length.
+    <strong>Figure 1:</strong> Pareto frontier of NLL recovery vs inference efficiency at 131k context length.
   </figcaption>
 </figure>
 
