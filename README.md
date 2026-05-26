@@ -2,7 +2,7 @@
 
 **ThriftAttention: Selective Mixed Precision for Long-Context FP4 Attention**
 
-https://arxiv.org/pdf/2605.23081
+[arxiv.org/abs/2605.23081](https://arxiv.org/pdf/2605.23081)
 
 <figure>
   <img width="1414" height="987" alt="pareto_frontier_131072" src="https://github.com/user-attachments/assets/25599d12-a851-4147-8e1a-36201eff4b04" />
