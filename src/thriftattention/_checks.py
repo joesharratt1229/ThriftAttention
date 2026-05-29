@@ -6,8 +6,8 @@ import torch
 def require_cuda_half(name: str, tensor: torch.Tensor) -> None:
     if not tensor.is_cuda:
         raise ValueError(f"{name} must be a CUDA tensor")
-    if tensor.dtype != torch.float16:
-        raise ValueError(f"{name} must have dtype torch.float16")
+    if tensor.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"{name} must have dtype torch.float16 or torch.bfloat16")
     if tensor.ndim != 4:
         raise ValueError(f"{name} must be 4D [batch, heads, seq, head_dim]")
 
@@ -21,6 +21,8 @@ def check_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
     require_cuda_half("q", q)
     require_cuda_half("k", k)
     require_cuda_half("v", v)
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise ValueError("q, k, and v must have the same dtype")
     if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
         raise ValueError("q, k, and v must have the same batch size")
     if k.shape[1] != v.shape[1]:

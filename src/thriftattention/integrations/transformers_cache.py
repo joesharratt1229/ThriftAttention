@@ -93,6 +93,10 @@ class ThriftAttentionCacheLayer:
             raise ValueError("KV cache tensors must be [batch, heads, seq, head_dim]")
         if key_states.shape != value_states.shape:
             raise ValueError("key_states and value_states must have identical shapes")
+        if key_states.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("KV cache tensors must be float16 or bfloat16")
+        if key_states.dtype != value_states.dtype:
+            raise ValueError("key_states and value_states must have the same dtype")
 
         key_states = key_states.contiguous()
         value_states = value_states.contiguous()
@@ -172,6 +176,9 @@ class ThriftAttentionCacheLayer:
         if self.k_mean is None:
             raise RuntimeError("ThriftAttention K block means have not been initialized")
 
+        is_bf16 = q_grouped.dtype == torch.bfloat16
+        if q_grouped.dtype != self.k_mean.dtype:
+            raise ValueError("q_grouped and cached K means must have the same dtype")
         ext = get_extension()
         if complete_blocks <= 2048 and hasattr(ext, "single_query_key_mean_topk_into"):
             topk, local_scores, local_indices, done_counts = self._ensure_selection_workspace(
@@ -187,6 +194,7 @@ class ThriftAttentionCacheLayer:
                 local_indices,
                 done_counts,
                 complete_blocks,
+                is_bf16,
             )
         if complete_blocks <= 2048 and hasattr(ext, "single_query_key_mean_topk"):
             return ext.single_query_key_mean_topk(
@@ -194,6 +202,7 @@ class ThriftAttentionCacheLayer:
                 self.k_mean,
                 selected_count,
                 complete_blocks,
+                is_bf16,
             )
 
         k_mean = self.k_mean[:, :, :complete_blocks]
@@ -246,6 +255,8 @@ class ThriftAttentionCacheLayer:
         if self.k_fp16 is not None:
             if like.shape[0] != self.k_fp16.shape[0] or like.shape[1] != self.k_fp16.shape[1]:
                 raise ValueError("ThriftAttentionCache batch/head shape changed unexpectedly")
+            if like.dtype != self.k_fp16.dtype:
+                raise ValueError("ThriftAttentionCache dtype changed unexpectedly")
             if required <= self.capacity:
                 return
 
@@ -296,7 +307,10 @@ class ThriftAttentionCacheLayer:
     def _quantize_k_range(self, key_states: torch.Tensor, start: int, end: int) -> None:
         assert self.k_packed is not None
         assert self.k_scale is not None
-        k_packed, k_scale = nvfp4_quantize(key_states)
+        k_packed, k_scale = nvfp4_quantize(
+            key_states,
+            is_bf16=key_states.dtype == torch.bfloat16,
+        )
         self.k_packed[:, :, start:end] = k_packed
         self.k_scale[:, :, start:end] = k_scale
 
@@ -307,7 +321,8 @@ class ThriftAttentionCacheLayer:
         begin = (start // 16) * 16
         finish = _round_up(end, 16)
         v_packed_t, v_scale_t = nvfp4_quantize_transposed(
-            self.v_fp16[:, :, begin:finish].contiguous()
+            self.v_fp16[:, :, begin:finish].contiguous(),
+            is_bf16=self.v_fp16.dtype == torch.bfloat16,
         )
         self.v_packed_t[:, :, :, begin // 2 : finish // 2] = v_packed_t[
             :, :, :, : (finish - begin) // 2
@@ -331,7 +346,7 @@ class ThriftAttentionCacheLayer:
             .reshape(batch, heads, last - first, 64, head_dim)
             .float()
             .mean(dim=3)
-            .to(torch.float16)
+            .to(self.k_mean.dtype)
         )
 
     def _ensure_selection_workspace(
@@ -562,10 +577,11 @@ def cached_decode_attention(
         raise RuntimeError("ThriftAttention decode cache is empty")
 
     q = query.contiguous()
+    is_bf16 = q.dtype == torch.bfloat16
     kv_heads = layer.key_view().shape[1]
     q_grouped = _group_single_query(q, kv_heads)
     quant_format = get_quant_format(config.quant_format)
-    q_packed, q_scale = quant_format.quantize(q_grouped)
+    q_packed, q_scale = quant_format.quantize(q_grouped, is_bf16=is_bf16)
     k_packed, v_packed_t, k_scale, v_scale_t = layer.packed_views()
 
     if config.method == "fp4":
@@ -576,6 +592,7 @@ def cached_decode_attention(
             q_scale,
             k_scale,
             v_scale_t,
+            is_bf16,
         )
         return _ungroup_single_query(out, q.shape[1])
 
@@ -599,6 +616,7 @@ def cached_decode_attention(
         q_scale,
         k_scale,
         v_scale_t,
+        is_bf16,
     )
     return _ungroup_single_query(out, q.shape[1])
 
@@ -611,6 +629,7 @@ def cached_prefill_attention(
 ) -> torch.Tensor:
     layer = cache.layer(layer_idx)
     q = query.contiguous()
+    is_bf16 = q.dtype == torch.bfloat16
     k_fp16 = layer.key_view().contiguous()
     v_fp16 = layer.value_view().contiguous()
     quant_format = get_quant_format(config.quant_format)
@@ -618,6 +637,7 @@ def cached_prefill_attention(
         q,
         k_fp16,
         v_fp16,
+        is_bf16=is_bf16,
     )
     ext = get_extension()
 
@@ -627,7 +647,7 @@ def cached_prefill_attention(
             if config.causal
             else ext.fp4_attention_noncausal_nvfp4_packed
         )
-        return fn(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t)
+        return fn(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, is_bf16)
 
     if config.method != "thrift":
         raise ValueError(f"unsupported ThriftAttention method {config.method!r}")
@@ -637,6 +657,7 @@ def cached_prefill_attention(
         layer,
         config,
         real_q_len=cache.prefill_real_seq_len,
+        is_bf16=is_bf16,
     )
     fn = (
         ext.thrift_attention_causal_nvfp4_packed
@@ -654,6 +675,7 @@ def cached_prefill_attention(
         q_scale,
         k_scale,
         v_scale_t,
+        is_bf16,
     )
 
 
@@ -662,6 +684,7 @@ def _select_block_pairs_from_cached_means(
     layer: ThriftAttentionCacheLayer,
     config: AttentionConfig,
     real_q_len: int | None = None,
+    is_bf16: bool = False,
 ) -> torch.Tensor:
     if layer.k_mean is None:
         raise RuntimeError("ThriftAttention K block means have not been initialized")
@@ -690,7 +713,7 @@ def _select_block_pairs_from_cached_means(
             q.reshape(batch, q_heads, num_q_blocks, block_size, head_dim)
             .float()
             .mean(dim=3)
-            .to(torch.float16)
+            .to(torch.bfloat16 if is_bf16 else torch.float16)
             .contiguous()
         )
     else:
@@ -709,13 +732,13 @@ def _select_block_pairs_from_cached_means(
                 q_blocks[:, :, full_blocks:] = 0
         q_mean = (
             q_blocks.sum(dim=3) / counts.clamp_min(1).view(1, 1, -1, 1)
-        ).to(torch.float16).contiguous()
+        ).to(torch.bfloat16 if is_bf16 else torch.float16).contiguous()
     k_mean = layer.k_mean[:, :, :num_kv_blocks]
     if q_heads != kv_heads:
         k_mean = k_mean.repeat_interleave(q_heads // kv_heads, dim=1).contiguous()
 
     if num_kv_blocks <= 2048:
-        return get_extension().block_mean_topk(q_mean, k_mean, selected_count, config.causal)
+        return get_extension().block_mean_topk(q_mean, k_mean, selected_count, config.causal, is_bf16)
 
     scores = (
         q_mean.reshape(batch * q_heads, num_q_blocks, head_dim).float()

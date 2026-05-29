@@ -6,10 +6,11 @@
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include "thriftattention/sm120/cuda_common.cuh"
 
-template<bool CAUSAL, int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
+template<typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
          int HEAD_DIM_2, int SCALE_DIM,
          int NUM_WARPS, int WARP_Q>
 __launch_bounds__(NUM_WARPS * TA_WARP_SIZE)
@@ -21,7 +22,7 @@ void fp4_attention_kernel(
     const __nv_fp8_e4m3* S_Q,
     const __nv_fp8_e4m3* S_K,
     const __nv_fp8_e4m3* S_V,
-    __half* O,
+    T* O,
     int bs,
     int q_len,
     int kv_len,
@@ -29,6 +30,7 @@ void fp4_attention_kernel(
     int num_q_heads,
     int num_kv_heads)
 {
+    using Traits = PrecisionTraits<T>;
     constexpr int TB_SIZE = NUM_WARPS * TA_WARP_SIZE;
     constexpr int MMA_M = 16;
     constexpr int MMA_K = 64;
@@ -408,18 +410,18 @@ void fp4_attention_kernel(
             regs[2] *= norm1;
             regs[3] *= norm1;
 
-            reinterpret_cast<__half2*>(O + (row + 0) * HEAD_DIM + col)[0] =
-                __floats2half2_rn(regs[0], regs[1]);
-            reinterpret_cast<__half2*>(O + (row + 8) * HEAD_DIM + col)[0] =
-                __floats2half2_rn(regs[2], regs[3]);
+            reinterpret_cast<typename Traits::vec2*>(O + (row + 0) * HEAD_DIM + col)[0] =
+                Traits::pack2(regs[0], regs[1]);
+            reinterpret_cast<typename Traits::vec2*>(O + (row + 8) * HEAD_DIM + col)[0] =
+                Traits::pack2(regs[2], regs[3]);
         }
 }
 
-template<bool CAUSAL, int HEAD_DIM>
+template<typename T, bool CAUSAL, int HEAD_DIM>
 static void launch_fp4_attention(
     const __nv_fp4x2_e2m1* Q, const __nv_fp4x2_e2m1* K, const __nv_fp4x2_e2m1* V,
     const __nv_fp8_e4m3* S_Q, const __nv_fp8_e4m3* S_K, const __nv_fp8_e4m3* S_V,
-    __half* O, int bs, int q_len, int kv_len, int kv_capacity,
+    T* O, int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads) {
 
     constexpr int HEAD_DIM_2 = HEAD_DIM / 2;
@@ -441,7 +443,7 @@ static void launch_fp4_attention(
     constexpr int smem_size = q_phase_smem + v_phase_smem > k_phase_smem
                             ? q_phase_smem + v_phase_smem : k_phase_smem;
 
-    auto kernel = fp4_attention_kernel<CAUSAL, BLOCK_Q, BLOCK_KV, HEAD_DIM,
+    auto kernel = fp4_attention_kernel<T, CAUSAL, BLOCK_Q, BLOCK_KV, HEAD_DIM,
                                        HEAD_DIM_2, SCALE_DIM,
                                        NUM_WARPS, WARP_Q>;
 
@@ -451,7 +453,7 @@ static void launch_fp4_attention(
         bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
 }
 
-template<bool CAUSAL>
+template<typename T, bool CAUSAL>
 static void dispatch_fp4_attention(
     const __nv_fp4x2_e2m1* Q,
     const __nv_fp4x2_e2m1* K,
@@ -459,7 +461,7 @@ static void dispatch_fp4_attention(
     const __nv_fp8_e4m3* S_Q,
     const __nv_fp8_e4m3* S_K,
     const __nv_fp8_e4m3* S_V,
-    __half* O,
+    T* O,
     int bs,
     int q_len,
     int kv_len,
@@ -468,14 +470,43 @@ static void dispatch_fp4_attention(
     int num_kv_heads,
     int head_dim) {
     if (head_dim == 64) {
-        launch_fp4_attention<CAUSAL, 64>(
+        launch_fp4_attention<T, CAUSAL, 64>(
             Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
             kv_capacity, num_q_heads, num_kv_heads);
     } else {
-        launch_fp4_attention<CAUSAL, 128>(
+        launch_fp4_attention<T, CAUSAL, 128>(
             Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
             kv_capacity, num_q_heads, num_kv_heads);
     }
+}
+
+template<typename T, bool CAUSAL>
+static void fp4_attention_nvfp4_typed(
+    const void* Q_raw,
+    const void* K_raw,
+    const void* V_raw,
+    const void* S_Q_raw,
+    const void* S_K_raw,
+    const void* S_V_raw,
+    void* O_raw,
+    int bs,
+    int q_len,
+    int kv_len,
+    int kv_capacity,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim) {
+    auto Q = reinterpret_cast<const __nv_fp4x2_e2m1*>(Q_raw);
+    auto K = reinterpret_cast<const __nv_fp4x2_e2m1*>(K_raw);
+    auto V = reinterpret_cast<const __nv_fp4x2_e2m1*>(V_raw);
+    auto S_Q = reinterpret_cast<const __nv_fp8_e4m3*>(S_Q_raw);
+    auto S_K = reinterpret_cast<const __nv_fp8_e4m3*>(S_K_raw);
+    auto S_V = reinterpret_cast<const __nv_fp8_e4m3*>(S_V_raw);
+    auto O = reinterpret_cast<T*>(O_raw);
+
+    dispatch_fp4_attention<T, CAUSAL>(
+        Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
+        kv_capacity, num_q_heads, num_kv_heads, head_dim);
 }
 
 void fp4_attention_causal_nvfp4(
@@ -492,19 +523,17 @@ void fp4_attention_causal_nvfp4(
     int kv_capacity,
     int num_q_heads,
     int num_kv_heads,
-    int head_dim) {
-
-    auto Q = reinterpret_cast<const __nv_fp4x2_e2m1*>(Q_raw);
-    auto K = reinterpret_cast<const __nv_fp4x2_e2m1*>(K_raw);
-    auto V = reinterpret_cast<const __nv_fp4x2_e2m1*>(V_raw);
-    auto S_Q = reinterpret_cast<const __nv_fp8_e4m3*>(S_Q_raw);
-    auto S_K = reinterpret_cast<const __nv_fp8_e4m3*>(S_K_raw);
-    auto S_V = reinterpret_cast<const __nv_fp8_e4m3*>(S_V_raw);
-    auto O = reinterpret_cast<__half*>(O_raw);
-
-    dispatch_fp4_attention<true>(
-        Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
-        kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    int head_dim,
+    bool is_bf16) {
+    if (is_bf16) {
+        fp4_attention_nvfp4_typed<__nv_bfloat16, true>(
+            Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    } else {
+        fp4_attention_nvfp4_typed<half, true>(
+            Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    }
 }
 
 void fp4_attention_noncausal_nvfp4(
@@ -521,17 +550,15 @@ void fp4_attention_noncausal_nvfp4(
     int kv_capacity,
     int num_q_heads,
     int num_kv_heads,
-    int head_dim) {
-
-    auto Q = reinterpret_cast<const __nv_fp4x2_e2m1*>(Q_raw);
-    auto K = reinterpret_cast<const __nv_fp4x2_e2m1*>(K_raw);
-    auto V = reinterpret_cast<const __nv_fp4x2_e2m1*>(V_raw);
-    auto S_Q = reinterpret_cast<const __nv_fp8_e4m3*>(S_Q_raw);
-    auto S_K = reinterpret_cast<const __nv_fp8_e4m3*>(S_K_raw);
-    auto S_V = reinterpret_cast<const __nv_fp8_e4m3*>(S_V_raw);
-    auto O = reinterpret_cast<__half*>(O_raw);
-
-    dispatch_fp4_attention<false>(
-        Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
-        kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    int head_dim,
+    bool is_bf16) {
+    if (is_bf16) {
+        fp4_attention_nvfp4_typed<__nv_bfloat16, false>(
+            Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    } else {
+        fp4_attention_nvfp4_typed<half, false>(
+            Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    }
 }

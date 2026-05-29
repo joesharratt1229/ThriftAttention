@@ -5,6 +5,7 @@
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 constexpr int TA_WARP_SIZE = 32;
 
@@ -203,3 +204,120 @@ __device__ __forceinline__ void ta_mma_m16n8k16_f16(
           "r"(b[0]), "r"(b[1]),
           "f"(acc[0]), "f"(acc[1]), "f"(acc[2]), "f"(acc[3]));
 }
+
+__device__ __forceinline__ void ta_mma_m16n8k16_bf16(
+    const uint32_t (&a)[4],
+    const uint32_t (&b)[2],
+    float (&acc)[4]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%10, %11, %12, %13};"
+        : "=f"(acc[0]), "=f"(acc[1]), "=f"(acc[2]), "=f"(acc[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]),
+          "f"(acc[0]), "f"(acc[1]), "f"(acc[2]), "f"(acc[3]));
+}
+
+template <typename T>
+struct PrecisionTraits;
+
+template <>
+struct PrecisionTraits<half> {
+    using scalar = half;
+    using vec2 = __half2;
+
+    static __device__ __forceinline__ float to_float(scalar x) {
+        return __half2float(x);
+    }
+
+    static __device__ __forceinline__ scalar from_float(float x) {
+        return __float2half_rn(x);
+    }
+
+    static __device__ __forceinline__ vec2 pack2(float a, float b) {
+        return __floats2half2_rn(a, b);
+    }
+
+    static __device__ __forceinline__ vec2 make_vec2(scalar a, scalar b) {
+        return __halves2half2(a, b);
+    }
+
+    static __device__ __forceinline__ vec2 abs2(vec2 x) {
+        return __habs2(x);
+    }
+
+    static __device__ __forceinline__ vec2 max2(vec2 a, vec2 b) {
+        return __hmax2(a, b);
+    }
+
+    static __device__ __forceinline__ scalar low(vec2 x) {
+        return __low2half(x);
+    }
+
+    static __device__ __forceinline__ scalar high(vec2 x) {
+        return __high2half(x);
+    }
+
+    static __device__ __forceinline__ float2 to_float2(vec2 x) {
+        return __half22float2(x);
+    }
+
+    static __device__ __forceinline__ void mma(
+        const uint32_t (&a)[4],
+        const uint32_t (&b)[2],
+        float (&acc)[4]) {
+        ta_mma_m16n8k16_f16(a, b, acc);
+    }
+};
+
+template <>
+struct PrecisionTraits<__nv_bfloat16> {
+    using scalar = __nv_bfloat16;
+    using vec2 = __nv_bfloat162;
+
+    static __device__ __forceinline__ float to_float(scalar x) {
+        return __bfloat162float(x);
+    }
+
+    static __device__ __forceinline__ scalar from_float(float x) {
+        return __float2bfloat16_rn(x);
+    }
+
+    static __device__ __forceinline__ vec2 pack2(float a, float b) {
+        return __floats2bfloat162_rn(a, b);
+    }
+
+    static __device__ __forceinline__ vec2 make_vec2(scalar a, scalar b) {
+        return __halves2bfloat162(a, b);
+    }
+
+    static __device__ __forceinline__ vec2 abs2(vec2 x) {
+        return __habs2(x);
+    }
+
+    static __device__ __forceinline__ vec2 max2(vec2 a, vec2 b) {
+        return __hmax2(a, b);
+    }
+
+    static __device__ __forceinline__ scalar low(vec2 x) {
+        return __low2bfloat16(x);
+    }
+
+    static __device__ __forceinline__ scalar high(vec2 x) {
+        return __high2bfloat16(x);
+    }
+
+    static __device__ __forceinline__ float2 to_float2(vec2 x) {
+        return __bfloat1622float2(x);
+    }
+
+    static __device__ __forceinline__ void mma(
+        const uint32_t (&a)[4],
+        const uint32_t (&b)[2],
+        float (&acc)[4]) {
+        ta_mma_m16n8k16_bf16(a, b, acc);
+    }
+};

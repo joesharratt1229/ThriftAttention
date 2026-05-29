@@ -3,6 +3,7 @@
 #include <float.h>
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include "thriftattention/sm120/cuda_common.cuh"
@@ -18,15 +19,16 @@ constexpr int SQ_TOPK_LOCAL_THREADS = SQ_TOPK_LOCAL_WARPS * TA_WARP_SIZE;
 // q_mean: [flat_heads, num_q_blocks, head_dim]
 // k_mean: [flat_heads, num_kv_blocks, head_dim]
 // out:    [flat_heads, num_q_blocks, topk_count]
-template<bool CAUSAL, int HEAD_DIM, int MAX_KV_BLOCKS>
+template<typename T, bool CAUSAL, int HEAD_DIM, int MAX_KV_BLOCKS>
 __global__ __launch_bounds__(TA_WARP_SIZE)
 void block_mean_topk_kernel(
-    const half* __restrict__ q_mean,
-    const half* __restrict__ k_mean,
+    const T* __restrict__ q_mean,
+    const T* __restrict__ k_mean,
     int32_t* __restrict__ topk_out,
     int num_q_blocks,
     int num_kv_blocks,
     int topk_count) {
+    using Traits = PrecisionTraits<T>;
     constexpr int ITEMS_PER_LANE = MAX_KV_BLOCKS / TA_WARP_SIZE;
     constexpr int ELEMS_PER_LANE = HEAD_DIM / TA_WARP_SIZE;
 
@@ -35,24 +37,24 @@ void block_mean_topk_kernel(
     const int q_block_id = bid % num_q_blocks;
     const int lane_id = threadIdx.x;
 
-    const half* q_row =
+    const T* q_row =
         q_mean + (static_cast<int64_t>(flat_head_id) * num_q_blocks + q_block_id) * HEAD_DIM;
     float q_reg[ELEMS_PER_LANE];
     #pragma unroll
     for (int i = 0; i < ELEMS_PER_LANE; i++) {
-        q_reg[i] = __half2float(q_row[lane_id + i * TA_WARP_SIZE]);
+        q_reg[i] = Traits::to_float(q_row[lane_id + i * TA_WARP_SIZE]);
     }
 
-    const half* k_head = k_mean + static_cast<int64_t>(flat_head_id) * num_kv_blocks * HEAD_DIM;
+    const T* k_head = k_mean + static_cast<int64_t>(flat_head_id) * num_kv_blocks * HEAD_DIM;
     extern __shared__ uint8_t smem[];
     float* block_scores = reinterpret_cast<float*>(smem);
 
     for (int kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
-        const half* k_row = k_head + kv_block * HEAD_DIM;
+        const T* k_row = k_head + kv_block * HEAD_DIM;
         float dot = 0.0f;
         #pragma unroll
         for (int i = 0; i < ELEMS_PER_LANE; i++) {
-            dot += q_reg[i] * __half2float(k_row[lane_id + i * TA_WARP_SIZE]);
+            dot += q_reg[i] * Traits::to_float(k_row[lane_id + i * TA_WARP_SIZE]);
         }
 
         #pragma unroll
@@ -120,41 +122,42 @@ void block_mean_topk_kernel(
 //
 // Scores are max_g dot(q[flat_head, g], k_mean[flat_head, block]), matching
 // the Python grouped decode selector.
-template<int HEAD_DIM, int MAX_KV_BLOCKS>
+template<typename T, int HEAD_DIM, int MAX_KV_BLOCKS>
 __global__ __launch_bounds__(TA_WARP_SIZE)
 void single_query_key_mean_topk_kernel(
-    const half* __restrict__ q_grouped,
-    const half* __restrict__ k_mean,
+    const T* __restrict__ q_grouped,
+    const T* __restrict__ k_mean,
     int32_t* __restrict__ topk_out,
     int groups,
     int num_kv_blocks,
     int k_mean_capacity_blocks,
     int topk_count) {
+    using Traits = PrecisionTraits<T>;
     constexpr int ITEMS_PER_LANE = MAX_KV_BLOCKS / TA_WARP_SIZE;
     constexpr int ELEMS_PER_LANE = HEAD_DIM / TA_WARP_SIZE;
 
     const int flat_head_id = blockIdx.x;
     const int lane_id = threadIdx.x;
 
-    const half* q_head =
+    const T* q_head =
         q_grouped + static_cast<int64_t>(flat_head_id) * groups * HEAD_DIM;
-    const half* k_head =
+    const T* k_head =
         k_mean + static_cast<int64_t>(flat_head_id) * k_mean_capacity_blocks * HEAD_DIM;
 
     extern __shared__ uint8_t smem[];
     float* block_scores = reinterpret_cast<float*>(smem);
 
     for (int kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
-        const half* k_row = k_head + kv_block * HEAD_DIM;
+        const T* k_row = k_head + kv_block * HEAD_DIM;
         float best = -FLT_MAX;
 
         for (int group_id = 0; group_id < groups; group_id++) {
-            const half* q_row = q_head + group_id * HEAD_DIM;
+            const T* q_row = q_head + group_id * HEAD_DIM;
             float dot = 0.0f;
             #pragma unroll
             for (int i = 0; i < ELEMS_PER_LANE; i++) {
                 const int elem = lane_id + i * TA_WARP_SIZE;
-                dot += __half2float(q_row[elem]) * __half2float(k_row[elem]);
+                dot += Traits::to_float(q_row[elem]) * Traits::to_float(k_row[elem]);
             }
 
             #pragma unroll
@@ -222,11 +225,11 @@ void single_query_key_mean_topk_kernel(
 // then the last completed chunk CTA merges the final top-k from all local
 // candidates. Keeping top-k candidates per chunk is exact: any global top-k
 // element must be in the top-k of its own chunk.
-template<int HEAD_DIM>
+template<typename T, int HEAD_DIM>
 __global__ __launch_bounds__(SQ_TOPK_LOCAL_THREADS)
 void single_query_key_mean_topk_local_kernel(
-    const half* __restrict__ q_grouped,
-    const half* __restrict__ k_mean,
+    const T* __restrict__ q_grouped,
+    const T* __restrict__ k_mean,
     int32_t* __restrict__ topk_out,
     float* __restrict__ local_scores,
     int32_t* __restrict__ local_indices,
@@ -237,6 +240,7 @@ void single_query_key_mean_topk_local_kernel(
     int chunk_count,
     int local_count,
     int topk_count) {
+    using Traits = PrecisionTraits<T>;
     constexpr int ELEMS_PER_LANE = HEAD_DIM / TA_WARP_SIZE;
     constexpr int ITEMS_PER_LANE = SQ_TOPK_CHUNK_BLOCKS / TA_WARP_SIZE;
 
@@ -253,9 +257,9 @@ void single_query_key_mean_topk_local_kernel(
     }
     __syncthreads();
 
-    const half* q_head =
+    const T* q_head =
         q_grouped + static_cast<int64_t>(flat_head_id) * groups * HEAD_DIM;
-    const half* k_head =
+    const T* k_head =
         k_mean + static_cast<int64_t>(flat_head_id) * k_mean_capacity_blocks * HEAD_DIM;
 
     for (int local_block = warp_id; local_block < SQ_TOPK_CHUNK_BLOCKS;
@@ -264,14 +268,14 @@ void single_query_key_mean_topk_local_kernel(
         float best = -FLT_MAX;
 
         if (kv_block < num_kv_blocks) {
-            const half* k_row = k_head + static_cast<int64_t>(kv_block) * HEAD_DIM;
+            const T* k_row = k_head + static_cast<int64_t>(kv_block) * HEAD_DIM;
             for (int group_id = 0; group_id < groups; group_id++) {
-                const half* q_row = q_head + group_id * HEAD_DIM;
+                const T* q_row = q_head + group_id * HEAD_DIM;
                 float dot = 0.0f;
                 #pragma unroll
                 for (int i = 0; i < ELEMS_PER_LANE; i++) {
                     const int elem = lane_id + i * TA_WARP_SIZE;
-                    dot += __half2float(q_row[elem]) * __half2float(k_row[elem]);
+                    dot += Traits::to_float(q_row[elem]) * Traits::to_float(k_row[elem]);
                 }
 
                 #pragma unroll
@@ -398,10 +402,10 @@ void single_query_key_mean_topk_local_kernel(
     }
 }
 
-template<bool CAUSAL, int HEAD_DIM, int MAX_KV_BLOCKS>
+template<typename T, bool CAUSAL, int HEAD_DIM, int MAX_KV_BLOCKS>
 void launch_block_mean_topk(
-    const half* q_mean,
-    const half* k_mean,
+    const T* q_mean,
+    const T* k_mean,
     int32_t* topk_out,
     int flat_heads,
     int num_q_blocks,
@@ -410,7 +414,7 @@ void launch_block_mean_topk(
     const int grid_size = flat_heads * num_q_blocks;
     const int smem_bytes = num_kv_blocks * static_cast<int>(sizeof(float));
 
-    block_mean_topk_kernel<CAUSAL, HEAD_DIM, MAX_KV_BLOCKS>
+    block_mean_topk_kernel<T, CAUSAL, HEAD_DIM, MAX_KV_BLOCKS>
         <<<grid_size, TA_WARP_SIZE, smem_bytes>>>(
             q_mean, k_mean, topk_out, num_q_blocks, num_kv_blocks, topk_count);
 
@@ -420,34 +424,34 @@ void launch_block_mean_topk(
     }
 }
 
-template<bool CAUSAL, int HEAD_DIM>
+template<typename T, bool CAUSAL, int HEAD_DIM>
 void dispatch_block_mean_topk(
-    const half* q_mean,
-    const half* k_mean,
+    const T* q_mean,
+    const T* k_mean,
     int32_t* topk_out,
     int flat_heads,
     int num_q_blocks,
     int num_kv_blocks,
     int topk_count) {
     if (num_kv_blocks <= 128) {
-        launch_block_mean_topk<CAUSAL, HEAD_DIM, 128>(
+        launch_block_mean_topk<T, CAUSAL, HEAD_DIM, 128>(
             q_mean, k_mean, topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count);
     } else if (num_kv_blocks <= 512) {
-        launch_block_mean_topk<CAUSAL, HEAD_DIM, 512>(
+        launch_block_mean_topk<T, CAUSAL, HEAD_DIM, 512>(
             q_mean, k_mean, topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count);
     } else if (num_kv_blocks <= 1024) {
-        launch_block_mean_topk<CAUSAL, HEAD_DIM, 1024>(
+        launch_block_mean_topk<T, CAUSAL, HEAD_DIM, 1024>(
             q_mean, k_mean, topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count);
     } else {
-        launch_block_mean_topk<CAUSAL, HEAD_DIM, 2048>(
+        launch_block_mean_topk<T, CAUSAL, HEAD_DIM, 2048>(
             q_mean, k_mean, topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count);
     }
 }
 
-template<int HEAD_DIM, int MAX_KV_BLOCKS>
+template<typename T, int HEAD_DIM, int MAX_KV_BLOCKS>
 void launch_single_query_key_mean_topk(
-    const half* q_grouped,
-    const half* k_mean,
+    const T* q_grouped,
+    const T* k_mean,
     int32_t* topk_out,
     int flat_heads,
     int groups,
@@ -456,7 +460,7 @@ void launch_single_query_key_mean_topk(
     int topk_count) {
     const int smem_bytes = num_kv_blocks * static_cast<int>(sizeof(float));
 
-    single_query_key_mean_topk_kernel<HEAD_DIM, MAX_KV_BLOCKS>
+    single_query_key_mean_topk_kernel<T, HEAD_DIM, MAX_KV_BLOCKS>
         <<<flat_heads, TA_WARP_SIZE, smem_bytes>>>(
             q_grouped, k_mean, topk_out, groups, num_kv_blocks,
             k_mean_capacity_blocks, topk_count);
@@ -468,10 +472,10 @@ void launch_single_query_key_mean_topk(
     }
 }
 
-template<int HEAD_DIM>
+template<typename T, int HEAD_DIM>
 void dispatch_single_query_key_mean_topk(
-    const half* q_grouped,
-    const half* k_mean,
+    const T* q_grouped,
+    const T* k_mean,
     int32_t* topk_out,
     int flat_heads,
     int groups,
@@ -479,28 +483,28 @@ void dispatch_single_query_key_mean_topk(
     int k_mean_capacity_blocks,
     int topk_count) {
     if (num_kv_blocks <= 128) {
-        launch_single_query_key_mean_topk<HEAD_DIM, 128>(
+        launch_single_query_key_mean_topk<T, HEAD_DIM, 128>(
             q_grouped, k_mean, topk_out, flat_heads, groups, num_kv_blocks,
             k_mean_capacity_blocks, topk_count);
     } else if (num_kv_blocks <= 512) {
-        launch_single_query_key_mean_topk<HEAD_DIM, 512>(
+        launch_single_query_key_mean_topk<T, HEAD_DIM, 512>(
             q_grouped, k_mean, topk_out, flat_heads, groups, num_kv_blocks,
             k_mean_capacity_blocks, topk_count);
     } else if (num_kv_blocks <= 1024) {
-        launch_single_query_key_mean_topk<HEAD_DIM, 1024>(
+        launch_single_query_key_mean_topk<T, HEAD_DIM, 1024>(
             q_grouped, k_mean, topk_out, flat_heads, groups, num_kv_blocks,
             k_mean_capacity_blocks, topk_count);
     } else {
-        launch_single_query_key_mean_topk<HEAD_DIM, 2048>(
+        launch_single_query_key_mean_topk<T, HEAD_DIM, 2048>(
             q_grouped, k_mean, topk_out, flat_heads, groups, num_kv_blocks,
             k_mean_capacity_blocks, topk_count);
     }
 }
 
-template<int HEAD_DIM>
+template<typename T, int HEAD_DIM>
 void launch_single_query_key_mean_topk_chunked(
-    const half* q_grouped,
-    const half* k_mean,
+    const T* q_grouped,
+    const T* k_mean,
     int32_t* topk_out,
     float* local_scores,
     int32_t* local_indices,
@@ -515,7 +519,7 @@ void launch_single_query_key_mean_topk_chunked(
     cudaMemsetAsync(done_counts, 0, static_cast<size_t>(flat_heads) * sizeof(int32_t));
 
     const int local_grid = flat_heads * chunk_count;
-    single_query_key_mean_topk_local_kernel<HEAD_DIM>
+    single_query_key_mean_topk_local_kernel<T, HEAD_DIM>
         <<<local_grid, SQ_TOPK_LOCAL_THREADS>>>(
             q_grouped, k_mean, topk_out, local_scores, local_indices, done_counts,
             groups, num_kv_blocks, k_mean_capacity_blocks, chunk_count, local_count,
@@ -530,7 +534,8 @@ void launch_single_query_key_mean_topk_chunked(
 
 }  // namespace
 
-void block_mean_topk(
+template<typename T>
+static void dispatch_block_mean_topk_typed(
     const void* q_mean_raw,
     const void* k_mean_raw,
     void* topk_out_raw,
@@ -540,8 +545,8 @@ void block_mean_topk(
     int head_dim,
     int topk_count,
     bool causal) {
-    const half* q_mean = reinterpret_cast<const half*>(q_mean_raw);
-    const half* k_mean = reinterpret_cast<const half*>(k_mean_raw);
+    const T* q_mean = reinterpret_cast<const T*>(q_mean_raw);
+    const T* k_mean = reinterpret_cast<const T*>(k_mean_raw);
     int32_t* topk_out = reinterpret_cast<int32_t*>(topk_out_raw);
 
     if (num_kv_blocks > 2048) {
@@ -551,22 +556,78 @@ void block_mean_topk(
 
     if (head_dim == 64) {
         if (causal) {
-            dispatch_block_mean_topk<true, 64>(
+            dispatch_block_mean_topk<T, true, 64>(
                 q_mean, k_mean, topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count);
         } else {
-            dispatch_block_mean_topk<false, 64>(
+            dispatch_block_mean_topk<T, false, 64>(
                 q_mean, k_mean, topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count);
         }
     } else if (head_dim == 128) {
         if (causal) {
-            dispatch_block_mean_topk<true, 128>(
+            dispatch_block_mean_topk<T, true, 128>(
                 q_mean, k_mean, topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count);
         } else {
-            dispatch_block_mean_topk<false, 128>(
+            dispatch_block_mean_topk<T, false, 128>(
                 q_mean, k_mean, topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count);
         }
     } else {
         fprintf(stderr, "block_mean_topk: unsupported head_dim=%d\n", head_dim);
+    }
+}
+
+void block_mean_topk(
+    const void* q_mean_raw,
+    const void* k_mean_raw,
+    void* topk_out_raw,
+    int flat_heads,
+    int num_q_blocks,
+    int num_kv_blocks,
+    int head_dim,
+    int topk_count,
+    bool causal,
+    bool is_bf16) {
+    if (is_bf16) {
+        dispatch_block_mean_topk_typed<__nv_bfloat16>(
+            q_mean_raw, k_mean_raw, topk_out_raw, flat_heads, num_q_blocks,
+            num_kv_blocks, head_dim, topk_count, causal);
+    } else {
+        dispatch_block_mean_topk_typed<half>(
+            q_mean_raw, k_mean_raw, topk_out_raw, flat_heads, num_q_blocks,
+            num_kv_blocks, head_dim, topk_count, causal);
+    }
+}
+
+template<typename T>
+static void dispatch_single_query_key_mean_topk_typed(
+    const void* q_grouped_raw,
+    const void* k_mean_raw,
+    void* topk_out_raw,
+    int flat_heads,
+    int groups,
+    int num_kv_blocks,
+    int k_mean_capacity_blocks,
+    int head_dim,
+    int topk_count) {
+    const T* q_grouped = reinterpret_cast<const T*>(q_grouped_raw);
+    const T* k_mean = reinterpret_cast<const T*>(k_mean_raw);
+    int32_t* topk_out = reinterpret_cast<int32_t*>(topk_out_raw);
+
+    if (num_kv_blocks > 2048) {
+        fprintf(stderr, "single_query_key_mean_topk: num_kv_blocks=%d > 2048 not supported\n",
+                num_kv_blocks);
+        return;
+    }
+
+    if (head_dim == 64) {
+        dispatch_single_query_key_mean_topk<T, 64>(
+            q_grouped, k_mean, topk_out, flat_heads, groups, num_kv_blocks,
+            k_mean_capacity_blocks, topk_count);
+    } else if (head_dim == 128) {
+        dispatch_single_query_key_mean_topk<T, 128>(
+            q_grouped, k_mean, topk_out, flat_heads, groups, num_kv_blocks,
+            k_mean_capacity_blocks, topk_count);
+    } else {
+        fprintf(stderr, "single_query_key_mean_topk: unsupported head_dim=%d\n", head_dim);
     }
 }
 
@@ -579,27 +640,63 @@ void single_query_key_mean_topk(
     int num_kv_blocks,
     int k_mean_capacity_blocks,
     int head_dim,
-    int topk_count) {
-    const half* q_grouped = reinterpret_cast<const half*>(q_grouped_raw);
-    const half* k_mean = reinterpret_cast<const half*>(k_mean_raw);
+    int topk_count,
+    bool is_bf16) {
+    if (is_bf16) {
+        dispatch_single_query_key_mean_topk_typed<__nv_bfloat16>(
+            q_grouped_raw, k_mean_raw, topk_out_raw, flat_heads, groups,
+            num_kv_blocks, k_mean_capacity_blocks, head_dim, topk_count);
+    } else {
+        dispatch_single_query_key_mean_topk_typed<half>(
+            q_grouped_raw, k_mean_raw, topk_out_raw, flat_heads, groups,
+            num_kv_blocks, k_mean_capacity_blocks, head_dim, topk_count);
+    }
+}
+
+template<typename T>
+static void dispatch_single_query_key_mean_topk_chunked_typed(
+    const void* q_grouped_raw,
+    const void* k_mean_raw,
+    void* topk_out_raw,
+    void* local_scores_raw,
+    void* local_indices_raw,
+    void* done_counts_raw,
+    int flat_heads,
+    int groups,
+    int num_kv_blocks,
+    int k_mean_capacity_blocks,
+    int head_dim,
+    int topk_count,
+    int chunk_count,
+    int local_count) {
+    const T* q_grouped = reinterpret_cast<const T*>(q_grouped_raw);
+    const T* k_mean = reinterpret_cast<const T*>(k_mean_raw);
     int32_t* topk_out = reinterpret_cast<int32_t*>(topk_out_raw);
+    float* local_scores = reinterpret_cast<float*>(local_scores_raw);
+    int32_t* local_indices = reinterpret_cast<int32_t*>(local_indices_raw);
+    int32_t* done_counts = reinterpret_cast<int32_t*>(done_counts_raw);
 
     if (num_kv_blocks > 2048) {
-        fprintf(stderr, "single_query_key_mean_topk: num_kv_blocks=%d > 2048 not supported\n",
+        fprintf(stderr, "single_query_key_mean_topk_chunked: num_kv_blocks=%d > 2048 not supported\n",
                 num_kv_blocks);
+        return;
+    }
+    if (chunk_count <= 0 || local_count <= 0) {
         return;
     }
 
     if (head_dim == 64) {
-        dispatch_single_query_key_mean_topk<64>(
-            q_grouped, k_mean, topk_out, flat_heads, groups, num_kv_blocks,
-            k_mean_capacity_blocks, topk_count);
+        launch_single_query_key_mean_topk_chunked<T, 64>(
+            q_grouped, k_mean, topk_out, local_scores, local_indices, done_counts,
+            flat_heads, groups, num_kv_blocks, k_mean_capacity_blocks,
+            topk_count, chunk_count, local_count);
     } else if (head_dim == 128) {
-        dispatch_single_query_key_mean_topk<128>(
-            q_grouped, k_mean, topk_out, flat_heads, groups, num_kv_blocks,
-            k_mean_capacity_blocks, topk_count);
+        launch_single_query_key_mean_topk_chunked<T, 128>(
+            q_grouped, k_mean, topk_out, local_scores, local_indices, done_counts,
+            flat_heads, groups, num_kv_blocks, k_mean_capacity_blocks,
+            topk_count, chunk_count, local_count);
     } else {
-        fprintf(stderr, "single_query_key_mean_topk: unsupported head_dim=%d\n", head_dim);
+        fprintf(stderr, "single_query_key_mean_topk_chunked: unsupported head_dim=%d\n", head_dim);
     }
 }
 
@@ -617,35 +714,18 @@ void single_query_key_mean_topk_chunked(
     int head_dim,
     int topk_count,
     int chunk_count,
-    int local_count) {
-    const half* q_grouped = reinterpret_cast<const half*>(q_grouped_raw);
-    const half* k_mean = reinterpret_cast<const half*>(k_mean_raw);
-    int32_t* topk_out = reinterpret_cast<int32_t*>(topk_out_raw);
-    float* local_scores = reinterpret_cast<float*>(local_scores_raw);
-    int32_t* local_indices = reinterpret_cast<int32_t*>(local_indices_raw);
-    int32_t* done_counts = reinterpret_cast<int32_t*>(done_counts_raw);
-
-    if (num_kv_blocks > 2048) {
-        fprintf(stderr, "single_query_key_mean_topk_chunked: num_kv_blocks=%d > 2048 not supported\n",
-                num_kv_blocks);
-        return;
-    }
-    if (chunk_count <= 0 || local_count <= 0) {
-        return;
-    }
-
-    if (head_dim == 64) {
-        launch_single_query_key_mean_topk_chunked<64>(
-            q_grouped, k_mean, topk_out, local_scores, local_indices, done_counts,
-            flat_heads, groups, num_kv_blocks, k_mean_capacity_blocks,
-            topk_count, chunk_count, local_count);
-    } else if (head_dim == 128) {
-        launch_single_query_key_mean_topk_chunked<128>(
-            q_grouped, k_mean, topk_out, local_scores, local_indices, done_counts,
-            flat_heads, groups, num_kv_blocks, k_mean_capacity_blocks,
-            topk_count, chunk_count, local_count);
+    int local_count,
+    bool is_bf16) {
+    if (is_bf16) {
+        dispatch_single_query_key_mean_topk_chunked_typed<__nv_bfloat16>(
+            q_grouped_raw, k_mean_raw, topk_out_raw, local_scores_raw,
+            local_indices_raw, done_counts_raw, flat_heads, groups, num_kv_blocks,
+            k_mean_capacity_blocks, head_dim, topk_count, chunk_count, local_count);
     } else {
-        fprintf(stderr, "single_query_key_mean_topk_chunked: unsupported head_dim=%d\n", head_dim);
+        dispatch_single_query_key_mean_topk_chunked_typed<half>(
+            q_grouped_raw, k_mean_raw, topk_out_raw, local_scores_raw,
+            local_indices_raw, done_counts_raw, flat_heads, groups, num_kv_blocks,
+            k_mean_capacity_blocks, head_dim, topk_count, chunk_count, local_count);
     }
 }
 

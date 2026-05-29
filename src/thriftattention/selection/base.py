@@ -26,5 +26,6 @@ class SelectionPolicy(Protocol):
         *,
         config: SelectionConfig,
         causal: bool,
+        is_bf16: bool,
     ) -> torch.Tensor:
         ...

@@ -4,6 +4,7 @@
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include "thriftattention/sm120/cuda_common.cuh"
 
@@ -13,15 +14,15 @@
 // Grid: (batch * heads * query_blocks), one CTA per query tile.
 // ===========================================================================
 
-template<bool CAUSAL, int BLOCK_Q, int BLOCK_KV_FP4, int HEAD_DIM,
+template<typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV_FP4, int HEAD_DIM,
          int HEAD_DIM_2, int SCALE_DIM,
          int NUM_WARPS, int WARP_Q>
 __launch_bounds__(NUM_WARPS * TA_WARP_SIZE)
 __global__
 void thrift_attention_kernel(
-    const half* Q_fp16_in,
-    const half* K_fp16_in,
-    const half* V_fp16_in,
+    const T* Q_fp16_in,
+    const T* K_fp16_in,
+    const T* V_fp16_in,
     const unsigned long long* topk_mask_in,
     int topk_word_count,
     const __nv_fp4x2_e2m1* Q,
@@ -30,7 +31,7 @@ void thrift_attention_kernel(
     const __nv_fp8_e4m3* S_Q,
     const __nv_fp8_e4m3* S_K,
     const __nv_fp8_e4m3* S_V,
-    __half* O,
+    T* O,
     float* rowmax_state,
     float* rowsum_state,
     int bs,
@@ -40,6 +41,7 @@ void thrift_attention_kernel(
     int num_q_heads,
     int num_kv_heads)
 {
+    using Traits = PrecisionTraits<T>;
     constexpr int TB_SIZE = NUM_WARPS * TA_WARP_SIZE;
     constexpr int MMA_M = 16;
     constexpr int MMA_K_FP4 = 64;
@@ -438,24 +440,24 @@ void thrift_attention_kernel(
             regs[0] *= norm0;  regs[1] *= norm0;
             regs[2] *= norm1;  regs[3] *= norm1;
 
-            reinterpret_cast<__half2*>(O + (row + 0) * HEAD_DIM + col)[0] =
-                __floats2half2_rn(regs[0], regs[1]);
-            reinterpret_cast<__half2*>(O + (row + 8) * HEAD_DIM + col)[0] =
-                __floats2half2_rn(regs[2], regs[3]);
+            reinterpret_cast<typename Traits::vec2*>(O + (row + 0) * HEAD_DIM + col)[0] =
+                Traits::pack2(regs[0], regs[1]);
+            reinterpret_cast<typename Traits::vec2*>(O + (row + 8) * HEAD_DIM + col)[0] =
+                Traits::pack2(regs[2], regs[3]);
     }
 }
 
-template<bool CAUSAL, int BLOCK_Q, int BLOCK_KV_FP4, int HEAD_DIM,
+template<typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV_FP4, int HEAD_DIM,
          int NUM_WARPS, int WARP_Q, int TOPK_BUCKET>
 __launch_bounds__(NUM_WARPS * TA_WARP_SIZE)
 __global__
 void thrift_attention_fp16_finalize_kernel(
-    const half* Q_fp16_in,
-    const half* K_fp16_in,
-    const half* V_fp16_in,
+    const T* Q_fp16_in,
+    const T* K_fp16_in,
+    const T* V_fp16_in,
     const int32_t* selected_blocks,
     int topk_count,
-    __half* O,
+    T* O,
     const float* rowmax_state,
     const float* rowsum_state,
     int bs,
@@ -464,6 +466,7 @@ void thrift_attention_fp16_finalize_kernel(
     int num_q_heads,
     int num_kv_heads)
 {
+    using Traits = PrecisionTraits<T>;
     constexpr int TB_SIZE = NUM_WARPS * TA_WARP_SIZE;
     constexpr int MMA_M = 16;
     constexpr int MMA_K_FP16 = 16;
@@ -518,12 +521,12 @@ void thrift_attention_fp16_finalize_kernel(
         const float partial_scale1 = rowsum[mma_id_q][1] * FP4_RANGE;
         for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
             const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
-            const half* upper = O + row * HEAD_DIM + col;
-            const half* lower = O + (row + 8) * HEAD_DIM + col;
-            O_rmem[mma_id_q][mma_id_d][0] = __half2float(upper[0]) * partial_scale0;
-            O_rmem[mma_id_q][mma_id_d][1] = __half2float(upper[1]) * partial_scale0;
-            O_rmem[mma_id_q][mma_id_d][2] = __half2float(lower[0]) * partial_scale1;
-            O_rmem[mma_id_q][mma_id_d][3] = __half2float(lower[1]) * partial_scale1;
+            const T* upper = O + row * HEAD_DIM + col;
+            const T* lower = O + (row + 8) * HEAD_DIM + col;
+            O_rmem[mma_id_q][mma_id_d][0] = Traits::to_float(upper[0]) * partial_scale0;
+            O_rmem[mma_id_q][mma_id_d][1] = Traits::to_float(upper[1]) * partial_scale0;
+            O_rmem[mma_id_q][mma_id_d][2] = Traits::to_float(lower[0]) * partial_scale1;
+            O_rmem[mma_id_q][mma_id_d][3] = Traits::to_float(lower[1]) * partial_scale1;
         }
     }
 
@@ -532,7 +535,7 @@ void thrift_attention_fp16_finalize_kernel(
     const uint32_t Q_fp16_smem = smem_base;
     const uint32_t KV_fp16_smem = smem_base;
 
-    constexpr int Q_FP16_ROW_BYTES = HEAD_DIM * (int)sizeof(half);
+    constexpr int Q_FP16_ROW_BYTES = HEAD_DIM * (int)sizeof(T);
     constexpr int Q_FP16_TOTAL_BYTES = BLOCK_Q * Q_FP16_ROW_BYTES;
     constexpr int Q_FP16_TOTAL_CHUNKS = Q_FP16_TOTAL_BYTES / 16;
 
@@ -551,13 +554,13 @@ void thrift_attention_fp16_finalize_kernel(
     uint32_t Q_fp16_rmem[HEAD_DIM / MMA_K_FP16][4];
     {
         const int q_row = warp_id * WARP_Q + (lane_id % 16);
-        const int q_col_bytes = (lane_id / 16) * 8 * (int)sizeof(half);
+        const int q_col_bytes = (lane_id / 16) * 8 * (int)sizeof(T);
         uint32_t Q_fp16_ld_base = ta_swizzle<Q_FP16_ROW_BYTES>(
             Q_fp16_smem + q_row * Q_FP16_ROW_BYTES + q_col_bytes);
 
         for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_K_FP16; mma_id_d++) {
             uint32_t addr = Q_fp16_ld_base;
-            addr ^= mma_id_d * MMA_K_FP16 * (int)sizeof(half);
+            addr ^= mma_id_d * MMA_K_FP16 * (int)sizeof(T);
             ta_ldmatrix_x4(Q_fp16_rmem[mma_id_d], addr);
         }
     }
@@ -583,15 +586,15 @@ void thrift_attention_fp16_finalize_kernel(
         const int k_block_start = kv_iter * BLOCK_KV_FP4;
         const bool needs_causal_mask = CAUSAL && ((k_block_start + BLOCK_KV_FP4 - 1) > q_block_start);
 
-        const half* K_fp16_ptr = K_fp16_in + kv_iter * FP16_ROWS * HEAD_DIM;
-        ta_gmem_to_smem<FP16_ROWS, HEAD_DIM, TB_SIZE, half>(
+        const T* K_fp16_ptr = K_fp16_in + kv_iter * FP16_ROWS * HEAD_DIM;
+        ta_gmem_to_smem<FP16_ROWS, HEAD_DIM, TB_SIZE, T>(
             KV_fp16_smem, K_fp16_ptr, tid, HEAD_DIM);
         asm volatile("cp.async.commit_group;");
         asm volatile("cp.async.wait_all;");
         __syncthreads();
 
         uint32_t K_fp16_ld_base = ta_swizzle<Q_FP16_ROW_BYTES>(
-            KV_fp16_smem + ((lane_id % 8) * HEAD_DIM + (lane_id / 8) * 8) * (int)sizeof(half));
+            KV_fp16_smem + ((lane_id % 8) * HEAD_DIM + (lane_id / 8) * 8) * (int)sizeof(T));
 
         float S_fp16[FP16_N_TILES][4] = {};
         for (int mma_id_kv = 0; mma_id_kv < FP16_N_TILES; mma_id_kv++) {
@@ -599,17 +602,17 @@ void thrift_attention_fp16_finalize_kernel(
             for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_K_FP16; mma_id_d++) {
                 uint32_t addr = K_fp16_ld_base
                     + mma_id_kv * MMA_N * Q_FP16_ROW_BYTES;
-                addr ^= mma_id_d * MMA_K_FP16 * (int)sizeof(half);
+                addr ^= mma_id_d * MMA_K_FP16 * (int)sizeof(T);
                 ta_ldmatrix_x2(K_tile[mma_id_d], addr);
             }
             for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_K_FP16; mma_id_d++)
-                ta_mma_m16n8k16_f16(
+                Traits::mma(
                     Q_fp16_rmem[mma_id_d], K_tile[mma_id_d], S_fp16[mma_id_kv]);
         }
 
         __syncthreads();
-        const half* V_fp16_ptr = V_fp16_in + kv_iter * FP16_ROWS * HEAD_DIM;
-        ta_gmem_to_smem<FP16_ROWS, HEAD_DIM, TB_SIZE, half>(
+        const T* V_fp16_ptr = V_fp16_in + kv_iter * FP16_ROWS * HEAD_DIM;
+        ta_gmem_to_smem<FP16_ROWS, HEAD_DIM, TB_SIZE, T>(
             KV_fp16_smem, V_fp16_ptr, tid, HEAD_DIM);
         asm volatile("cp.async.commit_group;");
 
@@ -678,11 +681,11 @@ void thrift_attention_fp16_finalize_kernel(
             this_rowsumexp[0] += r0[0] + r0[1] + r1[0] + r1[1];
             this_rowsumexp[1] += r0[2] + r0[3] + r1[2] + r1[3];
 
-            __half2* p = reinterpret_cast<__half2*>(P_rmem[mma_blk]);
-            p[0] = __floats2half2_rn(r0[0] * FP4_RANGE, r0[1] * FP4_RANGE);
-            p[1] = __floats2half2_rn(r0[2] * FP4_RANGE, r0[3] * FP4_RANGE);
-            p[2] = __floats2half2_rn(r1[0] * FP4_RANGE, r1[1] * FP4_RANGE);
-            p[3] = __floats2half2_rn(r1[2] * FP4_RANGE, r1[3] * FP4_RANGE);
+            typename Traits::vec2* p = reinterpret_cast<typename Traits::vec2*>(P_rmem[mma_blk]);
+            p[0] = Traits::pack2(r0[0] * FP4_RANGE, r0[1] * FP4_RANGE);
+            p[1] = Traits::pack2(r0[2] * FP4_RANGE, r0[3] * FP4_RANGE);
+            p[2] = Traits::pack2(r1[0] * FP4_RANGE, r1[1] * FP4_RANGE);
+            p[3] = Traits::pack2(r1[2] * FP4_RANGE, r1[3] * FP4_RANGE);
         }
 
         this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 1);
@@ -696,16 +699,16 @@ void thrift_attention_fp16_finalize_kernel(
         __syncthreads();
 
         uint32_t V_fp16_ld_base = ta_swizzle<Q_FP16_ROW_BYTES>(
-            KV_fp16_smem + ((lane_id % 16) * HEAD_DIM + (lane_id / 16) * 8) * (int)sizeof(half));
+            KV_fp16_smem + ((lane_id % 16) * HEAD_DIM + (lane_id / 16) * 8) * (int)sizeof(T));
 
         for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++)
             for (int mma_id_kv = 0; mma_id_kv < FP16_PV_CHUNKS; mma_id_kv++) {
                 uint32_t V_tile[2];
                 uint32_t addr = V_fp16_ld_base
                     + mma_id_kv * MMA_K_FP16 * Q_FP16_ROW_BYTES;
-                addr ^= mma_id_d * MMA_N * (int)sizeof(half);
+                addr ^= mma_id_d * MMA_N * (int)sizeof(T);
                 ta_ldmatrix_x2_trans(V_tile, addr);
-                ta_mma_m16n8k16_f16(P_rmem[mma_id_kv], V_tile, O_rmem[0][mma_id_d]);
+                Traits::mma(P_rmem[mma_id_kv], V_tile, O_rmem[0][mma_id_d]);
             }
 
         __syncthreads();
@@ -727,21 +730,21 @@ void thrift_attention_fp16_finalize_kernel(
             regs[0] *= norm0;  regs[1] *= norm0;
             regs[2] *= norm1;  regs[3] *= norm1;
 
-            reinterpret_cast<__half2*>(O + (row + 0) * HEAD_DIM + col)[0] =
-                __floats2half2_rn(regs[0], regs[1]);
-            reinterpret_cast<__half2*>(O + (row + 8) * HEAD_DIM + col)[0] =
-                __floats2half2_rn(regs[2], regs[3]);
+            reinterpret_cast<typename Traits::vec2*>(O + (row + 0) * HEAD_DIM + col)[0] =
+                Traits::pack2(regs[0], regs[1]);
+            reinterpret_cast<typename Traits::vec2*>(O + (row + 8) * HEAD_DIM + col)[0] =
+                Traits::pack2(regs[2], regs[3]);
         }
 }
 
-template<bool CAUSAL, int HEAD_DIM, int BLOCK_Q, int BLOCK_KV_FP4, int TOPK_BUCKET>
+template<typename T, bool CAUSAL, int HEAD_DIM, int BLOCK_Q, int BLOCK_KV_FP4, int TOPK_BUCKET>
 static void launch_thrift_attention_fp16_finalize(
-    const half* Q_fp16,
-    const half* K_fp16,
-    const half* V_fp16,
+    const T* Q_fp16,
+    const T* K_fp16,
+    const T* V_fp16,
     const int32_t* selected_blocks,
     int topk_count,
-    __half* O,
+    T* O,
     float* rowmax_state,
     float* rowsum_state,
     int bs,
@@ -753,14 +756,14 @@ static void launch_thrift_attention_fp16_finalize(
     constexpr int WARP_Q = 16;
     constexpr int NUM_WARPS = BLOCK_Q / WARP_Q;
     constexpr int TB_SIZE = NUM_WARPS * TA_WARP_SIZE;
-    constexpr int q_fp16_smem = BLOCK_Q * HEAD_DIM * (int)sizeof(half);
-    constexpr int fp16_kv_smem = BLOCK_KV_FP4 * HEAD_DIM * (int)sizeof(half);
+    constexpr int q_fp16_smem = BLOCK_Q * HEAD_DIM * (int)sizeof(T);
+    constexpr int fp16_kv_smem = BLOCK_KV_FP4 * HEAD_DIM * (int)sizeof(T);
     constexpr int fp16_smem = (q_fp16_smem > fp16_kv_smem) ? q_fp16_smem : fp16_kv_smem;
 
     const int num_blocks = bs * ta_cdiv(q_len, BLOCK_Q);
 
     auto fp16_finalize_kernel = thrift_attention_fp16_finalize_kernel<
-        CAUSAL, BLOCK_Q, BLOCK_KV_FP4, HEAD_DIM, NUM_WARPS, WARP_Q, TOPK_BUCKET>;
+        T, CAUSAL, BLOCK_Q, BLOCK_KV_FP4, HEAD_DIM, NUM_WARPS, WARP_Q, TOPK_BUCKET>;
 
     cudaFuncSetAttribute(fp16_finalize_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, fp16_smem);
 
@@ -771,14 +774,14 @@ static void launch_thrift_attention_fp16_finalize(
         bs, q_len, kv_len, num_q_heads, num_kv_heads);
 }
 
-template<bool CAUSAL, int HEAD_DIM, int BLOCK_Q, int BLOCK_KV_FP4>
+template<typename T, bool CAUSAL, int HEAD_DIM, int BLOCK_Q, int BLOCK_KV_FP4>
 static void dispatch_thrift_attention_fp16_finalize(
-    const half* Q_fp16,
-    const half* K_fp16,
-    const half* V_fp16,
+    const T* Q_fp16,
+    const T* K_fp16,
+    const T* V_fp16,
     const int32_t* selected_blocks,
     int topk_count,
-    __half* O,
+    T* O,
     float* rowmax_state,
     float* rowsum_state,
     int bs,
@@ -788,55 +791,55 @@ static void dispatch_thrift_attention_fp16_finalize(
     int num_kv_heads)
 {
     if (topk_count <= 1)
-        return launch_thrift_attention_fp16_finalize<CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 1>(
+        return launch_thrift_attention_fp16_finalize<T, CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 1>(
             Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count, O,
             rowmax_state, rowsum_state, bs, q_len, kv_len, num_q_heads, num_kv_heads);
     if (topk_count <= 2)
-        return launch_thrift_attention_fp16_finalize<CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 2>(
+        return launch_thrift_attention_fp16_finalize<T, CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 2>(
             Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count, O,
             rowmax_state, rowsum_state, bs, q_len, kv_len, num_q_heads, num_kv_heads);
     if (topk_count <= 4)
-        return launch_thrift_attention_fp16_finalize<CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 4>(
+        return launch_thrift_attention_fp16_finalize<T, CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 4>(
             Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count, O,
             rowmax_state, rowsum_state, bs, q_len, kv_len, num_q_heads, num_kv_heads);
     if (topk_count <= 8)
-        return launch_thrift_attention_fp16_finalize<CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 8>(
+        return launch_thrift_attention_fp16_finalize<T, CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 8>(
             Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count, O,
             rowmax_state, rowsum_state, bs, q_len, kv_len, num_q_heads, num_kv_heads);
     if (topk_count <= 16)
-        return launch_thrift_attention_fp16_finalize<CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 16>(
+        return launch_thrift_attention_fp16_finalize<T, CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 16>(
             Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count, O,
             rowmax_state, rowsum_state, bs, q_len, kv_len, num_q_heads, num_kv_heads);
     if (topk_count <= 32)
-        return launch_thrift_attention_fp16_finalize<CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 32>(
+        return launch_thrift_attention_fp16_finalize<T, CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 32>(
             Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count, O,
             rowmax_state, rowsum_state, bs, q_len, kv_len, num_q_heads, num_kv_heads);
     if (topk_count <= 64)
-        return launch_thrift_attention_fp16_finalize<CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 64>(
+        return launch_thrift_attention_fp16_finalize<T, CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 64>(
             Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count, O,
             rowmax_state, rowsum_state, bs, q_len, kv_len, num_q_heads, num_kv_heads);
     if (topk_count <= 128)
-        return launch_thrift_attention_fp16_finalize<CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 128>(
+        return launch_thrift_attention_fp16_finalize<T, CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 128>(
             Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count, O,
             rowmax_state, rowsum_state, bs, q_len, kv_len, num_q_heads, num_kv_heads);
     if (topk_count <= 256)
-        return launch_thrift_attention_fp16_finalize<CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 256>(
+        return launch_thrift_attention_fp16_finalize<T, CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 256>(
             Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count, O,
             rowmax_state, rowsum_state, bs, q_len, kv_len, num_q_heads, num_kv_heads);
     if (topk_count <= 512)
-        return launch_thrift_attention_fp16_finalize<CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 512>(
+        return launch_thrift_attention_fp16_finalize<T, CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 512>(
             Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count, O,
             rowmax_state, rowsum_state, bs, q_len, kv_len, num_q_heads, num_kv_heads);
-    return launch_thrift_attention_fp16_finalize<CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 2048>(
+    return launch_thrift_attention_fp16_finalize<T, CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4, 2048>(
         Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count, O,
         rowmax_state, rowsum_state, bs, q_len, kv_len, num_q_heads, num_kv_heads);
 }
 
-template<bool CAUSAL, int HEAD_DIM, int BLOCK_Q, int BLOCK_KV_FP4>
+template<typename T, bool CAUSAL, int HEAD_DIM, int BLOCK_Q, int BLOCK_KV_FP4>
 static void launch_thrift_attention(
-    const half* Q_fp16,
-    const half* K_fp16,
-    const half* V_fp16,
+    const T* Q_fp16,
+    const T* K_fp16,
+    const T* V_fp16,
     const int32_t* selected_blocks,
     int topk_count,
     const unsigned long long* topk_mask,
@@ -847,7 +850,7 @@ static void launch_thrift_attention(
     const __nv_fp8_e4m3* S_Q,
     const __nv_fp8_e4m3* S_K,
     const __nv_fp8_e4m3* S_V,
-    __half* O,
+    T* O,
     float* rowmax_state,
     float* rowsum_state,
     int bs,
@@ -876,7 +879,7 @@ static void launch_thrift_attention(
     constexpr int fp4_kv_smem = q_phase_smem + v_phase_smem;
 
     auto fp4_state_kernel = thrift_attention_kernel<
-        CAUSAL, BLOCK_Q, BLOCK_KV_FP4, HEAD_DIM,
+        T, CAUSAL, BLOCK_Q, BLOCK_KV_FP4, HEAD_DIM,
         HEAD_DIM_2, SCALE_DIM, NUM_WARPS, WARP_Q>;
 
     cudaFuncSetAttribute(fp4_state_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, fp4_kv_smem);
@@ -889,18 +892,18 @@ static void launch_thrift_attention(
         rowmax_state, rowsum_state,
         bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
 
-    dispatch_thrift_attention_fp16_finalize<CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4>(
+    dispatch_thrift_attention_fp16_finalize<T, CAUSAL, HEAD_DIM, BLOCK_Q, BLOCK_KV_FP4>(
         Q_fp16, K_fp16, V_fp16,
         selected_blocks, topk_count,
         O, rowmax_state, rowsum_state,
         bs, q_len, kv_len, num_q_heads, num_kv_heads);
 }
 
-template<bool CAUSAL, int HEAD_DIM>
+template<typename T, bool CAUSAL, int HEAD_DIM>
 static void dispatch_thrift_attention(
-    const half* Q_fp16,
-    const half* K_fp16,
-    const half* V_fp16,
+    const T* Q_fp16,
+    const T* K_fp16,
+    const T* V_fp16,
     const int32_t* selected_blocks,
     int topk_count,
     const unsigned long long* topk_mask,
@@ -911,7 +914,7 @@ static void dispatch_thrift_attention(
     const __nv_fp8_e4m3* S_Q,
     const __nv_fp8_e4m3* S_K,
     const __nv_fp8_e4m3* S_V,
-    __half* O,
+    T* O,
     float* rowmax_state,
     float* rowsum_state,
     int bs,
@@ -921,11 +924,72 @@ static void dispatch_thrift_attention(
     int num_q_heads,
     int num_kv_heads)
 {
-    return launch_thrift_attention<CAUSAL, HEAD_DIM, 64, 64>(
+    return launch_thrift_attention<T, CAUSAL, HEAD_DIM, 64, 64>(
         Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count,
         topk_mask, topk_word_count, Q_fp4, K_fp4, V_fp4,
         S_Q, S_K, S_V, O, rowmax_state, rowsum_state,
         bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+}
+
+template<typename T, bool CAUSAL>
+static void thrift_attention_nvfp4_typed(
+    const void* Q_fp16_raw,
+    const void* K_fp16_raw,
+    const void* V_fp16_raw,
+    const void* selected_blocks_raw,
+    int topk_count,
+    const void* topk_mask_raw,
+    int topk_word_count,
+    const void* Q_raw,
+    const void* K_raw,
+    const void* V_raw,
+    const void* S_Q_raw,
+    const void* S_K_raw,
+    const void* S_V_raw,
+    void* O_raw,
+    void* rowmax_state_raw,
+    void* rowsum_state_raw,
+    int bs,
+    int q_len,
+    int kv_len,
+    int kv_capacity,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim)
+{
+    auto Q_fp16 = reinterpret_cast<const T*>(Q_fp16_raw);
+    auto K_fp16 = reinterpret_cast<const T*>(K_fp16_raw);
+    auto V_fp16 = reinterpret_cast<const T*>(V_fp16_raw);
+    auto selected_blocks = reinterpret_cast<const int32_t*>(selected_blocks_raw);
+    auto topk_mask = reinterpret_cast<const unsigned long long*>(topk_mask_raw);
+
+    auto Q = reinterpret_cast<const __nv_fp4x2_e2m1*>(Q_raw);
+    auto K = reinterpret_cast<const __nv_fp4x2_e2m1*>(K_raw);
+    auto V = reinterpret_cast<const __nv_fp4x2_e2m1*>(V_raw);
+
+    auto S_Q = reinterpret_cast<const __nv_fp8_e4m3*>(S_Q_raw);
+    auto S_K = reinterpret_cast<const __nv_fp8_e4m3*>(S_K_raw);
+    auto S_V = reinterpret_cast<const __nv_fp8_e4m3*>(S_V_raw);
+    auto O = reinterpret_cast<T*>(O_raw);
+    auto rowmax_state = reinterpret_cast<float*>(rowmax_state_raw);
+    auto rowsum_state = reinterpret_cast<float*>(rowsum_state_raw);
+
+    if (head_dim == 64)
+        dispatch_thrift_attention<T, CAUSAL, 64>(
+            Q_fp16, K_fp16, V_fp16,
+            selected_blocks, topk_count,
+            topk_mask, topk_word_count,
+            Q, K, V, S_Q, S_K, S_V, O,
+            rowmax_state, rowsum_state,
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+    else
+        dispatch_thrift_attention<T, CAUSAL, 128>(
+            Q_fp16, K_fp16, V_fp16,
+            selected_blocks, topk_count,
+            topk_mask, topk_word_count,
+            Q, K, V, S_Q, S_K, S_V, O,
+            rowmax_state, rowsum_state,
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
 }
 
 void thrift_attention_causal_nvfp4(
@@ -951,41 +1015,22 @@ void thrift_attention_causal_nvfp4(
     int kv_capacity,
     int num_q_heads,
     int num_kv_heads,
-    int head_dim)
+    int head_dim,
+    bool is_bf16)
 {
-    auto Q_fp16 = reinterpret_cast<const half*>(Q_fp16_raw);
-    auto K_fp16 = reinterpret_cast<const half*>(K_fp16_raw);
-    auto V_fp16 = reinterpret_cast<const half*>(V_fp16_raw);
-    auto selected_blocks = reinterpret_cast<const int32_t*>(selected_blocks_raw);
-    auto topk_mask = reinterpret_cast<const unsigned long long*>(topk_mask_raw);
-
-    auto Q = reinterpret_cast<const __nv_fp4x2_e2m1*>(Q_raw);
-    auto K = reinterpret_cast<const __nv_fp4x2_e2m1*>(K_raw);
-    auto V = reinterpret_cast<const __nv_fp4x2_e2m1*>(V_raw);
-
-    auto S_Q = reinterpret_cast<const __nv_fp8_e4m3*>(S_Q_raw);
-    auto S_K = reinterpret_cast<const __nv_fp8_e4m3*>(S_K_raw);
-    auto S_V = reinterpret_cast<const __nv_fp8_e4m3*>(S_V_raw);
-    auto O = reinterpret_cast<__half*>(O_raw);
-    auto rowmax_state = reinterpret_cast<float*>(rowmax_state_raw);
-    auto rowsum_state = reinterpret_cast<float*>(rowsum_state_raw);
-
-    if (head_dim == 64)
-        dispatch_thrift_attention<true, 64>(
-            Q_fp16, K_fp16, V_fp16,
-            selected_blocks, topk_count,
-            topk_mask, topk_word_count,
-            Q, K, V, S_Q, S_K, S_V, O,
-            rowmax_state, rowsum_state,
-            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
-    else
-        dispatch_thrift_attention<true, 128>(
-            Q_fp16, K_fp16, V_fp16,
-            selected_blocks, topk_count,
-            topk_mask, topk_word_count,
-            Q, K, V, S_Q, S_K, S_V, O,
-            rowmax_state, rowsum_state,
-            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+    if (is_bf16) {
+        thrift_attention_nvfp4_typed<__nv_bfloat16, true>(
+            Q_fp16_raw, K_fp16_raw, V_fp16_raw, selected_blocks_raw, topk_count,
+            topk_mask_raw, topk_word_count, Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw,
+            S_V_raw, O_raw, rowmax_state_raw, rowsum_state_raw, bs, q_len,
+            kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    } else {
+        thrift_attention_nvfp4_typed<half, true>(
+            Q_fp16_raw, K_fp16_raw, V_fp16_raw, selected_blocks_raw, topk_count,
+            topk_mask_raw, topk_word_count, Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw,
+            S_V_raw, O_raw, rowmax_state_raw, rowsum_state_raw, bs, q_len,
+            kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    }
 }
 
 void thrift_attention_noncausal_nvfp4(
@@ -1011,39 +1056,20 @@ void thrift_attention_noncausal_nvfp4(
     int kv_capacity,
     int num_q_heads,
     int num_kv_heads,
-    int head_dim)
+    int head_dim,
+    bool is_bf16)
 {
-    auto Q_fp16 = reinterpret_cast<const half*>(Q_fp16_raw);
-    auto K_fp16 = reinterpret_cast<const half*>(K_fp16_raw);
-    auto V_fp16 = reinterpret_cast<const half*>(V_fp16_raw);
-    auto selected_blocks = reinterpret_cast<const int32_t*>(selected_blocks_raw);
-    auto topk_mask = reinterpret_cast<const unsigned long long*>(topk_mask_raw);
-
-    auto Q = reinterpret_cast<const __nv_fp4x2_e2m1*>(Q_raw);
-    auto K = reinterpret_cast<const __nv_fp4x2_e2m1*>(K_raw);
-    auto V = reinterpret_cast<const __nv_fp4x2_e2m1*>(V_raw);
-
-    auto S_Q = reinterpret_cast<const __nv_fp8_e4m3*>(S_Q_raw);
-    auto S_K = reinterpret_cast<const __nv_fp8_e4m3*>(S_K_raw);
-    auto S_V = reinterpret_cast<const __nv_fp8_e4m3*>(S_V_raw);
-    auto O = reinterpret_cast<__half*>(O_raw);
-    auto rowmax_state = reinterpret_cast<float*>(rowmax_state_raw);
-    auto rowsum_state = reinterpret_cast<float*>(rowsum_state_raw);
-
-    if (head_dim == 64)
-        dispatch_thrift_attention<false, 64>(
-            Q_fp16, K_fp16, V_fp16,
-            selected_blocks, topk_count,
-            topk_mask, topk_word_count,
-            Q, K, V, S_Q, S_K, S_V, O,
-            rowmax_state, rowsum_state,
-            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
-    else
-        dispatch_thrift_attention<false, 128>(
-            Q_fp16, K_fp16, V_fp16,
-            selected_blocks, topk_count,
-            topk_mask, topk_word_count,
-            Q, K, V, S_Q, S_K, S_V, O,
-            rowmax_state, rowsum_state,
-            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+    if (is_bf16) {
+        thrift_attention_nvfp4_typed<__nv_bfloat16, false>(
+            Q_fp16_raw, K_fp16_raw, V_fp16_raw, selected_blocks_raw, topk_count,
+            topk_mask_raw, topk_word_count, Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw,
+            S_V_raw, O_raw, rowmax_state_raw, rowsum_state_raw, bs, q_len,
+            kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    } else {
+        thrift_attention_nvfp4_typed<half, false>(
+            Q_fp16_raw, K_fp16_raw, V_fp16_raw, selected_blocks_raw, topk_count,
+            topk_mask_raw, topk_word_count, Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw,
+            S_V_raw, O_raw, rowmax_state_raw, rowsum_state_raw, bs, q_len,
+            kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    }
 }

@@ -33,8 +33,9 @@ def test_resolve_top_k_rejects_invalid_fraction():
 
 def test_select_key_blocks_groups_gqa(monkeypatch):
     from thriftattention import selection
+    from thriftattention.selection import block_mean
 
-    monkeypatch.setattr(selection, "check_qkv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(block_mean, "check_qkv", lambda *args, **kwargs: None)
 
     q = torch.tensor(
         [[[[10.0, 0.0]], [[0.0, 1.0]], [[1.0, 0.0]], [[0.0, 10.0]]]],

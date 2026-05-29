@@ -20,6 +20,7 @@ def attention(
         config = AttentionConfig()
 
     head_dim = q.shape[-1]
+    is_bf16 = q.dtype == torch.bfloat16
     quant_format = get_quant_format(config.quant_format)
     backend = select_backend(
         config,
@@ -41,6 +42,7 @@ def attention(
                 block_size=config.block_size,
             ),
             causal=config.causal,
+            is_bf16=is_bf16,
         )
 
     return backend.attention(
@@ -50,4 +52,5 @@ def attention(
         selection=selection,
         quant_format=quant_format,
         config=config,
+        is_bf16=is_bf16,
     )

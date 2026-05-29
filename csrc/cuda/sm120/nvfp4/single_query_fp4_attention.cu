@@ -7,6 +7,9 @@
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
+#include "thriftattention/sm120/cuda_common.cuh"
 
 __device__ inline
 void ldmatrix_x4_sqfp4(uint32_t reg[4], uint32_t addr) {
@@ -154,7 +157,7 @@ int sage_perm_seq_sqfp4(int x) {
     return base + sage_perm32_sqfp4(x & 31);
 }
 
-template<int BLOCK_KV, int HEAD_DIM, int HEAD_DIM_2, int SCALE_DIM>
+template<typename T, int BLOCK_KV, int HEAD_DIM, int HEAD_DIM_2, int SCALE_DIM>
 __launch_bounds__(WARP_SIZE_sqfp4)
 __global__
 void fp4_attention_single_query_kernel(
@@ -167,7 +170,7 @@ void fp4_attention_single_query_kernel(
     float* O_partial,       // [bs, num_kv_splits, 16, HEAD_DIM]
     float* rowmax_partial,  // [bs, num_kv_splits, 16]
     float* rowsum_partial,  // [bs, num_kv_splits, 16]
-    __half* O_final,        // [bs, q_len, HEAD_DIM]
+    T* O_final,             // [bs, q_len, HEAD_DIM]
     int* split_counter,     // [bs] — zeroed before launch
     int bs,
     int q_len,
@@ -177,6 +180,7 @@ void fp4_attention_single_query_kernel(
     int num_q_heads,
     int num_kv_heads)
 {
+    using Traits = PrecisionTraits<T>;
     constexpr int TB_SIZE = WARP_SIZE_sqfp4;
     constexpr int BLOCK_Q = 16;
     constexpr int MMA_M = 16;
@@ -696,7 +700,8 @@ void fp4_attention_single_query_kernel(
 
         if (row < q_len) {
             float norm = norm_smem[row];
-            O_final[bid * q_len * HEAD_DIM + row * HEAD_DIM + col] = __float2half(acc * norm);
+            O_final[bid * q_len * HEAD_DIM + row * HEAD_DIM + col] =
+                Traits::from_float(acc * norm);
         }
     }
 }
@@ -707,7 +712,7 @@ void fp4_attention_single_query_kernel(
 // Handles unpadded Q (q_len rows, typically 1 for single-query).
 // Grid: (bs,)
 // ---------------------------------------------------------------------------
-template<int BLOCK_KV, int HEAD_DIM, int HEAD_DIM_2, int SCALE_DIM>
+template<typename T, int BLOCK_KV, int HEAD_DIM, int HEAD_DIM_2, int SCALE_DIM>
 __launch_bounds__(WARP_SIZE_sqfp4)
 __global__
 void fp4_attention_single_query_nosplit_kernel(
@@ -717,7 +722,7 @@ void fp4_attention_single_query_nosplit_kernel(
     const __nv_fp8_e4m3* S_Q,
     const __nv_fp8_e4m3* S_K,
     const __nv_fp8_e4m3* S_V,
-    __half* O,
+    T* O,
     int bs,
     int q_len,
     int kv_len,
@@ -725,6 +730,7 @@ void fp4_attention_single_query_nosplit_kernel(
     int num_q_heads,
     int num_kv_heads)
 {
+    using Traits = PrecisionTraits<T>;
     constexpr int TB_SIZE = WARP_SIZE_sqfp4;
     constexpr int BLOCK_Q = 16;
     constexpr int MMA_M = 16;
@@ -1089,11 +1095,11 @@ void fp4_attention_single_query_nosplit_kernel(
         regs[3] *= norm1;
 
         if (row < q_len)
-            reinterpret_cast<__half2*>(O + row * HEAD_DIM + col)[0] =
-                __float22half2_rn({regs[0], regs[1]});
+            reinterpret_cast<typename Traits::vec2*>(O + row * HEAD_DIM + col)[0] =
+                Traits::pack2(regs[0], regs[1]);
         if (row + 8 < q_len)
-            reinterpret_cast<__half2*>(O + (row + 8) * HEAD_DIM + col)[0] =
-                __float22half2_rn({regs[2], regs[3]});
+            reinterpret_cast<typename Traits::vec2*>(O + (row + 8) * HEAD_DIM + col)[0] =
+                Traits::pack2(regs[2], regs[3]);
     }
 }
 
@@ -1104,7 +1110,7 @@ void fp4_attention_single_query_nosplit_kernel(
 // No workspace allocation needed — reduction is entirely intra-CTA.
 // Grid: (bs,)
 // ---------------------------------------------------------------------------
-template<int BLOCK_KV, int HEAD_DIM, int HEAD_DIM_2, int SCALE_DIM, int NUM_WARPS>
+template<typename T, int BLOCK_KV, int HEAD_DIM, int HEAD_DIM_2, int SCALE_DIM, int NUM_WARPS>
 __launch_bounds__(NUM_WARPS * WARP_SIZE_sqfp4, 1)
 __global__
 void fp4_attention_single_query_cta_kernel(
@@ -1114,7 +1120,7 @@ void fp4_attention_single_query_cta_kernel(
     const __nv_fp8_e4m3* S_Q,
     const __nv_fp8_e4m3* S_K,
     const __nv_fp8_e4m3* S_V,
-    __half* O,
+    T* O,
     int bs,
     int q_len,
     int kv_len,
@@ -1122,6 +1128,7 @@ void fp4_attention_single_query_cta_kernel(
     int num_q_heads,
     int num_kv_heads)
 {
+    using Traits = PrecisionTraits<T>;
     constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE_sqfp4;
     constexpr int BLOCK_Q = 16;
     constexpr int MMA_M = 16;
@@ -1600,17 +1607,17 @@ void fp4_attention_single_query_cta_kernel(
         }
 
         if (row < q_len) {
-            __half2 result = __floats2half2_rn(acc0 * norm, acc1 * norm);
-            *reinterpret_cast<__half2*>(&O[row * HEAD_DIM + col]) = result;
+            typename Traits::vec2 result = Traits::pack2(acc0 * norm, acc1 * norm);
+            *reinterpret_cast<typename Traits::vec2*>(&O[row * HEAD_DIM + col]) = result;
         }
     }
 }
 
-template<int HEAD_DIM>
+template<typename T, int HEAD_DIM>
 static void fp4_attention_single_query_nosplit_launch(
     const __nv_fp4x2_e2m1* Q, const __nv_fp4x2_e2m1* K, const __nv_fp4x2_e2m1* V,
     const __nv_fp8_e4m3* S_Q, const __nv_fp8_e4m3* S_K, const __nv_fp8_e4m3* S_V,
-    __half* O, int bs, int q_len, int kv_len, int kv_capacity,
+    T* O, int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads) {
 
     constexpr int HEAD_DIM_2 = HEAD_DIM / 2;
@@ -1627,7 +1634,7 @@ static void fp4_attention_single_query_nosplit_launch(
                                 + HEAD_DIM * (BLOCK_KV / 16) * sizeof(__nv_fp8_e4m3);
     constexpr int smem_size = q_phase_smem > kv_phase_smem ? q_phase_smem : kv_phase_smem;
 
-    auto kernel = fp4_attention_single_query_nosplit_kernel<BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM>;
+    auto kernel = fp4_attention_single_query_nosplit_kernel<T, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
     kernel<<<bs, TB_SIZE, smem_size>>>(
@@ -1637,11 +1644,11 @@ static void fp4_attention_single_query_nosplit_launch(
 }
 
 // CTA-cooperative launch: multiple warps per block, shared-memory reduction
-template<int HEAD_DIM>
+template<typename T, int HEAD_DIM>
 static void fp4_attention_single_query_cta_launch(
     const __nv_fp4x2_e2m1* Q, const __nv_fp4x2_e2m1* K, const __nv_fp4x2_e2m1* V,
     const __nv_fp8_e4m3* S_Q, const __nv_fp8_e4m3* S_K, const __nv_fp8_e4m3* S_V,
-    __half* O, int bs, int q_len, int kv_len, int kv_capacity,
+    T* O, int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads) {
 
     constexpr int HEAD_DIM_2 = HEAD_DIM / 2;
@@ -1664,7 +1671,7 @@ static void fp4_attention_single_query_cta_launch(
     constexpr int smem_12 = q_phase_smem > kv_phase_smem ? q_phase_smem : kv_phase_smem;
     constexpr int smem_size = smem_12 > reduce_smem ? smem_12 : reduce_smem;
 
-    auto kernel = fp4_attention_single_query_cta_kernel<BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM, NUM_WARPS>;
+    auto kernel = fp4_attention_single_query_cta_kernel<T, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM, NUM_WARPS>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
     kernel<<<bs, TB_SIZE, smem_size>>>(
@@ -1674,11 +1681,11 @@ static void fp4_attention_single_query_cta_launch(
 }
 
 // Split-KV launch: multiple blocks per batch element, requires workspace
-template<int HEAD_DIM>
+template<typename T, int HEAD_DIM>
 static void fp4_attention_single_query_split_launch(
     const __nv_fp4x2_e2m1* Q, const __nv_fp4x2_e2m1* K, const __nv_fp4x2_e2m1* V,
     const __nv_fp8_e4m3* S_Q, const __nv_fp8_e4m3* S_K, const __nv_fp8_e4m3* S_V,
-    __half* O, float* workspace, int bs, int q_len, int kv_len, int kv_capacity,
+    T* O, float* workspace, int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads) {
 
     constexpr int HEAD_DIM_2 = HEAD_DIM / 2;
@@ -1707,7 +1714,7 @@ static void fp4_attention_single_query_split_launch(
     constexpr int kv_phase_smem = kv_phase_smem_single * 2;  // double-buffer
     constexpr int smem_size = q_phase_smem > kv_phase_smem ? q_phase_smem : kv_phase_smem;
 
-    auto kernel = fp4_attention_single_query_kernel<BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM>;
+    auto kernel = fp4_attention_single_query_kernel<T, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
     dim3 grid(num_kv_splits, bs);
@@ -1718,7 +1725,8 @@ static void fp4_attention_single_query_split_launch(
         bs, q_len, kv_len, kv_capacity, num_kv_splits, num_q_heads, num_kv_heads);
 }
 
-void fp4_attention_single_query_nvfp4(
+template<typename T>
+static void fp4_attention_single_query_nvfp4_typed(
     const void* Q_raw,
     const void* K_raw,
     const void* V_raw,
@@ -1741,20 +1749,48 @@ void fp4_attention_single_query_nvfp4(
     auto S_Q = reinterpret_cast<const __nv_fp8_e4m3*>(S_Q_raw);
     auto S_K = reinterpret_cast<const __nv_fp8_e4m3*>(S_K_raw);
     auto S_V = reinterpret_cast<const __nv_fp8_e4m3*>(S_V_raw);
-    auto O = reinterpret_cast<__half*>(O_raw);
+    auto O = reinterpret_cast<T*>(O_raw);
 
     constexpr int BLOCK_KV = 64;
     const int total_kv_blocks = cdiv_sqfp4(kv_len, BLOCK_KV);
 
     if (total_kv_blocks <= 4) {
         if (head_dim == 64)
-            fp4_attention_single_query_nosplit_launch<64>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+            fp4_attention_single_query_nosplit_launch<T, 64>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
         else
-            fp4_attention_single_query_nosplit_launch<128>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+            fp4_attention_single_query_nosplit_launch<T, 128>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
     } else {
         if (head_dim == 64)
-            fp4_attention_single_query_cta_launch<64>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+            fp4_attention_single_query_cta_launch<T, 64>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
         else
-            fp4_attention_single_query_cta_launch<128>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+            fp4_attention_single_query_cta_launch<T, 128>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+    }
+}
+
+void fp4_attention_single_query_nvfp4(
+    const void* Q_raw,
+    const void* K_raw,
+    const void* V_raw,
+    const void* S_Q_raw,
+    const void* S_K_raw,
+    const void* S_V_raw,
+    void* O_raw,
+    void* workspace_raw,
+    int bs,
+    int q_len,
+    int kv_len,
+    int kv_capacity,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    bool is_bf16) {
+    if (is_bf16) {
+        fp4_attention_single_query_nvfp4_typed<__nv_bfloat16>(
+            Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw, workspace_raw,
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    } else {
+        fp4_attention_single_query_nvfp4_typed<half>(
+            Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw, workspace_raw,
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
     }
 }

@@ -18,10 +18,17 @@ PackedQKV = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.
 class QuantFormat(Protocol):
     name: str
 
-    def quantize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def quantize(self, x: torch.Tensor, *, is_bf16: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         ...
 
-    def quantize_qkv(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> PackedQKV:
+    def quantize_qkv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        is_bf16: bool = False,
+    ) -> PackedQKV:
         ...
 
     def quantize_single_query_qkv(
@@ -29,6 +36,8 @@ class QuantFormat(Protocol):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        *,
+        is_bf16: bool = False,
     ) -> PackedQKV:
         ...
 
@@ -37,13 +46,20 @@ class QuantFormat(Protocol):
 class Nvfp4QuantFormat:
     name: QuantFormatName = "nvfp4"
 
-    def quantize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return nvfp4_quantize(x)
+    def quantize(self, x: torch.Tensor, *, is_bf16: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        return nvfp4_quantize(x, is_bf16=is_bf16)
 
-    def quantize_qkv(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> PackedQKV:
-        q_packed, q_scale = nvfp4_quantize(q)
-        k_packed, k_scale = nvfp4_quantize_permuted(k)
-        v_packed_t, v_scale_t = nvfp4_quantize_transposed(v)
+    def quantize_qkv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        is_bf16: bool = False,
+    ) -> PackedQKV:
+        q_packed, q_scale = nvfp4_quantize(q, is_bf16=is_bf16)
+        k_packed, k_scale = nvfp4_quantize_permuted(k, is_bf16=is_bf16)
+        v_packed_t, v_scale_t = nvfp4_quantize_transposed(v, is_bf16=is_bf16)
         return q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t
 
     def quantize_single_query_qkv(
@@ -51,10 +67,12 @@ class Nvfp4QuantFormat:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        *,
+        is_bf16: bool = False,
     ) -> PackedQKV:
-        q_packed, q_scale = nvfp4_quantize(q)
-        k_packed, k_scale = nvfp4_quantize(k)
-        v_packed_t, v_scale_t = nvfp4_quantize_transposed(v)
+        q_packed, q_scale = nvfp4_quantize(q, is_bf16=is_bf16)
+        k_packed, k_scale = nvfp4_quantize(k, is_bf16=is_bf16)
+        v_packed_t, v_scale_t = nvfp4_quantize_transposed(v, is_bf16=is_bf16)
         return q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t
 
 

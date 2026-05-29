@@ -41,14 +41,15 @@ def resolve_top_k(
     return max(1, min(num_blocks, round(top_k_float)))
 
 
-def block_means(x: torch.Tensor, *, block_size: int = 64) -> torch.Tensor:
+def block_means(x: torch.Tensor, *, block_size: int = 64, is_bf16: bool = False) -> torch.Tensor:
     require_block_aligned("x", x.shape[2], block_size)
     batch, heads, seq_len, head_dim = x.shape
+    out_dtype = torch.bfloat16 if is_bf16 else torch.float16
     return (
         x.reshape(batch, heads, seq_len // block_size, block_size, head_dim)
         .float()
         .mean(dim=3)
-        .to(torch.float16)
+        .to(out_dtype)
         .contiguous()
     )
 
@@ -68,6 +69,7 @@ def select_block_pairs(
     top_k: int | None = None,
     fraction: float | None = 0.05,
     block_size: int = 64,
+    is_bf16: bool = False,
 ) -> torch.Tensor:
     """Return selected KV blocks for each query block."""
     check_qkv(q, k, k)
@@ -90,10 +92,10 @@ def select_block_pairs(
             dtype=torch.int32,
         )
 
-    q_mean = block_means(q, block_size=block_size)
-    k_mean = _expand_kv_heads(q, block_means(k, block_size=block_size))
+    q_mean = block_means(q, block_size=block_size, is_bf16=is_bf16)
+    k_mean = _expand_kv_heads(q, block_means(k, block_size=block_size, is_bf16=is_bf16))
     if num_kv_blocks <= 2048:
-        return get_extension().block_mean_topk(q_mean, k_mean, selected_count, causal)
+        return get_extension().block_mean_topk(q_mean, k_mean, selected_count, causal, is_bf16)
 
     scores = (
         q_mean.reshape(q.shape[0] * q.shape[1], q_mean.shape[2], q.shape[3]).float()
@@ -122,6 +124,7 @@ def select_key_blocks(
     top_k: int | None = None,
     fraction: float | None = 0.05,
     block_size: int = 64,
+    is_bf16: bool = False,
 ) -> torch.Tensor:
     """Return selected KV blocks for single-query attention."""
     check_qkv(q, k, k)
@@ -148,7 +151,7 @@ def select_key_blocks(
         )
 
     q_grouped = q.reshape(batch, kv_heads, groups, head_dim)
-    k_mean = block_means(k, block_size=block_size)
+    k_mean = block_means(k, block_size=block_size, is_bf16=is_bf16)
     scores = (q_grouped.float().unsqueeze(3) * k_mean.float().unsqueeze(2)).sum(dim=-1)
     scores = scores.amax(dim=2).reshape(batch * kv_heads, num_kv_blocks)
     return scores.topk(selected_count, dim=-1).indices.to(torch.int32).contiguous()
@@ -164,6 +167,7 @@ class BlockMeanSelectionPolicy:
         *,
         config: SelectionConfig,
         causal: bool,
+        is_bf16: bool,
     ) -> torch.Tensor:
         if config.name != self.name:
             raise ValueError(f"selection config {config.name!r} does not match block_mean policy")
@@ -174,6 +178,7 @@ class BlockMeanSelectionPolicy:
                 top_k=config.top_k,
                 fraction=config.fraction,
                 block_size=config.block_size,
+                is_bf16=is_bf16,
             )
         return select_block_pairs(
             q,
@@ -182,4 +187,5 @@ class BlockMeanSelectionPolicy:
             top_k=config.top_k,
             fraction=config.fraction,
             block_size=config.block_size,
+            is_bf16=is_bf16,
         )

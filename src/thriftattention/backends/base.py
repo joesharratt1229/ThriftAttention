@@ -20,5 +20,6 @@ class AttentionBackend(Protocol):
         selection: torch.Tensor | None,
         quant_format: QuantFormat,
         config: AttentionConfig,
+        is_bf16: bool,
     ) -> torch.Tensor:
         ...

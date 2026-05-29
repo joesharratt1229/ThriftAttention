@@ -26,6 +26,7 @@ class Sm120Nvfp4Backend:
         selection: torch.Tensor | None,
         quant_format: QuantFormat,
         config: AttentionConfig,
+        is_bf16: bool,
     ) -> torch.Tensor:
         check_qkv(q, k, v)
         if config.block_size != 64:
@@ -34,8 +35,8 @@ class Sm120Nvfp4Backend:
             raise NotImplementedError(f"SM120 backend does not support quant format {quant_format.name!r}")
 
         if _use_single_query(q, config.implementation):
-            return self._single_query_attention(q, k, v, selection, quant_format, config)
-        return self._tiled_attention(q, k, v, selection, quant_format, config)
+            return self._single_query_attention(q, k, v, selection, quant_format, config, is_bf16)
+        return self._tiled_attention(q, k, v, selection, quant_format, config, is_bf16)
 
     def _single_query_attention(
         self,
@@ -45,17 +46,18 @@ class Sm120Nvfp4Backend:
         selection: torch.Tensor | None,
         quant_format: QuantFormat,
         config: AttentionConfig,
+        is_bf16: bool,
     ) -> torch.Tensor:
         require_block_aligned("k", k.shape[2], config.block_size)
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
         q_grouped = _group_single_query(q, k.shape[1])
-        packed = quant_format.quantize_single_query_qkv(q_grouped, k, v)
+        packed = quant_format.quantize_single_query_qkv(q_grouped, k, v, is_bf16=is_bf16)
         ext = get_extension()
 
         if config.method == "fp4":
-            out = ext.fp4_attention_single_query_nvfp4_packed(*packed)
+            out = ext.fp4_attention_single_query_nvfp4_packed(*packed, is_bf16)
         elif config.method == "thrift":
             if selection is None:
                 raise ValueError("thrift attention requires a selection tensor")
@@ -65,6 +67,7 @@ class Sm120Nvfp4Backend:
                 v,
                 selection,
                 *packed,
+                is_bf16,
             )
         else:
             raise ValueError(f"unsupported attention method {config.method!r}")
@@ -78,13 +81,14 @@ class Sm120Nvfp4Backend:
         selection: torch.Tensor | None,
         quant_format: QuantFormat,
         config: AttentionConfig,
+        is_bf16: bool,
     ) -> torch.Tensor:
         require_block_aligned("q", q.shape[2], 64)
         require_block_aligned("k", k.shape[2], config.block_size)
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
-        packed = quant_format.quantize_qkv(q, k, v)
+        packed = quant_format.quantize_qkv(q, k, v, is_bf16=is_bf16)
         ext = get_extension()
 
         if config.method == "fp4":
@@ -93,7 +97,7 @@ class Sm120Nvfp4Backend:
                 if config.causal
                 else ext.fp4_attention_noncausal_nvfp4_packed
             )
-            return fn(*packed)
+            return fn(*packed, is_bf16)
         if config.method == "thrift":
             if selection is None:
                 raise ValueError("thrift attention requires a selection tensor")
@@ -102,7 +106,7 @@ class Sm120Nvfp4Backend:
                 if config.causal
                 else ext.thrift_attention_noncausal_nvfp4_packed
             )
-            return fn(q, k, v, selection, *packed)
+            return fn(q, k, v, selection, *packed, is_bf16)
         raise ValueError(f"unsupported attention method {config.method!r}")
 
 

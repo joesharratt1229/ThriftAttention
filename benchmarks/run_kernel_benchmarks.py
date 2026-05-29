@@ -85,6 +85,15 @@ def parse_fraction_list(value: str) -> list[float]:
     return fractions
 
 
+def parse_dtype(value: str) -> torch.dtype:
+    normalized = value.strip().lower()
+    if normalized in ("fp16", "float16", "half"):
+        return torch.float16
+    if normalized in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    raise argparse.ArgumentTypeError("dtype must be fp16 or bf16")
+
+
 def percentile(values: list[float], q: float) -> float:
     if not values:
         raise ValueError("cannot compute percentile of an empty list")
@@ -121,9 +130,9 @@ def make_qkv(args: argparse.Namespace, seq_len: int) -> tuple[torch.Tensor, torc
 
     shape_q = (args.batch_size, args.heads, q_len, args.head_dim)
     shape_kv = (args.batch_size, args.kv_heads, seq_len, args.head_dim)
-    q = torch.randn(shape_q, device=args.device, dtype=torch.float16, generator=generator)
-    k = torch.randn(shape_kv, device=args.device, dtype=torch.float16, generator=generator)
-    v = torch.randn(shape_kv, device=args.device, dtype=torch.float16, generator=generator)
+    q = torch.randn(shape_q, device=args.device, dtype=args.torch_dtype, generator=generator)
+    k = torch.randn(shape_kv, device=args.device, dtype=args.torch_dtype, generator=generator)
+    v = torch.randn(shape_kv, device=args.device, dtype=args.torch_dtype, generator=generator)
     return q, k, v
 
 
@@ -192,7 +201,7 @@ def build_specs(
             fn = make_flash_attn_fp16(q, k, v, causal=args.causal)
             specs.append(
                 BenchmarkSpec(
-                    "fp16_flash_attn",
+                    f"{args.dtype_name}_flash_attn",
                     None,
                     None,
                     fn,
@@ -384,7 +393,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark fp16 flash attention, ThriftAttention coverages, and SageAttention3 FP4.",
+        description="Benchmark high-precision flash attention, ThriftAttention coverages, and SageAttention3 FP4.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("seq_lens", nargs="+", help="Sequence lengths, as spaces or comma-separated values.")
@@ -399,6 +408,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kv-heads", type=int, default=16)
     parser.add_argument("--q-len", type=int, default=None, help="Query length. Defaults to each sequence length; use 1 for decode.")
     parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16", help="Input dtype.")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=50)
     parser.add_argument("--device", default="cuda")
@@ -414,6 +424,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-going", action="store_true", help="Report benchmark errors instead of stopping.")
     args = parser.parse_args()
     args.seq_lens = parse_int_list(args.seq_lens)
+    args.torch_dtype = parse_dtype(args.dtype)
+    args.dtype_name = args.dtype
     return args
 
 
@@ -428,7 +440,7 @@ def main() -> None:
         impl = attention_implementation(q_len)
         print(
             f"Running q={q_len}, kv={seq_len}, implementation={impl}, batch={args.batch_size}, "
-            f"heads={args.heads}, kv_heads={args.kv_heads}, dim={args.head_dim}"
+            f"heads={args.heads}, kv_heads={args.kv_heads}, dim={args.head_dim}, dtype={args.dtype_name}"
         )
         specs = build_specs(args, q, k, v, seq_len)
 

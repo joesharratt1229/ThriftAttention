@@ -369,8 +369,10 @@ def _fast_path_rejection_reason(
             return f"{name} must be shaped [batch, heads, seq, head_dim]"
         if not tensor.is_cuda:
             return "ThriftAttention fast path requires CUDA tensors"
-        if tensor.dtype != torch.float16:
-            return "ThriftAttention fast path requires float16 query/key/value tensors"
+        if tensor.dtype not in (torch.float16, torch.bfloat16):
+            return "ThriftAttention fast path requires float16 or bfloat16 query/key/value tensors"
+    if query.dtype != key.dtype or query.dtype != value.dtype:
+        return "query/key/value tensors must have the same dtype"
 
     head_dim = query.shape[-1]
     if head_dim not in (64, 128):
@@ -438,8 +440,10 @@ def _cached_decode_rejection_reason(
             return f"{name} must be shaped [batch, heads, seq, head_dim]"
         if not tensor.is_cuda:
             return "cached decode requires CUDA tensors"
-        if tensor.dtype != torch.float16:
-            return "cached decode requires float16 query/key/value tensors"
+        if tensor.dtype not in (torch.float16, torch.bfloat16):
+            return "cached decode requires float16 or bfloat16 query/key/value tensors"
+    if query.dtype != key.dtype or query.dtype != value.dtype:
+        return "query/key/value tensors must have the same dtype"
 
     if query.shape[2] != 1:
         return "cached decode requires query sequence length 1"
