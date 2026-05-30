@@ -210,7 +210,7 @@ def build_specs(
     if not args.skip_fp4:
         specs.append(
             BenchmarkSpec(
-                "ta_fp4_attention",
+                f"ta_{args.quant_format}_fp4_attention",
                 None,
                 None,
                 lambda: ta.attention(
@@ -221,6 +221,7 @@ def build_specs(
                         method="fp4",
                         causal=args.causal,
                         implementation=impl,
+                        quant_format=args.quant_format,
                     ),
                 ),
             )
@@ -229,7 +230,7 @@ def build_specs(
         for coverage in args.coverages:
             specs.append(
                 BenchmarkSpec(
-                    f"thrift_{coverage * 100:g}pct",
+                    f"thrift_{args.quant_format}_{coverage * 100:g}pct",
                     coverage,
                     selected_top_k(seq_len, coverage, causal=args.causal and q.shape[2] != 1),
                     lambda coverage=coverage: ta.attention(
@@ -241,6 +242,7 @@ def build_specs(
                             causal=args.causal,
                             fraction=coverage,
                             implementation=impl,
+                            quant_format=args.quant_format,
                         ),
                     ),
                 )
@@ -389,6 +391,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise SystemExit("sequence lengths must be divisible by 64 for ThriftAttention")
         if seq_len % 64 != 0 and not args.skip_fp4:
             raise SystemExit("sequence lengths must be divisible by 64 for FP4 paths")
+        if args.quant_format == "mxfp4" and q_len == 1 and (not args.skip_thrift or not args.skip_fp4):
+            raise SystemExit("--quant-format mxfp4 currently supports tiled ThriftAttention benchmarks only")
 
 
 def parse_args() -> argparse.Namespace:
@@ -409,6 +413,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--q-len", type=int, default=None, help="Query length. Defaults to each sequence length; use 1 for decode.")
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16", help="Input dtype.")
+    parser.add_argument(
+        "--quant-format",
+        choices=("nvfp4", "mxfp4"),
+        default="nvfp4",
+        help="Low-precision quantization format for ThriftAttention kernels.",
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=50)
     parser.add_argument("--device", default="cuda")
@@ -440,7 +450,8 @@ def main() -> None:
         impl = attention_implementation(q_len)
         print(
             f"Running q={q_len}, kv={seq_len}, implementation={impl}, batch={args.batch_size}, "
-            f"heads={args.heads}, kv_heads={args.kv_heads}, dim={args.head_dim}, dtype={args.dtype_name}"
+            f"heads={args.heads}, kv_heads={args.kv_heads}, dim={args.head_dim}, "
+            f"dtype={args.dtype_name}, quant_format={args.quant_format}"
         )
         specs = build_specs(args, q, k, v, seq_len)
 
