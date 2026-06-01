@@ -172,6 +172,18 @@ void block_mean_topk(
     int topk_count,
     bool causal,
     bool is_bf16);
+void quest_block_topk(
+    const void* q_mean,
+    const void* k_min,
+    const void* k_max,
+    void* topk_out,
+    int flat_heads,
+    int num_q_blocks,
+    int num_kv_blocks,
+    int head_dim,
+    int topk_count,
+    bool causal,
+    bool is_bf16);
 void single_query_key_mean_topk(
     const void* q_grouped,
     const void* k_mean,
@@ -180,6 +192,18 @@ void single_query_key_mean_topk(
     int groups,
     int num_kv_blocks,
     int k_mean_capacity_blocks,
+    int head_dim,
+    int topk_count,
+    bool is_bf16);
+void single_query_quest_topk(
+    const void* q_grouped,
+    const void* k_min,
+    const void* k_max,
+    void* topk_out,
+    int flat_heads,
+    int groups,
+    int num_kv_blocks,
+    int k_stat_capacity_blocks,
     int head_dim,
     int topk_count,
     bool is_bf16);
@@ -1096,6 +1120,54 @@ static at::Tensor block_mean_topk_impl(
     return topk;
 }
 
+static at::Tensor quest_block_topk_impl(
+    const at::Tensor& q_mean,
+    const at::Tensor& k_min,
+    const at::Tensor& k_max,
+    int topk_count,
+    bool causal = true,
+    bool is_bf16 = false) {
+    TORCH_CHECK(q_mean.is_cuda() && k_min.is_cuda() && k_max.is_cuda(),
+                "q_mean, k_min, and k_max must be CUDA tensors");
+    TORCH_CHECK(q_mean.is_contiguous() && k_min.is_contiguous() && k_max.is_contiguous(),
+                "q_mean, k_min, and k_max must be contiguous");
+    TORCH_CHECK(q_mean.dim() == 4 && k_min.dim() == 4 && k_max.dim() == 4,
+                "q_mean, k_min, and k_max must be 4D tensors");
+    TORCH_CHECK(k_min.sizes() == k_max.sizes(),
+                "k_min and k_max shapes must match");
+    TORCH_CHECK(q_mean.size(0) == k_min.size(0),
+                "q_mean and key stat batch dimensions must match");
+    TORCH_CHECK(q_mean.size(1) == k_min.size(1),
+                "q_mean and key stat head dimensions must match");
+    TORCH_CHECK(q_mean.size(3) == k_min.size(3),
+                "q_mean and key stat head_dim must match");
+
+    const int batch = q_mean.size(0);
+    const int heads = q_mean.size(1);
+    const int flat_heads = batch * heads;
+    const int num_q_blocks = q_mean.size(2);
+    const int num_kv_blocks = k_min.size(2);
+    const int head_dim = q_mean.size(3);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128,
+                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(num_kv_blocks <= 2048,
+                "QUEST block selector supports <= 2048 KV blocks, got ", num_kv_blocks);
+    TORCH_CHECK(topk_count >= 0 && topk_count <= num_kv_blocks,
+                "topk_count must be in [0, num_kv_blocks]");
+
+    auto opts = at::TensorOptions().dtype(at::kInt).device(q_mean.device());
+    at::Tensor topk = at::empty({flat_heads, num_q_blocks, topk_count}, opts);
+    if (topk_count == 0) {
+        return topk;
+    }
+
+    quest_block_topk(
+        q_mean.data_ptr(), k_min.data_ptr(), k_max.data_ptr(), topk.data_ptr(),
+        flat_heads, num_q_blocks, num_kv_blocks, head_dim, topk_count, causal, is_bf16);
+
+    return topk;
+}
+
 static at::Tensor single_query_key_mean_topk_impl(
     const at::Tensor& q_grouped,
     const at::Tensor& k_mean,
@@ -1160,6 +1232,59 @@ static at::Tensor single_query_key_mean_topk_impl(
         local_scores.data_ptr(), local_indices.data_ptr(), done_counts.data_ptr(),
         flat_heads, groups, num_kv_blocks, k_mean_capacity_blocks,
         head_dim, topk_count, chunk_count, local_count, is_bf16);
+
+    return topk;
+}
+
+static at::Tensor single_query_quest_topk_impl(
+    const at::Tensor& q_grouped,
+    const at::Tensor& k_min,
+    const at::Tensor& k_max,
+    int topk_count,
+    int num_kv_blocks,
+    bool is_bf16 = false) {
+    TORCH_CHECK(q_grouped.is_cuda() && k_min.is_cuda() && k_max.is_cuda(),
+                "q_grouped, k_min, and k_max must be CUDA tensors");
+    TORCH_CHECK(q_grouped.is_contiguous() && k_min.is_contiguous() && k_max.is_contiguous(),
+                "q_grouped, k_min, and k_max must be contiguous");
+    TORCH_CHECK(q_grouped.dim() == 4 && k_min.dim() == 4 && k_max.dim() == 4,
+                "q_grouped, k_min, and k_max must be 4D tensors");
+    TORCH_CHECK(k_min.sizes() == k_max.sizes(),
+                "k_min and k_max shapes must match");
+    TORCH_CHECK(q_grouped.size(0) == k_min.size(0),
+                "q_grouped and key stat batch dimensions must match");
+    TORCH_CHECK(q_grouped.size(1) == k_min.size(1),
+                "q_grouped and key stat KV-head dimensions must match");
+    TORCH_CHECK(q_grouped.size(3) == k_min.size(3),
+                "q_grouped and key stat head_dim must match");
+
+    const int batch = q_grouped.size(0);
+    const int kv_heads = q_grouped.size(1);
+    const int flat_heads = batch * kv_heads;
+    const int groups = q_grouped.size(2);
+    const int head_dim = q_grouped.size(3);
+    const int k_stat_capacity_blocks = k_min.size(2);
+    TORCH_CHECK(groups >= 1 && groups <= 16,
+                "grouped single-query selector expects groups in [1, 16], got ", groups);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128,
+                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(num_kv_blocks >= 0 && num_kv_blocks <= k_stat_capacity_blocks,
+                "num_kv_blocks must be in [0, key stat capacity]");
+    TORCH_CHECK(num_kv_blocks <= 2048,
+                "QUEST single-query block selector supports <= 2048 KV blocks, got ", num_kv_blocks);
+    TORCH_CHECK(topk_count >= 0 && topk_count <= num_kv_blocks,
+                "topk_count must be in [0, num_kv_blocks]");
+
+    auto opts = at::TensorOptions().dtype(at::kInt).device(q_grouped.device());
+    at::Tensor topk = at::empty({flat_heads, topk_count}, opts);
+    if (topk_count == 0) {
+        return topk;
+    }
+
+    single_query_quest_topk(
+        q_grouped.data_ptr(), k_min.data_ptr(), k_max.data_ptr(), topk.data_ptr(),
+        flat_heads, groups, num_kv_blocks, k_stat_capacity_blocks,
+        head_dim, topk_count, is_bf16);
 
     return topk;
 }
@@ -1420,6 +1545,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("causal") = true,
           pybind11::arg("is_bf16") = false,
           "Select KV blocks using block-mean QK scores");
+    m.def("quest_block_topk", &quest_block_topk_impl,
+          pybind11::arg("q_mean"),
+          pybind11::arg("k_min"),
+          pybind11::arg("k_max"),
+          pybind11::arg("topk_count"),
+          pybind11::arg("causal") = true,
+          pybind11::arg("is_bf16") = false,
+          "Select KV blocks using QUEST query-aware min/max scores");
     m.def("single_query_key_mean_topk", &single_query_key_mean_topk_impl,
           pybind11::arg("q_grouped"),
           pybind11::arg("k_mean"),
@@ -1427,6 +1560,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_kv_blocks"),
           pybind11::arg("is_bf16") = false,
           "Select decode KV blocks using grouped single-query block-mean QK scores");
+    m.def("single_query_quest_topk", &single_query_quest_topk_impl,
+          pybind11::arg("q_grouped"),
+          pybind11::arg("k_min"),
+          pybind11::arg("k_max"),
+          pybind11::arg("topk_count"),
+          pybind11::arg("num_kv_blocks"),
+          pybind11::arg("is_bf16") = false,
+          "Select decode KV blocks using grouped single-query QUEST min/max scores");
     m.def("single_query_key_mean_topk_into", &single_query_key_mean_topk_into_impl,
           pybind11::arg("q_grouped"),
           pybind11::arg("k_mean"),
