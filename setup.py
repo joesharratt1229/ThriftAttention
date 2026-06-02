@@ -1,4 +1,5 @@
 from pathlib import Path
+from dataclasses import dataclass
 import os
 import re
 import subprocess
@@ -20,7 +21,38 @@ except ModuleNotFoundError as exc:
 
 ROOT = Path(__file__).parent
 MIN_TORCH = (2, 8, 0)
-MIN_CUDA = (12, 8)
+
+
+@dataclass(frozen=True)
+class CudaArchitecture:
+    torch_arch: str
+    min_cuda: tuple[int, int]
+    sources: tuple[str, ...]
+    nvcc_flags: tuple[str, ...] = ()
+
+
+CUDA_ARCHITECTURES = {
+    "sm120": CudaArchitecture(
+        torch_arch="12.0a",
+        min_cuda=(12, 8),
+        sources=(
+            "csrc/bindings.cpp",
+            "csrc/cuda/sm120/nvfp4/fp4_attention.cu",
+            "csrc/cuda/sm120/nvfp4/single_query_fp4_attention.cu",
+            "csrc/cuda/sm120/nvfp4/thrift_attention.cu",
+            "csrc/cuda/sm120/nvfp4/single_query_attention.cu",
+            "csrc/cuda/sm120/nvfp4/quantization.cu",
+            "csrc/cuda/sm120/mxfp4/fp4_attention.cu",
+            "csrc/cuda/sm120/mxfp4/single_query_fp4_attention.cu",
+            "csrc/cuda/sm120/mxfp4/thrift_attention.cu",
+            "csrc/cuda/sm120/mxfp4/single_query_attention.cu",
+            "csrc/cuda/sm120/mxfp4/quantization.cu",
+            "csrc/cuda/sm120/shared/block_selection.cu",
+        ),
+        nvcc_flags=("--ptxas-options=--gpu-name=sm_120a",),
+    ),
+}
+DEFAULT_CUDA_ARCHITECTURE = "sm120"
 
 
 def _parse_version(value: str, components: int) -> tuple[int, ...]:
@@ -45,21 +77,21 @@ def _check_min_version(name: str, actual: tuple[int, ...], minimum: tuple[int, .
         raise RuntimeError(f"ThriftAttention requires {name}>={minimum_text}; found {actual_text}.")
 
 
-def _check_build_prerequisites() -> None:
+def _check_build_prerequisites(architecture: CudaArchitecture) -> None:
     _check_min_version("torch", _parse_version(torch.__version__, 3), MIN_TORCH)
 
     torch_cuda = getattr(torch.version, "cuda", None)
     if torch_cuda is None:
         raise RuntimeError(
-            "ThriftAttention requires a PyTorch CUDA wheel built with CUDA>=12.8; "
+            "ThriftAttention requires a PyTorch CUDA wheel; "
             "the installed torch build does not report CUDA support."
         )
     torch_cuda_version = _parse_version(torch_cuda, 2)
-    _check_min_version("PyTorch CUDA", torch_cuda_version, MIN_CUDA)
+    _check_min_version("PyTorch CUDA", torch_cuda_version, architecture.min_cuda)
 
     if CUDA_HOME is None:
         raise RuntimeError(
-            "ThriftAttention requires a local CUDA toolkit with nvcc>=12.8, "
+            "ThriftAttention requires a local CUDA toolkit with nvcc, "
             "but torch.utils.cpp_extension.CUDA_HOME is not set."
         )
     nvcc = Path(CUDA_HOME) / "bin" / "nvcc"
@@ -72,11 +104,11 @@ def _check_build_prerequisites() -> None:
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise RuntimeError(
-            f"ThriftAttention requires a working CUDA toolkit with nvcc>=12.8; "
+            "ThriftAttention requires a working CUDA toolkit; "
             f"failed to run {nvcc}."
         ) from exc
     toolkit_cuda_version = _parse_nvcc_release(result.stdout)
-    _check_min_version("CUDA toolkit", toolkit_cuda_version, MIN_CUDA)
+    _check_min_version("CUDA toolkit", toolkit_cuda_version, architecture.min_cuda)
     if toolkit_cuda_version != torch_cuda_version:
         torch_cuda_text = ".".join(str(part) for part in torch_cuda_version)
         toolkit_cuda_text = ".".join(str(part) for part in toolkit_cuda_version)
@@ -89,35 +121,22 @@ def _check_build_prerequisites() -> None:
         )
 
 
-_check_build_prerequisites()
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0a")
+CUDA_ARCHITECTURE = CUDA_ARCHITECTURES[DEFAULT_CUDA_ARCHITECTURE]
+_check_build_prerequisites(CUDA_ARCHITECTURE)
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", CUDA_ARCHITECTURE.torch_arch)
 
 
-def cuda_extension() -> CUDAExtension:
-    sources = [
-        "csrc/bindings.cpp",
-        "csrc/cuda/sm120/nvfp4/fp4_attention.cu",
-        "csrc/cuda/sm120/nvfp4/single_query_fp4_attention.cu",
-        "csrc/cuda/sm120/nvfp4/thrift_attention.cu",
-        "csrc/cuda/sm120/nvfp4/single_query_attention.cu",
-        "csrc/cuda/sm120/nvfp4/quantization.cu",
-        "csrc/cuda/sm120/mxfp4/fp4_attention.cu",
-        "csrc/cuda/sm120/mxfp4/single_query_fp4_attention.cu",
-        "csrc/cuda/sm120/mxfp4/thrift_attention.cu",
-        "csrc/cuda/sm120/mxfp4/single_query_attention.cu",
-        "csrc/cuda/sm120/mxfp4/quantization.cu",
-        "csrc/cuda/sm120/shared/block_selection.cu",
-    ]
+def cuda_extension(architecture: CudaArchitecture) -> CUDAExtension:
     return CUDAExtension(
         name="thriftattention._C",
-        sources=sources,
+        sources=list(architecture.sources),
         include_dirs=[str(ROOT / "csrc" / "include")],
         extra_compile_args={
             "cxx": ["-O3"],
             "nvcc": [
                 "-O3",
                 "-use_fast_math",
-                "--ptxas-options=--gpu-name=sm_120a",
+                *architecture.nvcc_flags,
             ],
         },
     )
@@ -126,6 +145,6 @@ def cuda_extension() -> CUDAExtension:
 setup(
     packages=find_packages(where="src"),
     package_dir={"": "src"},
-    ext_modules=[cuda_extension()],
+    ext_modules=[cuda_extension(CUDA_ARCHITECTURE)],
     cmdclass={"build_ext": BuildExtension},
 )

@@ -52,6 +52,11 @@ model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", attn_implementatio
 
 ## Installation
 
+The shipped CUDA kernels currently target Blackwell `SM120`. Ampere `SM80` is
+registered as the next backend target, but its kernels are not implemented yet.
+Backend selection is capability-based so additional architecture-specific
+implementations can be added independently.
+
 Prerequisites:
 
 - Python >=3.10
