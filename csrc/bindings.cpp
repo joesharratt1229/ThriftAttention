@@ -231,6 +231,14 @@ void pack_topk_mask(
     int total_units,
     int word_count);
 
+#ifdef THRIFTATTENTION_ENABLE_SM80_MMA_TEST
+// Implemented in csrc/cuda/sm80/shared/mma_test.cu.
+void sm80_mma_m16n8k32_s8_test(
+    const void* A,
+    const void* B,
+    void* D);
+#endif
+
 static at::Tensor fp4_attention_nvfp4_packed(
     const at::Tensor& q_packed,
     const at::Tensor& k_packed,
@@ -1373,6 +1381,29 @@ static at::Tensor single_query_key_mean_topk_into_impl(
     return topk;
 }
 
+static at::Tensor sm80_mma_m16n8k32_s8_test_impl(
+    const at::Tensor& a,
+    const at::Tensor& b) {
+    TORCH_CHECK(a.is_cuda() && b.is_cuda(), "A and B must be CUDA tensors");
+    TORCH_CHECK(a.is_contiguous() && b.is_contiguous(), "A and B must be contiguous");
+    TORCH_CHECK(a.dtype() == at::kChar, "A must have dtype torch.int8");
+    TORCH_CHECK(b.dtype() == at::kChar, "B must have dtype torch.int8");
+    TORCH_CHECK(a.dim() == 2 && a.size(0) == 16 && a.size(1) == 32,
+                "A must be shaped [16, 32]");
+    TORCH_CHECK(b.dim() == 2 && b.size(0) == 32 && b.size(1) == 8,
+                "B must be shaped [32, 8]");
+    TORCH_CHECK(a.device() == b.device(), "A and B must be on the same CUDA device");
+
+    at::Tensor d = at::empty({16, 8}, at::TensorOptions().dtype(at::kInt).device(a.device()));
+#ifdef THRIFTATTENTION_ENABLE_SM80_MMA_TEST
+    sm80_mma_m16n8k32_s8_test(a.data_ptr(), b.data_ptr(), d.data_ptr());
+    return d;
+#else
+    TORCH_CHECK(false, "SM80 MMA test kernel is not built");
+    return d;
+#endif
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fp4_attention_causal_nvfp4_packed", &fp4_attention_causal_nvfp4_packed,
           pybind11::arg("q_packed"),
@@ -1578,4 +1609,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_kv_blocks"),
           pybind11::arg("is_bf16") = false,
           "Select decode KV blocks into preallocated top-k workspace");
+    m.def("sm80_mma_m16n8k32_s8_test", &sm80_mma_m16n8k32_s8_test_impl,
+          pybind11::arg("a"),
+          pybind11::arg("b"),
+          "Debug harness for one SM80 m16n8k32 INT8 MMA tile");
 }
