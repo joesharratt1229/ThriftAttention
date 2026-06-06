@@ -252,8 +252,13 @@ void fp4_attention_kernel(
 
             // rescale previous O for new rowmax
             float rescale[2];
-            rescale[0] = ta_softmax_exp<APPROX_EXP>(rowmax[mma_id_q][0] - this_rowmax[0]);
-            rescale[1] = ta_softmax_exp<APPROX_EXP>(rowmax[mma_id_q][1] - this_rowmax[1]);
+            if constexpr (APPROX_EXP) {
+                rescale[0] = ta_softmax_exp_approx(rowmax[mma_id_q][0] - this_rowmax[0]);
+                rescale[1] = ta_softmax_exp_approx(rowmax[mma_id_q][1] - this_rowmax[1]);
+            } else {
+                rescale[0] = __expf(rowmax[mma_id_q][0] - this_rowmax[0]);
+                rescale[1] = __expf(rowmax[mma_id_q][1] - this_rowmax[1]);
+            }
             for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
                 O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
                 O_rmem[mma_id_q][mma_id_d][1] *= rescale[0];
@@ -269,10 +274,17 @@ void fp4_attention_kernel(
             float this_rowsumexp[2] = {};
             for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
                 float *regs = S_rmem[mma_id_q][mma_id_kv];
-                regs[0] = ta_softmax_exp<APPROX_EXP>(regs[0] - rowmax[mma_id_q][0]);
-                regs[1] = ta_softmax_exp<APPROX_EXP>(regs[1] - rowmax[mma_id_q][0]);
-                regs[2] = ta_softmax_exp<APPROX_EXP>(regs[2] - rowmax[mma_id_q][1]);
-                regs[3] = ta_softmax_exp<APPROX_EXP>(regs[3] - rowmax[mma_id_q][1]);
+                if constexpr (APPROX_EXP) {
+                    regs[0] = ta_softmax_exp_approx(regs[0] - rowmax[mma_id_q][0]);
+                    regs[1] = ta_softmax_exp_approx(regs[1] - rowmax[mma_id_q][0]);
+                    regs[2] = ta_softmax_exp_approx(regs[2] - rowmax[mma_id_q][1]);
+                    regs[3] = ta_softmax_exp_approx(regs[3] - rowmax[mma_id_q][1]);
+                } else {
+                    regs[0] = __expf(regs[0] - rowmax[mma_id_q][0]);
+                    regs[1] = __expf(regs[1] - rowmax[mma_id_q][0]);
+                    regs[2] = __expf(regs[2] - rowmax[mma_id_q][1]);
+                    regs[3] = __expf(regs[3] - rowmax[mma_id_q][1]);
+                }
 
                 this_rowsumexp[0] += regs[0] + regs[1];
                 this_rowsumexp[1] += regs[2] + regs[3];
@@ -298,12 +310,14 @@ void fp4_attention_kernel(
                 const int t1 = t0 + 1;
                 const int t2 = t0 + 2;
                 const int t3 = t0 + 3;
-                const bool valid_upper = rowmax[mma_id_q][0] > -FLT_MAX * 0.5f;
-                const bool valid_lower = rowmax[mma_id_q][1] > -FLT_MAX * 0.5f;
-                const float inv_upper = valid_upper ? FP4_MAX : 0.0f;
-                const float inv_lower = valid_lower ? FP4_MAX : 0.0f;
-                sf_P_upper[blk] = valid_upper ? (FP4_RANGE / FP4_MAX) : 1.0f;
-                sf_P_lower[blk] = valid_lower ? (FP4_RANGE / FP4_MAX) : 1.0f;
+                const float gmax_upper = rowmax[mma_id_q][0];
+                const float gmax_lower = rowmax[mma_id_q][1];
+                const bool valid_upper = gmax_upper > -FLT_MAX * 0.5f;
+                const bool valid_lower = gmax_lower > -FLT_MAX * 0.5f;
+                const float inv_upper = valid_upper ? (FP4_MAX * __expf(rowmax[mma_id_q][0] - gmax_upper)) : 0.0f;
+                const float inv_lower = valid_lower ? (FP4_MAX * __expf(rowmax[mma_id_q][1] - gmax_lower)) : 0.0f;
+                sf_P_upper[blk] = valid_upper ? (FP4_RANGE / FP4_MAX * __expf(gmax_upper - rowmax[mma_id_q][0])) : 1.0f;
+                sf_P_lower[blk] = valid_lower ? (FP4_RANGE / FP4_MAX * __expf(gmax_lower - rowmax[mma_id_q][1])) : 1.0f;
 
                 S_rmem[mma_id_q][t0][0] *= inv_upper;
                 S_rmem[mma_id_q][t0][1] *= inv_upper;

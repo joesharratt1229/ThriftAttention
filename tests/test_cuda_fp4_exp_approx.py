@@ -50,9 +50,9 @@ def test_tiled_fp4_exp_approx_matches_sdpa(quant_format: str) -> None:
     batch, q_heads, kv_heads, q_len, kv_len, head_dim = 1, 2, 1, 64, 4096, 64
     groups = q_heads // kv_heads
 
-    q = (torch.randn(batch, q_heads, q_len, head_dim, device=device, dtype=torch.float16) * 0.25).contiguous()
-    k = (torch.randn(batch, kv_heads, kv_len, head_dim, device=device, dtype=torch.float16) * 0.25).contiguous()
-    v = (torch.randn(batch, kv_heads, kv_len, head_dim, device=device, dtype=torch.float16) * 0.25).contiguous()
+    q = (torch.randn(batch, q_heads, q_len, head_dim, device=device, dtype=torch.float16) ).contiguous()
+    k = (torch.randn(batch, kv_heads, kv_len, head_dim, device=device, dtype=torch.float16) ).contiguous()
+    v = (torch.randn(batch, kv_heads, kv_len, head_dim, device=device, dtype=torch.float16) ).contiguous()
 
     packed = _quantize_qkv(q, k, v, quant_format=quant_format)
     fn = (

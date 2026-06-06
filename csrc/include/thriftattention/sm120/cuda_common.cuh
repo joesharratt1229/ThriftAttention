@@ -153,6 +153,14 @@ __device__ __forceinline__ float ta_softmax_exp(float z) {
     }
 }
 
+__device__ __forceinline__ float ta_softmax_exp_approx(float z) {
+    if (z <= -87.0f) {
+        return 0.0f;
+    }
+    const uint32_t bits = __float2uint_rz(fmaf(z, 12102203.0f, 1065353216.0f));
+    return __uint_as_float(bits);
+}
+
 __device__ inline uint32_t ta_cvt_8xf32_to_e2m1_packed(
     float f0, float f1, float f2, float f3,
     float f4, float f5, float f6, float f7) {
