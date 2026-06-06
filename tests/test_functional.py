@@ -208,6 +208,45 @@ def test_sm120_backend_dispatches_fp4_mxfp4_extension(monkeypatch):
     assert calls == [("mxfp4_causal", ("qp", "kp", "vp", "qs", "ks", "vs", False))]
 
 
+def test_sm120_backend_dispatches_fp4_exp_approx_extension(monkeypatch):
+    from thriftattention.backends import sm120 as sm120_backend
+
+    calls = []
+    q = torch.empty(1, 1, 64, 64)
+    k = torch.empty(1, 1, 64, 64)
+    v = torch.empty(1, 1, 64, 64)
+
+    def fake_causal(*args):
+        calls.append(("causal", args))
+        return "out"
+
+    ext = SimpleNamespace(
+        fp4_attention_causal_nvfp4_packed=fake_causal,
+        fp4_attention_noncausal_nvfp4_packed=lambda *args: calls.append(("noncausal", args)),
+    )
+    monkeypatch.setattr(sm120_backend, "check_qkv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sm120_backend, "require_block_aligned", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sm120_backend, "get_extension", lambda: ext)
+
+    out = sm120_backend.Sm120Nvfp4Backend().attention(
+        q,
+        k,
+        v,
+        selection=None,
+        quant_format=FakeQuantFormat(),
+        config=AttentionConfig(
+            method="fp4",
+            causal=True,
+            implementation="tiled",
+            exp_approx="codebook",
+        ),
+        is_bf16=False,
+    )
+
+    assert out == "out"
+    assert calls == [("causal", ("qp", "kp", "vp", "qs", "ks", "vs", False, True))]
+
+
 def test_sm120_backend_dispatches_mxfp4_single_query_extension(monkeypatch):
     from thriftattention.backends import sm120 as sm120_backend
 
@@ -237,6 +276,29 @@ def test_sm120_backend_dispatches_mxfp4_single_query_extension(monkeypatch):
 
     assert out.shape == q.shape
     assert calls == [("mxfp4_single_query", ("qp", "kp", "vp", "qs", "ks", "vs", False))]
+
+
+def test_sm120_backend_rejects_exp_approx_for_single_query(monkeypatch):
+    from thriftattention.backends import sm120 as sm120_backend
+
+    q = torch.empty(1, 1, 1, 64)
+    k = torch.empty(1, 1, 64, 64)
+    v = torch.empty(1, 1, 64, 64)
+
+    monkeypatch.setattr(sm120_backend, "check_qkv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sm120_backend, "require_block_aligned", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sm120_backend, "get_extension", lambda: SimpleNamespace())
+
+    with pytest.raises(NotImplementedError, match="tiled fp4 prefill"):
+        sm120_backend.Sm120Nvfp4Backend().attention(
+            q,
+            k,
+            v,
+            selection=None,
+            quant_format=FakeQuantFormat(),
+            config=AttentionConfig(method="fp4", exp_approx="codebook"),
+            is_bf16=False,
+        )
 
 
 def test_sm120_backend_dispatches_thrift_single_query_extension(monkeypatch):

@@ -13,7 +13,6 @@ from thriftattention.config import AttentionConfig
 from thriftattention.quant.formats import QuantFormat
 
 
-
 class Sm120Nvfp4Backend:
     name = "sm120"
 
@@ -33,8 +32,15 @@ class Sm120Nvfp4Backend:
             raise NotImplementedError("the current SM120 attention kernels use 64-token KV blocks")
         if quant_format.name not in ("nvfp4", "mxfp4"):
             raise NotImplementedError(f"SM120 backend does not support quant format {quant_format.name!r}")
+        if config.exp_approx not in ("exact", "codebook"):
+            raise ValueError(f"unsupported exp approximation {config.exp_approx!r}")
+        if config.exp_approx != "exact" and config.method != "fp4":
+            raise NotImplementedError("exp approximation is currently implemented only for fp4 attention")
 
-        if _use_single_query(q, config.implementation):
+        use_single_query = _use_single_query(q, config.implementation)
+        if use_single_query and config.exp_approx != "exact" and config.method == "fp4":
+            raise NotImplementedError("exp approximation is currently implemented only for tiled fp4 prefill")
+        if use_single_query:
             return self._single_query_attention(q, k, v, selection, quant_format, config, is_bf16)
         return self._tiled_attention(q, k, v, selection, quant_format, config, is_bf16)
 
@@ -57,6 +63,8 @@ class Sm120Nvfp4Backend:
         ext = get_extension()
 
         if config.method == "fp4":
+            if config.exp_approx != "exact":
+                raise NotImplementedError("exp approximation is currently implemented only for tiled fp4 prefill")
             fn = (
                 ext.fp4_attention_single_query_mxfp4_packed
                 if quant_format.name == "mxfp4"
@@ -114,6 +122,8 @@ class Sm120Nvfp4Backend:
                     if config.causal
                     else ext.fp4_attention_noncausal_nvfp4_packed
                 )
+            if config.exp_approx == "codebook":
+                return fn(*packed, is_bf16, True)
             return fn(*packed, is_bf16)
         if config.method == "thrift":
             if selection is None:

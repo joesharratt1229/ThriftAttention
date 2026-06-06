@@ -9,6 +9,7 @@ SelectionMethod = Literal["block_mean", "quest"]
 QuantFormatName = Literal["nvfp4", "mxfp4"]
 AttentionBackendName = Literal["auto", "sm120"]
 AttentionImplementation = Literal["auto", "tiled", "single_query"]
+ExpApproximation = Literal["exact", "codebook"]
 FallbackBackend = Literal["error"]
 
 
@@ -23,4 +24,5 @@ class AttentionConfig:
     quant_format: QuantFormatName = "nvfp4"
     backend: AttentionBackendName = "auto"
     implementation: AttentionImplementation = "auto"
+    exp_approx: ExpApproximation = "exact"
     fallback: FallbackBackend = "error"

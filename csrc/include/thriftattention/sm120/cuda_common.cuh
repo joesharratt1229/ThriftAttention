@@ -144,6 +144,15 @@ __device__ inline uint32_t ta_ld_shared_u16(uint32_t addr) {
     return static_cast<uint32_t>(value);
 }
 
+template <bool APPROX>
+__device__ __forceinline__ float ta_softmax_exp(float z) {
+    if constexpr (APPROX) {
+        return __uint_as_float(0x3f800000u - min(15u, __float2uint_rn(-z * 1.875f)) * 6454508u);
+    } else {
+        return __expf(z);
+    }
+}
+
 __device__ inline uint32_t ta_cvt_8xf32_to_e2m1_packed(
     float f0, float f1, float f2, float f3,
     float f4, float f5, float f6, float f7) {
