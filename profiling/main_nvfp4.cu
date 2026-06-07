@@ -20,8 +20,8 @@
         }                                                                    \
     } while (0)
 
-constexpr uint16_t BYTE_ID = 16;
-constexpr uint16_t THREAD_ID = 16;
+constexpr uint16_t BYTE_ID = 0;
+constexpr uint16_t THREAD_ID = 0;
 constexpr uint16_t TA_WARP_SIZE = 32;
 
 constexpr uint64_t M = 64;
@@ -41,6 +41,11 @@ constexpr uint32_t SMEM_BYTES = SCALE_B_SMEM + SCALE_B_BYTES;
 
 constexpr int DEFAULT_ITERS = 10000;
 constexpr int MMA_PER_ITER = 8;
+constexpr int WAVE_SWEEP[] = {1, 2, 4, 8};
+constexpr int WAVE_SWEEP_COUNT = sizeof(WAVE_SWEEP) / sizeof(WAVE_SWEEP[0]);
+constexpr int MAX_SWEEP_WAVES = 8;
+
+constexpr double OPS_PER_MMA = 16.0 * 8.0 * 64.0 * 2.0;
 
 __device__ __forceinline__
 uint64_t read_clock64()
@@ -63,12 +68,13 @@ void mma_m16n8k64(uint32_t const a_reg[4],
         "{%0, %1, %2, %3}, "
         "{%4, %5, %6, %7}, "
         "{%8, %9}, "
-        "{%0, %1, %2, %3}, "
-        "{%10}, {%11, %12}, "
-        "{%13}, {%14, %15};"
-        : "+f"(c_reg[0]), "+f"(c_reg[1]), "+f"(c_reg[2]), "+f"(c_reg[3])
+        "{%10, %11, %12, %13}, "
+        "{%14}, {%15, %16}, "
+        "{%17}, {%18, %19};"
+        : "=f"(c_reg[0]), "=f"(c_reg[1]), "=f"(c_reg[2]), "=f"(c_reg[3])
         : "r"(a_reg[0]), "r"(a_reg[1]), "r"(a_reg[2]), "r"(a_reg[3]),
           "r"(b_reg[0]), "r"(b_reg[1]),
+          "f"(c_reg[0]), "f"(c_reg[1]), "f"(c_reg[2]), "f"(c_reg[3]),
           "r"(scale_a_reg), "h"(BYTE_ID), "h"(THREAD_ID),
           "r"(scale_b_reg), "h"(BYTE_ID), "h"(THREAD_ID));
 }
@@ -89,7 +95,6 @@ void mma_m64k64n64_kernel(const __nv_fp4x2_e2m1* a,
                           const __nv_fp8_e4m3* scale_b,
                           half* c,
                           uint64_t* mma_ticks,
-                          uint64_t* empty_ticks,
                           int iters)
 {
     const int bid = blockIdx.x;
@@ -151,16 +156,7 @@ void mma_m64k64n64_kernel(const __nv_fp4x2_e2m1* a,
         : "memory");
     __syncwarp();
 
-    uint32_t empty_dep = lane_id;
     uint64_t start = read_clock64();
-#pragma unroll 1
-    for (int i = 0; i < iters; ++i) {
-        asm volatile("add.u32 %0, %0, 1;" : "+r"(empty_dep));
-    }
-    uint64_t stop = read_clock64();
-    const uint64_t empty = stop - start;
-
-    start = read_clock64();
 #pragma unroll 1
     for (int i = 0; i < iters; ++i) {
         mma_m16n8k64(a_reg, b_reg, scale_a_reg, scale_b_reg, c0);
@@ -172,15 +168,49 @@ void mma_m64k64n64_kernel(const __nv_fp4x2_e2m1* a,
         mma_m16n8k64(a_reg, b_reg, scale_a_reg, scale_b_reg, c6);
         mma_m16n8k64(a_reg, b_reg, scale_a_reg, scale_b_reg, c7);
     }
-    stop = read_clock64();
+    uint64_t stop = read_clock64();
 
     if (lane_id == 0) {
-        empty_ticks[bid] = empty;
         mma_ticks[bid] = stop - start;
         c[bid] = __float2half(c0[0] + c1[0] + c2[0] + c3[0] +
-                              c4[0] + c5[0] + c6[0] + c7[0] +
-                              static_cast<float>(empty_dep & 1));
+                              c4[0] + c5[0] + c6[0] + c7[0]);
     }
+}
+
+struct LaunchConfig {
+    int sm_count;
+    int active_blocks_per_sm;
+    int saturation_blocks;
+    int blocks;
+    bool auto_blocks;
+};
+
+LaunchConfig configure_launch(int requested_blocks)
+{
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+
+    cudaDeviceProp props{};
+    CUDA_CHECK(cudaGetDeviceProperties(&props, device));
+
+    int active_blocks_per_sm = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &active_blocks_per_sm, mma_m64k64n64_kernel, TA_WARP_SIZE,
+        SMEM_BYTES));
+    if (active_blocks_per_sm <= 0) {
+        std::fprintf(stderr, "failed to compute active blocks per SM\n");
+        std::exit(EXIT_FAILURE);
+    }
+
+    const int saturation_blocks =
+        props.multiProcessorCount * active_blocks_per_sm;
+    const bool auto_blocks = requested_blocks == 0;
+    const int blocks = auto_blocks
+                           ? saturation_blocks * MAX_SWEEP_WAVES
+                           : requested_blocks;
+
+    return {props.multiProcessorCount, active_blocks_per_sm,
+            saturation_blocks, blocks, auto_blocks};
 }
 
 template <class T>
@@ -199,8 +229,7 @@ void setup_inputs(int blocks,
                   __nv_fp8_e4m3** d_scale_a,
                   __nv_fp8_e4m3** d_scale_b,
                   half** d_c,
-                  uint64_t** d_mma_ticks,
-                  uint64_t** d_empty_ticks)
+                  uint64_t** d_mma_ticks)
 {
     const size_t a_elems = blocks * M * P_K;
     const size_t b_elems = blocks * N * P_K;
@@ -225,7 +254,6 @@ void setup_inputs(int blocks,
                           h_scale_b.size() * sizeof(h_scale_b[0])));
     CUDA_CHECK(cudaMalloc(d_c, blocks * sizeof(half)));
     CUDA_CHECK(cudaMalloc(d_mma_ticks, blocks * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(d_empty_ticks, blocks * sizeof(uint64_t)));
 
     CUDA_CHECK(cudaMemcpy(*d_a, h_a.data(), h_a.size() * sizeof(h_a[0]),
                           cudaMemcpyHostToDevice));
@@ -239,19 +267,81 @@ void setup_inputs(int blocks,
                           cudaMemcpyHostToDevice));
 }
 
-uint64_t min_tick(const std::vector<uint64_t>& ticks)
+uint64_t median_tick(std::vector<uint64_t> ticks)
 {
-    return *std::min_element(ticks.begin(), ticks.end());
+    std::sort(ticks.begin(), ticks.end());
+    return ticks[ticks.size() / 2];
+}
+
+struct BenchmarkResult {
+    double median_cycles_per_mma;
+    double ops_per_sec;
+};
+
+BenchmarkResult run_benchmark(int blocks,
+                              int iters,
+                              const __nv_fp4x2_e2m1* d_a,
+                              const __nv_fp4x2_e2m1* d_b,
+                              const __nv_fp8_e4m3* d_scale_a,
+                              const __nv_fp8_e4m3* d_scale_b,
+                              half* d_c,
+                              uint64_t* d_mma_ticks,
+                              cudaEvent_t start_event,
+                              cudaEvent_t stop_event)
+{
+    CUDA_CHECK(cudaEventRecord(start_event));
+    mma_m64k64n64_kernel<<<blocks, TA_WARP_SIZE, SMEM_BYTES>>>(
+        d_a, d_b, d_scale_a, d_scale_b, d_c, d_mma_ticks, iters);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(stop_event));
+    CUDA_CHECK(cudaEventSynchronize(stop_event));
+
+    float elapsed_ms = 0.f;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start_event, stop_event));
+
+    std::vector<uint64_t> h_mma_ticks(blocks);
+    CUDA_CHECK(cudaMemcpy(h_mma_ticks.data(), d_mma_ticks,
+                          blocks * sizeof(uint64_t),
+                          cudaMemcpyDeviceToHost));
+
+    const uint64_t med_mma = median_tick(h_mma_ticks);
+    const double denom = static_cast<double>(iters) * MMA_PER_ITER;
+    const double total_mma_insts =
+        static_cast<double>(blocks) * iters * MMA_PER_ITER;
+    const double mma_inst_per_sec =
+        elapsed_ms > 0.f
+            ? total_mma_insts / (static_cast<double>(elapsed_ms) * 1.0e-3)
+            : 0.0;
+
+    return {static_cast<double>(med_mma) / denom,
+            mma_inst_per_sec * OPS_PER_MMA};
 }
 
 int main(int argc, char** argv)
 {
     const int iters = argc > 1 ? std::atoi(argv[1]) : DEFAULT_ITERS;
-    const int blocks = argc > 2 ? std::atoi(argv[2]) : 1;
-    if (iters <= 0 || blocks <= 0) {
-        std::fprintf(stderr, "usage: %s [iters=%d] [blocks=1]\n", argv[0],
-                     DEFAULT_ITERS);
+    const int requested_blocks = argc > 2 ? std::atoi(argv[2]) : 0;
+    if (iters <= 0 || requested_blocks < 0) {
+        std::fprintf(stderr,
+                     "usage: %s [iters=%d] [blocks=auto|positive]\n",
+                     argv[0], DEFAULT_ITERS);
         return EXIT_FAILURE;
+    }
+
+    const LaunchConfig launch = configure_launch(requested_blocks);
+    const int max_blocks = launch.blocks;
+    const int tail_blocks = max_blocks % launch.saturation_blocks;
+
+    if (!launch.auto_blocks && max_blocks < launch.saturation_blocks) {
+        std::fprintf(stderr,
+                     "warning: blocks=%d underfills the GPU; need at least "
+                     "%d blocks for one resident wave\n",
+                     max_blocks, launch.saturation_blocks);
+    } else if (!launch.auto_blocks && tail_blocks != 0) {
+        std::fprintf(stderr,
+                     "warning: blocks=%d leaves a partial final wave of %d "
+                     "blocks; use a multiple of %d for clean saturation\n",
+                     max_blocks, tail_blocks, launch.saturation_blocks);
     }
 
     __nv_fp4x2_e2m1* d_a = nullptr;
@@ -260,48 +350,66 @@ int main(int argc, char** argv)
     __nv_fp8_e4m3* d_scale_b = nullptr;
     half* d_c = nullptr;
     uint64_t* d_mma_ticks = nullptr;
-    uint64_t* d_empty_ticks = nullptr;
 
-    setup_inputs(blocks, &d_a, &d_b, &d_scale_a, &d_scale_b, &d_c,
-                 &d_mma_ticks, &d_empty_ticks);
+    setup_inputs(max_blocks, &d_a, &d_b, &d_scale_a, &d_scale_b, &d_c,
+                 &d_mma_ticks);
 
-    mma_m64k64n64_kernel<<<blocks, TA_WARP_SIZE, SMEM_BYTES>>>(
-        d_a, d_b, d_scale_a, d_scale_b, d_c, d_mma_ticks, d_empty_ticks,
-        iters);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaEvent_t start_event;
+    cudaEvent_t stop_event;
+    CUDA_CHECK(cudaEventCreate(&start_event));
+    CUDA_CHECK(cudaEventCreate(&stop_event));
 
-    std::vector<uint64_t> h_mma_ticks(blocks);
-    std::vector<uint64_t> h_empty_ticks(blocks);
-    CUDA_CHECK(cudaMemcpy(h_mma_ticks.data(), d_mma_ticks,
-                          blocks * sizeof(uint64_t),
-                          cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_empty_ticks.data(), d_empty_ticks,
-                          blocks * sizeof(uint64_t),
-                          cudaMemcpyDeviceToHost));
+    const int warmup_blocks =
+        launch.auto_blocks ? launch.saturation_blocks : max_blocks;
+    run_benchmark(warmup_blocks, iters, d_a, d_b, d_scale_a, d_scale_b, d_c,
+                  d_mma_ticks, start_event, stop_event);
 
-    const uint64_t mma = min_tick(h_mma_ticks);
-    const uint64_t empty = min_tick(h_empty_ticks);
-    const double raw_cycles =
-        static_cast<double>(mma) / (iters * MMA_PER_ITER);
-    const double corrected_cycles =
-        static_cast<double>(mma - empty) / (iters * MMA_PER_ITER);
+    std::printf("iters=%d sms=%d active_blocks/sm=%d saturation_blocks=%d "
+                "mode=%s\n",
+                iters, launch.sm_count, launch.active_blocks_per_sm,
+                launch.saturation_blocks,
+                launch.auto_blocks ? "wave-sweep" : "manual");
+    std::printf("%5s %8s %11s %11s %15s\n",
+                "wave", "blocks", "cyc_med", "TOPS/s",
+                "est_ops/cyc/sm");
 
-    std::printf("iters=%d blocks=%d smem=%u bytes\n", iters, blocks,
-                SMEM_BYTES);
-    std::printf("raw mma region: %llu cycles\n",
-                static_cast<unsigned long long>(mma));
-    std::printf("empty region:   %llu cycles\n",
-                static_cast<unsigned long long>(empty));
-    std::printf("cycles/mma raw:       %.4f\n", raw_cycles);
-    std::printf("cycles/mma corrected: %.4f\n", corrected_cycles);
+    const auto print_result = [&](int run_blocks,
+                                  const BenchmarkResult& result) {
+        const int run_full_waves = run_blocks / launch.saturation_blocks;
+        const double estimated_ops_per_cycle_per_sm =
+            launch.active_blocks_per_sm * OPS_PER_MMA /
+            result.median_cycles_per_mma;
 
+        std::printf("%5d %8d %11.4f %11.3f %15.3f\n",
+                    run_full_waves, run_blocks,
+                    result.median_cycles_per_mma,
+                    result.ops_per_sec * 1.0e-12,
+                    estimated_ops_per_cycle_per_sm);
+    };
+
+    if (launch.auto_blocks) {
+        for (int i = 0; i < WAVE_SWEEP_COUNT; ++i) {
+            const int run_blocks = launch.saturation_blocks * WAVE_SWEEP[i];
+            const BenchmarkResult result =
+                run_benchmark(run_blocks, iters, d_a, d_b, d_scale_a,
+                              d_scale_b, d_c, d_mma_ticks, start_event,
+                              stop_event);
+            print_result(run_blocks, result);
+        }
+    } else {
+        const BenchmarkResult result =
+            run_benchmark(max_blocks, iters, d_a, d_b, d_scale_a, d_scale_b,
+                          d_c, d_mma_ticks, start_event, stop_event);
+        print_result(max_blocks, result);
+    }
+
+    CUDA_CHECK(cudaEventDestroy(start_event));
+    CUDA_CHECK(cudaEventDestroy(stop_event));
     CUDA_CHECK(cudaFree(d_a));
     CUDA_CHECK(cudaFree(d_b));
     CUDA_CHECK(cudaFree(d_scale_a));
     CUDA_CHECK(cudaFree(d_scale_b));
     CUDA_CHECK(cudaFree(d_c));
     CUDA_CHECK(cudaFree(d_mma_ticks));
-    CUDA_CHECK(cudaFree(d_empty_ticks));
     return 0;
 }
