@@ -55,9 +55,10 @@ CUDA_ARCHITECTURES = {
         torch_arch="8.0;8.6",
         min_cuda=(12, 8),
         sources=(
-            "csrc/bindings.cpp",
-            "csrc/cuda/sm80/shared/block_selection.cu",
+            "csrc/bindings_sm80_debug.cpp",
+            # "csrc/cuda/sm80/shared/block_selection.cu",
             "csrc/cuda/sm80/shared/mma_test.cu",
+            "csrc/cuda/sm80/int8/int8_attention.cu",
         )
     )
 }
@@ -145,7 +146,6 @@ def cuda_extension(architecture: CudaArchitecture) -> CUDAExtension:
             "nvcc": [
                 "-O3",
                 "-use_fast_math",
-                "-DTHRIFTATTENTION_ENABLE_SM80_MMA_TEST",
                 *architecture.nvcc_flags,
             ],
         },
