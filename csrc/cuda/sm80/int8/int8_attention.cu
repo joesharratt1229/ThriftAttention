@@ -26,12 +26,15 @@ __global__ void int8_attention_kernel(
     const int q_head = (q_idx / q_len) % num_q_heads;
     const int batch = q_idx / (q_len * num_q_heads);
 
-    const int kv_head = q_head * num_kv_heads / num_q_heads;
+    const int kv_idx = blockIdx.y;
+    const int kv_token =  kv_idx % kv_len;
+    const int kv_head = q_head * num_kv_heads / num_kv_heads;
 
     float score = 0.0f;
 
     int q_scale_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM;
-    int k_scale_offset = ();
+    int k_scale_offset = ((batch * kv_len + kv_token) * num_kv_heads + kv_head) * HEAD_DIM;
+    int v_scale_offset = ((batch * kv_len + kv_token) * num_kv_heads + kv_head) * HEAD_DIM;
 
     for (int d = 0; d < HEAD_DIM; d++) {
         int q_val = int(Q[q_offset + d]);
@@ -42,13 +45,11 @@ __global__ void int8_attention_kernel(
         score += float(q_val * k_val) * scale;
     }
 
-    score *= rsqrtf(float(HEAD_DIM));
+    // score *= rsqrtf(float(HEAD_DIM));
+    // float max_score = -INFINITY;
+    // for (int d = 0; d < HEAD_DIM; d++) {
 
-    float max_score = -INFINITY;
-    for (int d = 0; d < HEAD_DIM; d++) {
-
-    }
-    O
+    // }
 }
 
 template <typename T, bool CAUSAL, int HEAD_DIM>
