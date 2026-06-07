@@ -21,15 +21,20 @@ constexpr int TILE_M = 16;
 constexpr int TILE_N = 8;
 constexpr int VALUES_PER_THREAD = 4;
 constexpr int EXP_PER_TILE = TILE_M * TILE_N;
+constexpr int EXP_CHAINS_PER_THREAD = 32;
+constexpr int EXP_PER_ITER = TA_WARP_SIZE * EXP_CHAINS_PER_THREAD;
 
 constexpr uint32_t INPUT_BYTES = EXP_PER_TILE * sizeof(float);
 constexpr uint32_t SMEM_BYTES = INPUT_BYTES;
 
 constexpr int DEFAULT_ITERS = 10000;
-constexpr int TILES_PER_ITER = 8;
+constexpr int TILES_PER_ITER = EXP_PER_ITER / EXP_PER_TILE;
 constexpr int WAVE_SWEEP[] = {1, 2, 4, 8};
 constexpr int WAVE_SWEEP_COUNT = sizeof(WAVE_SWEEP) / sizeof(WAVE_SWEEP[0]);
 constexpr int MAX_SWEEP_WAVES = 8;
+
+static_assert(EXP_PER_ITER % EXP_PER_TILE == 0,
+              "exp iteration must cover a whole number of tiles");
 
 __device__ __forceinline__
 uint64_t read_clock64()
@@ -45,16 +50,6 @@ float ex2_approx_ftz(float x)
     float y;
     asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
-}
-
-__device__ __forceinline__
-void exp_m16n8_tile(const float x[VALUES_PER_THREAD],
-                    float y[VALUES_PER_THREAD])
-{
-    y[0] = ex2_approx_ftz(x[0]);
-    y[1] = ex2_approx_ftz(x[1]);
-    y[2] = ex2_approx_ftz(x[2]);
-    y[3] = ex2_approx_ftz(x[3]);
 }
 
 __device__ __forceinline__
@@ -91,66 +86,35 @@ void exp_m16n8_kernel(const float* x,
 
     __syncwarp();
 
-    uint64_t start;
-    uint64_t stop;
-    float y0;
-    float y1;
-    float y2;
-    float y3;
-    asm volatile(
-        "{\n"
-        ".reg .pred p;\n"
-        ".reg .s32 r;\n"
-        "mov.s32 r, %10;\n"
-        "mov.u64 %0, %%clock64;\n"
-        "exp_loop:\n"
-        "ex2.approx.ftz.f32 %2, %6;\n"
-        "ex2.approx.ftz.f32 %3, %7;\n"
-        "ex2.approx.ftz.f32 %4, %8;\n"
-        "ex2.approx.ftz.f32 %5, %9;\n"
-        "ex2.approx.ftz.f32 %2, %6;\n"
-        "ex2.approx.ftz.f32 %3, %7;\n"
-        "ex2.approx.ftz.f32 %4, %8;\n"
-        "ex2.approx.ftz.f32 %5, %9;\n"
-        "ex2.approx.ftz.f32 %2, %6;\n"
-        "ex2.approx.ftz.f32 %3, %7;\n"
-        "ex2.approx.ftz.f32 %4, %8;\n"
-        "ex2.approx.ftz.f32 %5, %9;\n"
-        "ex2.approx.ftz.f32 %2, %6;\n"
-        "ex2.approx.ftz.f32 %3, %7;\n"
-        "ex2.approx.ftz.f32 %4, %8;\n"
-        "ex2.approx.ftz.f32 %5, %9;\n"
-        "ex2.approx.ftz.f32 %2, %6;\n"
-        "ex2.approx.ftz.f32 %3, %7;\n"
-        "ex2.approx.ftz.f32 %4, %8;\n"
-        "ex2.approx.ftz.f32 %5, %9;\n"
-        "ex2.approx.ftz.f32 %2, %6;\n"
-        "ex2.approx.ftz.f32 %3, %7;\n"
-        "ex2.approx.ftz.f32 %4, %8;\n"
-        "ex2.approx.ftz.f32 %5, %9;\n"
-        "ex2.approx.ftz.f32 %2, %6;\n"
-        "ex2.approx.ftz.f32 %3, %7;\n"
-        "ex2.approx.ftz.f32 %4, %8;\n"
-        "ex2.approx.ftz.f32 %5, %9;\n"
-        "ex2.approx.ftz.f32 %2, %6;\n"
-        "ex2.approx.ftz.f32 %3, %7;\n"
-        "ex2.approx.ftz.f32 %4, %8;\n"
-        "ex2.approx.ftz.f32 %5, %9;\n"
-        "add.s32 r, r, -1;\n"
-        "setp.ne.s32 p, r, 0;\n"
-        "@p bra exp_loop;\n"
-        "mov.u64 %1, %%clock64;\n"
-        "}\n"
-        : "=l"(start), "=l"(stop), "=f"(y0), "=f"(y1), "=f"(y2),
-          "=f"(y3)
-        : "f"(x_reg[0]), "f"(x_reg[1]), "f"(x_reg[2]), "f"(x_reg[3]),
-          "r"(iters)
-        : "memory");
+    float chain[EXP_CHAINS_PER_THREAD];
+#pragma unroll
+    for (int i = 0; i < EXP_CHAINS_PER_THREAD; ++i) {
+        const float seed = 0.000244140625f * static_cast<float>(i + 1);
+        chain[i] = x_reg[i % VALUES_PER_THREAD] + seed;
+    }
 
-    out[lane_id * VALUES_PER_THREAD + 0] = y0;
-    out[lane_id * VALUES_PER_THREAD + 1] = y1;
-    out[lane_id * VALUES_PER_THREAD + 2] = y2;
-    out[lane_id * VALUES_PER_THREAD + 3] = y3;
+    __syncwarp();
+
+    uint64_t start = read_clock64();
+#pragma unroll 1
+    for (int iter = 0; iter < iters; ++iter) {
+#pragma unroll
+        for (int i = 0; i < EXP_CHAINS_PER_THREAD; ++i) {
+            chain[i] = ex2_approx_ftz(chain[i]);
+        }
+    }
+    uint64_t stop = read_clock64();
+
+    float y[VALUES_PER_THREAD] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int i = 0; i < EXP_CHAINS_PER_THREAD; ++i) {
+        y[i % VALUES_PER_THREAD] += chain[i];
+    }
+
+    out[lane_id * VALUES_PER_THREAD + 0] = y[0];
+    out[lane_id * VALUES_PER_THREAD + 1] = y[1];
+    out[lane_id * VALUES_PER_THREAD + 2] = y[2];
+    out[lane_id * VALUES_PER_THREAD + 3] = y[3];
 
     if (lane_id == 0) {
         exp_ticks[bid] = stop - start;
