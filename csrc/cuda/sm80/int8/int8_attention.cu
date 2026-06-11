@@ -74,48 +74,68 @@ __global__ void int8_attention_kernel(
     const int o_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM;
     const int sq_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * SCALE_DIM;
 
-    __shared__ float denom;
-    __shared__ float max_score;
+    __shared__ float score_mem[128];
+    __shared__ float denom_mem[128];
 
-    max_score = -INFINITY;
-    denom = 0.0f;
+    float local_max = -INFINITY;
 
-    if (threadIdx.x == 0) {
-        // Phase 1: find the largest QK score for numerical stability.
-        for (int kv_token = 0; kv_token < kv_len; kv_token++) {
-            float score = compute_int8_score<HEAD_DIM, SCALE_DIM>(
-                Q, K, S_Q, S_K, q_offset, sq_offset, batch, kv_capacity, kv_token,
-                num_kv_heads, kv_head);
+    // Phase 1: find the largest QK score for numerical stability.
+    for (int kv_token = threadIdx.x; kv_token < kv_len; kv_token += blockDim.x) {
+        float score = compute_int8_score<HEAD_DIM, SCALE_DIM>(
+            Q, K, S_Q, S_K, q_offset, sq_offset, batch, kv_capacity, kv_token,
+            num_kv_heads, kv_head);
 
-            if constexpr (CAUSAL) {
-                if (kv_token > q_token) {
-                    score = -INFINITY;
-                }
+        if constexpr (CAUSAL) {
+            if (kv_token > q_token) {
+                score = -INFINITY;
             }
-
-            max_score = fmaxf(max_score, score);
         }
 
-        // Phase 2: compute the softmax denominator.
-        for (int kv_token = 0; kv_token < kv_len; kv_token++) {
-            float score = compute_int8_score<HEAD_DIM, SCALE_DIM>(
-                Q, K, S_Q, S_K, q_offset, sq_offset, batch, kv_capacity, kv_token,
-                num_kv_heads, kv_head);
+        local_max = fmaxf(local_max, score);
+    }
 
-            if constexpr (CAUSAL) {
-                if (kv_token > q_token) {
-                    score = -INFINITY;
-                }
-            }
+    score_mem[threadIdx.x] = local_max;
+    __syncthreads();
 
-            denom += expf(score - max_score);
+    for (int stride=blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            score_mem[threadIdx.x] = fmax(score_mem[threadIdx.x], score_mem[threadIdx.x + stride]);
         }
+        __syncthreads();
     }
 
     __syncthreads();
+    float max_score = score_mem[0];
+
+    // Phase 2: compute the softmax denominator.
+    float local_denom = 0.0f;
+    for (int kv_token = threadIdx.x; kv_token < kv_len; kv_token += blockDim.x) {
+        float score = compute_int8_score<HEAD_DIM, SCALE_DIM>(
+            Q, K, S_Q, S_K, q_offset, sq_offset, batch, kv_capacity, kv_token,
+            num_kv_heads, kv_head);
+
+        if constexpr (CAUSAL) {
+            if (kv_token > q_token) {
+                score = -INFINITY;
+            }
+        }
+
+        local_denom += expf(score - max_score);
+    }
+    denom_mem[threadIdx.x] = local_denom;
+    __syncthreads();
+
+    for (int stride=blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            denom_mem[threadIdx.x] += denom_mem[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    __syncthreads();
+    float denom = denom_mem[0];
 
     // Phase 3: use softmax probabilities to mix V into each output channel.
-
     int out_d = threadIdx.x;
     if (out_d < HEAD_DIM) {
         const int v_group = out_d / 32;
