@@ -8,17 +8,9 @@
 __device__ __forceinline__
 float ex2_approx_ftz(float x)
 {
-    uint32_t bits;
-    asm volatile(
-        "{\n\t"
-        ".reg .s32 exp_int;\n\t"
-        "cvt.rni.s32.f32 exp_int, %1;\n\t"
-        "add.s32 exp_int, exp_int, 127;\n\t"
-        "shl.b32 %0, exp_int, 23;\n\t"
-        "}\n"
-        : "=r"(bits)
-        : "f"(x));
-    return __uint_as_float(bits);
+    float r = x + 12582912.0f;
+    uint32_t b = (__float_as_uint(r) << 23) + 0x3F800000u;
+    return __uint_as_float(b);
 }
 
 #include "main_exp.cu"

@@ -39,6 +39,10 @@ class ErrorStats:
     mean_abs: float
     max_rel: float
     cosine: float
+    exact_nan: int
+    exact_inf: int
+    approx_nan: int
+    approx_inf: int
 
 
 def parse_int_list(values: list[str]) -> list[int]:
@@ -180,6 +184,10 @@ def compare_outputs(run_exp: TensorFn, run_exp_approx: TensorFn) -> ErrorStats:
         mean_abs=float(diff.mean().item()),
         max_rel=float((diff / denom).max().item()),
         cosine=float(cosine.item()),
+        exact_nan=int(torch.isnan(exact).sum().item()),
+        exact_inf=int(torch.isinf(exact).sum().item()),
+        approx_nan=int(torch.isnan(approx).sum().item()),
+        approx_inf=int(torch.isinf(approx).sum().item()),
     )
 
 
@@ -264,6 +272,20 @@ def main() -> None:
                 f"{errors.max_abs:.3e}  {errors.mean_abs:.3e}  "
                 f"{errors.max_rel:.3e}  {errors.cosine:.5f}"
             )
+            if any(
+                count
+                for count in (
+                    errors.exact_nan,
+                    errors.exact_inf,
+                    errors.approx_nan,
+                    errors.approx_inf,
+                )
+            ):
+                print(
+                    "nonfinite: "
+                    f"exp nan={errors.exact_nan} inf={errors.exact_inf}; "
+                    f"exp_approx nan={errors.approx_nan} inf={errors.approx_inf}"
+                )
 
         print(
             f"{seq_len:<3}  {q_len:<5}  "
