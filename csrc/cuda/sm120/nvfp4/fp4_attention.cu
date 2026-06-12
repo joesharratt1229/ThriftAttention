@@ -13,25 +13,19 @@
 __device__ __forceinline__
 float ex2_approx_ftz(float x)
 {
-    uint32_t bits;
-    asm volatile(
-        "{\n\t"
-        ".reg .s32 exp_int;\n\t"
-        "cvt.rni.s32.f32 exp_int, %1;\n\t"
-        "add.s32 exp_int, exp_int, 127;\n\t"
-        "shl.b32 %0, exp_int, 23;\n\t"
-        "}\n"
-        : "=r"(bits)
-        : "f"(x));
-    return __uint_as_float(bits);
+    float x = fminf(fmaxf(x, -126.0f), 127.0f);
+    float r = x + 12582912.0f;
+    uint32_t b = (__float_as_uint(r) << 23) + 0x3F800000u;
+    return __uint_as_float(b);
 }
+
 
 template<bool EXP_APPROX>
 __device__ __forceinline__
 float attention_exp(float x)
 {
     if constexpr (EXP_APPROX) {
-        return x <= -126.5f ? 0.0f : ex2_approx_ftz(x);
+        return ex2_approx_ftz(x);
     } else {
         return __expf(x);
     }
