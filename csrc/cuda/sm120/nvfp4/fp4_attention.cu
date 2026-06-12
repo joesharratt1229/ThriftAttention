@@ -10,7 +10,35 @@
 
 #include "thriftattention/sm120/cuda_common.cuh"
 
-template<typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
+__device__ __forceinline__
+float ex2_approx_ftz(float x)
+{
+    uint32_t bits;
+    asm volatile(
+        "{\n\t"
+        ".reg .s32 exp_int;\n\t"
+        "cvt.rni.s32.f32 exp_int, %1;\n\t"
+        "add.s32 exp_int, exp_int, 127;\n\t"
+        "shl.b32 %0, exp_int, 23;\n\t"
+        "}\n"
+        : "=r"(bits)
+        : "f"(x));
+    return __uint_as_float(bits);
+}
+
+template<bool EXP_APPROX>
+__device__ __forceinline__
+float attention_exp(float x)
+{
+    if constexpr (EXP_APPROX) {
+        return x <= -126.5f ? 0.0f : ex2_approx_ftz(x);
+    } else {
+        return __expf(x);
+    }
+}
+
+template<typename T, bool CAUSAL, bool EXP_APPROX,
+         int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
          int HEAD_DIM_2, int SCALE_DIM,
          int NUM_WARPS, int WARP_Q>
 __launch_bounds__(NUM_WARPS * TA_WARP_SIZE)
@@ -35,8 +63,10 @@ void fp4_attention_kernel(
     constexpr int MMA_M = 16;
     constexpr int MMA_K = 64;
     constexpr int MMA_N = 8;
+    constexpr float LOG2_E = 1.4426950408889634f;
 
-    const float softmax_scale = rsqrtf(static_cast<float>(HEAD_DIM));
+    const float softmax_scale =
+        rsqrtf(static_cast<float>(HEAD_DIM)) * (EXP_APPROX ? LOG2_E : 1.0f);
 
     const int bid = blockIdx.x;
     const int tid = threadIdx.x;
@@ -255,8 +285,10 @@ void fp4_attention_kernel(
 
             // rescale previous O for new rowmax
             float rescale[2];
-            rescale[0] = __expf(rowmax[mma_id_q][0] - this_rowmax[0]);
-            rescale[1] = __expf(rowmax[mma_id_q][1] - this_rowmax[1]);
+            rescale[0] = attention_exp<EXP_APPROX>(
+                rowmax[mma_id_q][0] - this_rowmax[0]);
+            rescale[1] = attention_exp<EXP_APPROX>(
+                rowmax[mma_id_q][1] - this_rowmax[1]);
             for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
                 O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
                 O_rmem[mma_id_q][mma_id_d][1] *= rescale[0];
@@ -272,10 +304,14 @@ void fp4_attention_kernel(
             float this_rowsumexp[2] = {};
             for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
                 float *regs = S_rmem[mma_id_q][mma_id_kv];
-                regs[0] = __expf(regs[0] - rowmax[mma_id_q][0]);
-                regs[1] = __expf(regs[1] - rowmax[mma_id_q][0]);
-                regs[2] = __expf(regs[2] - rowmax[mma_id_q][1]);
-                regs[3] = __expf(regs[3] - rowmax[mma_id_q][1]);
+                regs[0] = attention_exp<EXP_APPROX>(
+                    regs[0] - rowmax[mma_id_q][0]);
+                regs[1] = attention_exp<EXP_APPROX>(
+                    regs[1] - rowmax[mma_id_q][0]);
+                regs[2] = attention_exp<EXP_APPROX>(
+                    regs[2] - rowmax[mma_id_q][1]);
+                regs[3] = attention_exp<EXP_APPROX>(
+                    regs[3] - rowmax[mma_id_q][1]);
 
                 this_rowsumexp[0] += regs[0] + regs[1];
                 this_rowsumexp[1] += regs[2] + regs[3];
@@ -303,10 +339,22 @@ void fp4_attention_kernel(
                 const float gmax_lower = rowmax[mma_id_q][1];
                 const bool valid_upper = gmax_upper > -FLT_MAX * 0.5f;
                 const bool valid_lower = gmax_lower > -FLT_MAX * 0.5f;
-                const float inv_upper = valid_upper ? (FP4_MAX * __expf(rowmax[mma_id_q][0] - gmax_upper)) : 0.0f;
-                const float inv_lower = valid_lower ? (FP4_MAX * __expf(rowmax[mma_id_q][1] - gmax_lower)) : 0.0f;
-                sf_P_upper[blk] = valid_upper ? (FP4_RANGE / FP4_MAX * __expf(gmax_upper - rowmax[mma_id_q][0])) : 1.0f;
-                sf_P_lower[blk] = valid_lower ? (FP4_RANGE / FP4_MAX * __expf(gmax_lower - rowmax[mma_id_q][1])) : 1.0f;
+                const float inv_upper = valid_upper
+                    ? (FP4_MAX * attention_exp<EXP_APPROX>(
+                          rowmax[mma_id_q][0] - gmax_upper))
+                    : 0.0f;
+                const float inv_lower = valid_lower
+                    ? (FP4_MAX * attention_exp<EXP_APPROX>(
+                          rowmax[mma_id_q][1] - gmax_lower))
+                    : 0.0f;
+                sf_P_upper[blk] = valid_upper
+                    ? (FP4_RANGE / FP4_MAX * attention_exp<EXP_APPROX>(
+                          gmax_upper - rowmax[mma_id_q][0]))
+                    : 1.0f;
+                sf_P_lower[blk] = valid_lower
+                    ? (FP4_RANGE / FP4_MAX * attention_exp<EXP_APPROX>(
+                          gmax_lower - rowmax[mma_id_q][1]))
+                    : 1.0f;
 
                 S_rmem[mma_id_q][t0][0] *= inv_upper;
                 S_rmem[mma_id_q][t0][1] *= inv_upper;
@@ -417,7 +465,7 @@ void fp4_attention_kernel(
         }
 }
 
-template<typename T, bool CAUSAL, int HEAD_DIM>
+template<typename T, bool CAUSAL, bool EXP_APPROX, int HEAD_DIM>
 static void launch_fp4_attention(
     const __nv_fp4x2_e2m1* Q, const __nv_fp4x2_e2m1* K, const __nv_fp4x2_e2m1* V,
     const __nv_fp8_e4m3* S_Q, const __nv_fp8_e4m3* S_K, const __nv_fp8_e4m3* S_V,
@@ -443,7 +491,8 @@ static void launch_fp4_attention(
     constexpr int smem_size = q_phase_smem + v_phase_smem > k_phase_smem
                             ? q_phase_smem + v_phase_smem : k_phase_smem;
 
-    auto kernel = fp4_attention_kernel<T, CAUSAL, BLOCK_Q, BLOCK_KV, HEAD_DIM,
+    auto kernel = fp4_attention_kernel<T, CAUSAL, EXP_APPROX,
+                                       BLOCK_Q, BLOCK_KV, HEAD_DIM,
                                        HEAD_DIM_2, SCALE_DIM,
                                        NUM_WARPS, WARP_Q>;
 
@@ -453,7 +502,7 @@ static void launch_fp4_attention(
         bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
 }
 
-template<typename T, bool CAUSAL>
+template<typename T, bool CAUSAL, bool EXP_APPROX>
 static void dispatch_fp4_attention(
     const __nv_fp4x2_e2m1* Q,
     const __nv_fp4x2_e2m1* K,
@@ -470,11 +519,11 @@ static void dispatch_fp4_attention(
     int num_kv_heads,
     int head_dim) {
     if (head_dim == 64) {
-        launch_fp4_attention<T, CAUSAL, 64>(
+        launch_fp4_attention<T, CAUSAL, EXP_APPROX, 64>(
             Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
             kv_capacity, num_q_heads, num_kv_heads);
     } else {
-        launch_fp4_attention<T, CAUSAL, 128>(
+        launch_fp4_attention<T, CAUSAL, EXP_APPROX, 128>(
             Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
             kv_capacity, num_q_heads, num_kv_heads);
     }
@@ -495,7 +544,8 @@ static void fp4_attention_nvfp4_typed(
     int kv_capacity,
     int num_q_heads,
     int num_kv_heads,
-    int head_dim) {
+    int head_dim,
+    bool exp_approx) {
     auto Q = reinterpret_cast<const __nv_fp4x2_e2m1*>(Q_raw);
     auto K = reinterpret_cast<const __nv_fp4x2_e2m1*>(K_raw);
     auto V = reinterpret_cast<const __nv_fp4x2_e2m1*>(V_raw);
@@ -504,9 +554,15 @@ static void fp4_attention_nvfp4_typed(
     auto S_V = reinterpret_cast<const __nv_fp8_e4m3*>(S_V_raw);
     auto O = reinterpret_cast<T*>(O_raw);
 
-    dispatch_fp4_attention<T, CAUSAL>(
-        Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
-        kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    if (exp_approx) {
+        dispatch_fp4_attention<T, CAUSAL, true>(
+            Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
+            kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    } else {
+        dispatch_fp4_attention<T, CAUSAL, false>(
+            Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
+            kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    }
 }
 
 void fp4_attention_causal_nvfp4(
@@ -524,15 +580,18 @@ void fp4_attention_causal_nvfp4(
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
-    bool is_bf16) {
+    bool is_bf16,
+    bool exp_approx) {
     if (is_bf16) {
         fp4_attention_nvfp4_typed<__nv_bfloat16, true>(
             Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
-            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads,
+            head_dim, exp_approx);
     } else {
         fp4_attention_nvfp4_typed<half, true>(
             Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
-            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads,
+            head_dim, exp_approx);
     }
 }
 
@@ -551,14 +610,17 @@ void fp4_attention_noncausal_nvfp4(
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
-    bool is_bf16) {
+    bool is_bf16,
+    bool exp_approx) {
     if (is_bf16) {
         fp4_attention_nvfp4_typed<__nv_bfloat16, false>(
             Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
-            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads,
+            head_dim, exp_approx);
     } else {
         fp4_attention_nvfp4_typed<half, false>(
             Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
-            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads,
+            head_dim, exp_approx);
     }
 }

@@ -40,13 +40,17 @@ def test_register_transformers_attention_registers_custom_name(monkeypatch):
     monkeypatch.setattr(hf, "_register_attention_mask", register_mask)
 
     name = hf.register_transformers_attention(
-        hf.TransformersAttentionConfig(name="unit_thrift_attention", method="fp4")
+        hf.TransformersAttentionConfig(
+            name="unit_thrift_attention", method="fp4", exp_approx=True
+        )
     )
 
     assert name == "unit_thrift_attention"
     assert registered["unit_thrift_attention"] is hf.thriftattention_forward
     assert masks["unit_thrift_attention"] is True
-    assert hf.get_registered_transformers_attention_config("unit_thrift_attention").method == "fp4"
+    config = hf.get_registered_transformers_attention_config("unit_thrift_attention")
+    assert config.method == "fp4"
+    assert config.exp_approx is True
 
 
 def test_registered_attention_config_is_used_without_model_mutation(monkeypatch):

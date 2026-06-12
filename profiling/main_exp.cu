@@ -33,6 +33,10 @@ constexpr int WAVE_SWEEP[] = {1, 2, 4, 8};
 constexpr int WAVE_SWEEP_COUNT = sizeof(WAVE_SWEEP) / sizeof(WAVE_SWEEP[0]);
 constexpr int MAX_SWEEP_WAVES = 8;
 
+#ifndef TA_EXP_BENCH_IMPL_LABEL
+#define TA_EXP_BENCH_IMPL_LABEL "ex2.approx.ftz"
+#endif
+
 static_assert(EXP_PER_ITER % EXP_PER_TILE == 0,
               "exp iteration must cover a whole number of tiles");
 
@@ -44,6 +48,7 @@ uint64_t read_clock64()
     return t;
 }
 
+#ifndef TA_EXP_BENCH_CUSTOM_EX2
 __device__ __forceinline__
 float ex2_approx_ftz(float x)
 {
@@ -51,6 +56,7 @@ float ex2_approx_ftz(float x)
     asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
 }
+#endif
 
 __device__ __forceinline__
 void copy_bytes_to_smem(uint8_t* smem, const uint8_t* gmem, uint32_t bytes)
@@ -270,10 +276,11 @@ int main(int argc, char** argv)
                   start_event, stop_event);
 
     std::printf("iters=%d sms=%d active_blocks/sm=%d saturation_blocks=%d "
-                "tile=m16n8 exp/tile=%d mode=%s\n",
+                "tile=m16n8 exp/tile=%d mode=%s impl=%s\n",
                 iters, launch.sm_count, launch.active_blocks_per_sm,
                 launch.saturation_blocks, EXP_PER_TILE,
-                launch.auto_blocks ? "wave-sweep" : "manual");
+                launch.auto_blocks ? "wave-sweep" : "manual",
+                TA_EXP_BENCH_IMPL_LABEL);
     std::printf("%5s %8s %13s %11s %16s\n",
                 "wave", "blocks", "cyc_med/tile", "Gexp/s",
                 "est_exp/cyc/sm");

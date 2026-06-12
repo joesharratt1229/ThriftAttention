@@ -166,12 +166,12 @@ def test_sm120_backend_dispatches_fp4_noncausal_extension(monkeypatch):
         v,
         selection=None,
         quant_format=FakeQuantFormat(),
-        config=AttentionConfig(method="fp4", causal=False),
+        config=AttentionConfig(method="fp4", causal=False, exp_approx=True),
         is_bf16=False,
     )
 
     assert out == "out"
-    assert calls == [("noncausal", ("qp", "kp", "vp", "qs", "ks", "vs", False))]
+    assert calls == [("noncausal", ("qp", "kp", "vp", "qs", "ks", "vs", False, True))]
 
 
 def test_sm120_backend_dispatches_fp4_mxfp4_extension(monkeypatch):
@@ -287,7 +287,7 @@ def test_sm120_backend_forwards_bf16_to_quantizer_and_extension(monkeypatch):
             return "qp", "kp", "vp", "qs", "ks", "vs"
 
     def fake_noncausal(*args):
-        calls.append(("noncausal", args[-1]))
+        calls.append(("noncausal", args[-2], args[-1]))
         return "out"
 
     ext = SimpleNamespace(fp4_attention_noncausal_nvfp4_packed=fake_noncausal)
@@ -306,4 +306,4 @@ def test_sm120_backend_forwards_bf16_to_quantizer_and_extension(monkeypatch):
     )
 
     assert out == "out"
-    assert calls == [("quantize_qkv", True), ("noncausal", True)]
+    assert calls == [("quantize_qkv", True), ("noncausal", True, False)]

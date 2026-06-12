@@ -114,6 +114,7 @@ class Sm120Nvfp4Backend:
                     if config.causal
                     else ext.fp4_attention_noncausal_nvfp4_packed
                 )
+                return fn(*packed, is_bf16, config.exp_approx)
             return fn(*packed, is_bf16)
         if config.method == "thrift":
             if selection is None:

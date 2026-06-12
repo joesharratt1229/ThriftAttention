@@ -24,3 +24,4 @@ class AttentionConfig:
     backend: AttentionBackendName = "auto"
     implementation: AttentionImplementation = "auto"
     fallback: FallbackBackend = "error"
+    exp_approx: bool = False
