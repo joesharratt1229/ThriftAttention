@@ -91,6 +91,7 @@ def test_sm80_int8_attention_noncausal_matches_torch(
         (1, 8, 4, 64, 64, 64, "q_heads > kv_heads"),
         (4, 1, 1, 64, 64, 64, "larger batch size"),
         (1, 1, 1, 64, 64, 128, "headd dim 128"),
+        (1, 1, 1, 256, 256, 128, "long kv_len"),
     ]
 )
 def test_sm80_int8_attention_causal_matches_torch(
