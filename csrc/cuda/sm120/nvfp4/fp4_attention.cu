@@ -1,4 +1,79 @@
-// SM120 NVFP4 attention baseline
+// SM120 NVFP4 attention — staged power-of-two softmax rewrite
+//
+// Three stages applied to the EXP_APPROX=true path (baseline __expf path kept
+// intact for A/B, and it also benefits from Stage 2):
+//
+//   Stage 1 — FUSE, don't append.
+//     * The per-element `*= softmax_scale` loop is deleted. rowmax is tracked
+//       on RAW scores (max commutes with a positive scale).
+//     * scale + base-change(log2e) + max-subtract + magic-round collapse into
+//       ONE FFMA per element:  r = fmaf(s_raw, k, MAGIC - m_raw*k).
+//     * One FMNMX lower guard (handles -INF mask values and NaN); the upper
+//       clamp is unnecessary because s - m <= 0 structurally.
+//
+//   Stage 2 — DELETE dead work (applies to BOTH paths).
+//     * The old sf_P block computed attention_exp(rowmax - rowmax) == exp(0)
+//       sixteen times per row-group per iteration. inv == 6.0, sf == 448.0
+//       are constants; the e4m3-packed scale word is the compile-time
+//       constant 0x7E7E7E7E (448 in e4m3, replicated).
+//
+//   Stage 3 — bit-built power-of-two weight, SHARED cvt quantization
+//     (approx path only).
+//     * The weight 4 * 2^n is constructed from the magic-added bits in two
+//       integer ops: (bits(r) << 23) + bits(4.0f). No MUFU.EX2 is issued.
+//     * Quantization reuses the SAME ta_cvt_8xf32_to_e2m1_packed loop as the
+//       baseline: cvt.rn on {4, 2, 1, 0.5, <=0.25} reproduces the
+//       power-of-two ladder codes {6, 4, 2, 1, 0} exactly (0.25 is a tie and
+//       rounds to even = 0). The x4 bias keeps the row max on the top
+//       representable power-of-two rung; since the rowsum accumulates the
+//       SAME x4-biased weight, the epilogue only divides out the 448 scale.
+//     * Rationale (ncu): the kernel runs at 25% occupancy (164 regs, 3
+//       blocks/SM; the cliff to 2 blocks is at 170 regs) with ~2.7 active
+//       warps/scheduler — latency-bound, no pipe saturated. So the approx
+//       path must SHORTEN the serial QK -> softmax -> PV chain without
+//       adding live registers. A previous attempt that hand-packed nibbles
+//       (5-op clamp ladder + shift/or chains, ~10 extra ALU ops and ~10
+//       extra live values per row) regressed badly for exactly that reason.
+//       This version keeps the register profile of the baseline and removes
+//       FMUL(log2e) + MUFU.EX2 + FMUL(x6) per element in exchange for
+//       FMNMX + SHL + IADD on full-rate pipes.
+//
+//   Stage 4 — INTEGER-SNAPPED rowmax (approx path only).
+//     * rowmax[] stores R = TA_MAGIC + ceil-ish(max * k) (magic-biased rung)
+//       instead of the raw max. The per-row FFMA addend is the exact FADD
+//       c = 2*MAGIC - R, and the O/rowsum rescale is exactly 2^(R_old - R) —
+//       no drift between rescaled O entries and their re-quantization.
+//     * A uniform rung shift cancels between numerator and denominator, so
+//       snapping costs no accuracy class.
+//     * R changes only when a row's max crosses a rung boundary (1/k raw
+//       units). The warp votes via __any_sync and SKIPS the O-rescale loop
+//       when no row moved — the common case once the running max stabilizes.
+//
+//   Stage 5 — MMA-accumulated rowsum (approx path only).
+//     * The PV mma gets a 17th output tile: P @ ones (B = e2m1 code 2 in
+//       every nibble, scale = e4m3 1.0; both compile-time constants, no
+//       smem traffic). B being all-ones makes every column of the tile equal
+//       to the row's denominator, so each thread reads its own copy — the
+//       per-iteration FADD rowsum, the 4-shuffle butterfly, and the running
+//       rowsum FMA are all deleted, and the O-rescale/skip logic covers the
+//       denominator automatically. Epilogue norm = 1/sum_tile: every
+//       packaging constant cancels between numerator and denominator.
+//
+// Numerics notes for the approx path:
+//   * each weight is 2^round((s-m)*k): within x/÷sqrt(2) of exact exp.
+//   * Stage 5 changes the denominator to the sum of QUANTIZED weights:
+//     elements with n <= -4 (code 0) no longer contribute. Numerator and
+//     denominator are now exactly consistent (true weighted average of V
+//     rows), instead of a denominator that includes sub-rung tail mass the
+//     numerator drops.
+//   * fully-padded rows produce NaN garbage (0 * 1/0) instead of ~0/eps
+//     garbage; both are garbage for padding, unchanged contract.
+//
+// Suggested measurement after each stage (ncu):
+//   sm__inst_executed_pipe_xu      -> approx drops the EX2 share (~2/3); the
+//                                     two cvt.e2m1x2 per 8 values remain
+//   launch__registers_per_thread   -> MUST stay <= 170 (3-blocks/SM cliff)
+//   smsp__issue_active / stalls    -> latency-bound; watch warp eligibility
 
 #include <cstdint>
 #include <float.h>
@@ -10,32 +85,51 @@
 
 #include "thriftattention/sm120/cuda_common.cuh"
 
+// ---------------------------------------------------------------------------
+// Power-of-two softmax helpers (Stage 1 / Stage 3 building blocks)
+// ---------------------------------------------------------------------------
+
+// 1.5 * 2^23: floats in [2^23, 2^24) are spaced exactly 1.0 apart, so an FADD
+// against this constant performs round-to-nearest-integer on the wide pipe.
+constexpr float    TA_MAGIC        = 12582912.0f;
+constexpr uint32_t TA_MAGIC_BITS   = 0x4B400000u;   // __float_as_uint(TA_MAGIC)
+// Lower guard: keeps round(x) >= -126 so the exponent-field construction
+// cannot wrap. fmaxf against this also launders -INF (masked) and NaN inputs.
+constexpr float    TA_MAGIC_FLOOR  = TA_MAGIC - 126.0f;
+// 2 * TA_MAGIC (= 1.5 * 2^24, exactly representable). For a snapped rung
+// R = TA_MAGIC + u stored magic-biased, the per-row FFMA addend
+// c = TA_MAGIC - u is recovered exactly as TA_MAGIC_X2 - R (both operands
+// sit on the unit grid of [2^23, 2^24), so the FADD is exact).
+constexpr float    TA_MAGIC_X2     = 25165824.0f;
+
+// 2^n from the magic-added bits: (bits << 23) drops the constant exactly
+// ((TA_MAGIC_BITS << 23) mod 2^32 == 0) and +0x3F800000 supplies the bias.
+// Output always has a zero mantissa: only {2^j} are ever produced.
 __device__ __forceinline__
-float ex2_approx_ftz(float x)
+float ta_pow2_from_bits(uint32_t br)
 {
-    float x = fminf(fmaxf(x, -126.0f), 127.0f);
-    float r = x + 12582912.0f;
-    uint32_t b = (__float_as_uint(r) << 23) + 0x3F800000u;
-    return __uint_as_float(b);
+    return __uint_as_float((br << 23) + 0x3F800000u);
 }
 
-
-template<bool EXP_APPROX>
+// 4 * 2^n from the magic-added bits (bias constant = bits of 4.0f). The x4
+// puts the row max on e2m1's top power-of-two rung {4, 2, 1, 0.5}; the same
+// biased value feeds the rowsum, so the pair cancels in the epilogue.
+// Requires n >= -126 (guaranteed by the TA_MAGIC_FLOOR guard) and n <= 0
+// (structural: s - m <= 0).
 __device__ __forceinline__
-float attention_exp(float x)
+float ta_pow2x4_from_bits(uint32_t br)
 {
-    if constexpr (EXP_APPROX) {
-        return ex2_approx_ftz(x);
-    } else {
-        return __expf(x);
-    }
+    return __uint_as_float((br << 23) + 0x40800000u);
 }
 
 template<typename T, bool CAUSAL, bool EXP_APPROX,
          int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
          int HEAD_DIM_2, int SCALE_DIM,
          int NUM_WARPS, int WARP_Q>
-__launch_bounds__(NUM_WARPS * TA_WARP_SIZE)
+// The 3 pins occupancy at 3 blocks/SM (<= 170 regs with 128 threads on a
+// 64K-reg SM): crossing that register cliff costs ~33% of resident warps on
+// an already latency-bound kernel, which is never worth a few extra regs.
+__launch_bounds__(NUM_WARPS * TA_WARP_SIZE, 3)
 __global__
 void fp4_attention_kernel(
     const __nv_fp4x2_e2m1* Q,
@@ -59,6 +153,7 @@ void fp4_attention_kernel(
     constexpr int MMA_N = 8;
     constexpr float LOG2_E = 1.4426950408889634f;
 
+    // k folds 1/sqrt(d) and (approx path only) the e->2 base change.
     const float softmax_scale =
         rsqrtf(static_cast<float>(HEAD_DIM)) * (EXP_APPROX ? LOG2_E : 1.0f);
 
@@ -98,13 +193,23 @@ void fp4_attention_kernel(
     uint32_t sfK_rmem[BLOCK_KV / MMA_N][HEAD_DIM / MMA_K];
     uint32_t sfV_rmem[BLOCK_KV / MMA_K][HEAD_DIM / MMA_N];
 
+    // Approx (Stage 5): the rowsum rides the PV mma as a 17th output tile
+    // against an all-ones e2m1 column block — B all-ones makes every column
+    // of that tile equal to the row's sum of QUANTIZED weights, so each
+    // thread reads its own copy (no shuffle reduction) and the O-rescale /
+    // skip logic covers the denominator for free.
+    constexpr int O_TILES = HEAD_DIM / MMA_N + (EXP_APPROX ? 1 : 0);
+
+    // Baseline: RAW-domain running max. Approx: the SNAPPED rung
+    // R = TA_MAGIC + ceil-ish(max * k), kept magic-biased so rung deltas and
+    // the per-row FFMA addend come out of exact unit-grid FADDs.
     float rowmax[WARP_Q/MMA_M][2];
-    float rowsum[WARP_Q/MMA_M][2] = {};
-    float O_rmem[WARP_Q/MMA_M][HEAD_DIM/MMA_N][4] = {};
+    float rowsum[WARP_Q/MMA_M][2] = {};   // baseline only
+    float O_rmem[WARP_Q/MMA_M][O_TILES][4] = {};
 
     for (int mma_id_q = 0; mma_id_q < WARP_Q/MMA_M; mma_id_q++) {
-        rowmax[mma_id_q][0] = -FLT_MAX;
-        rowmax[mma_id_q][1] = -FLT_MAX;
+        rowmax[mma_id_q][0] = EXP_APPROX ? TA_MAGIC_FLOOR : -FLT_MAX;
+        rowmax[mma_id_q][1] = EXP_APPROX ? TA_MAGIC_FLOOR : -FLT_MAX;
     }
 
     // ---- load Q data global -> shared (swizzled) -> registers ----
@@ -188,7 +293,7 @@ void fp4_attention_kernel(
 
         // Load K first; issue V in a second async group so QK can overlap
         // with the V transfer.
-        ta_gmem_to_smem<BLOCK_KV, HEAD_DIM_2, TB_SIZE, __nv_fp4x2_e2m1>(K_smem, K, tid, HEAD_DIM_2);;
+        ta_gmem_to_smem<BLOCK_KV, HEAD_DIM_2, TB_SIZE, __nv_fp4x2_e2m1>(K_smem, K, tid, HEAD_DIM_2);
         ta_load_scales<BLOCK_KV, SCALE_DIM, TB_SIZE, __nv_fp8_e4m3>(K_sf_smem, S_K, SCALE_DIM, tid);
         asm volatile("cp.async.commit_group;");
         ta_gmem_to_smem<HEAD_DIM, BLOCK_KV / 2, TB_SIZE, __nv_fp4x2_e2m1>(V_smem, V, tid, v_kv / 2);
@@ -244,8 +349,6 @@ void fp4_attention_kernel(
                         const int k_col_0 = k_block_start + ta_kv_logical_from_physical(k_phys_0);
                         const int k_col_1 = k_block_start + ta_kv_logical_from_physical(k_phys_1);
 
-                        // regs[0]: (q_row_upper, k_col_0), regs[1]: (q_row_upper, k_col_1)
-                        // regs[2]: (q_row_lower, k_col_0), regs[3]: (q_row_lower, k_col_1)
                         if (k_col_0 > q_row_upper_global) S_rmem[mma_id_q][mma_id_kv][0] = -INFINITY;
                         if (k_col_1 > q_row_upper_global) S_rmem[mma_id_q][mma_id_kv][1] = -INFINITY;
                         if (k_col_0 > q_row_lower_global) S_rmem[mma_id_q][mma_id_kv][2] = -INFINITY;
@@ -256,12 +359,11 @@ void fp4_attention_kernel(
         }
 
         for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
-            // apply softmax scale
-            for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
-                for (int reg_id = 0; reg_id < 4; reg_id++)
-                    S_rmem[mma_id_q][mma_id_kv][reg_id] *= softmax_scale;
-
-            // rowmax over this KV block
+            // ---------------------------------------------------------------
+            // Stage 1: rowmax over RAW scores. The old `*= softmax_scale`
+            // loop (32 FMULs/thread/iter) is gone; max commutes with the
+            // positive scale, so the scale is applied later inside one FFMA.
+            // ---------------------------------------------------------------
             float this_rowmax[2] = {-FLT_MAX, -FLT_MAX};
             for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
                 float *regs = S_rmem[mma_id_q][mma_id_kv];
@@ -273,93 +375,132 @@ void fp4_attention_kernel(
             this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[1], 1));
             this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[1], 2));
 
-            // new rowmax
-            this_rowmax[0] = max(this_rowmax[0], rowmax[mma_id_q][0]);
-            this_rowmax[1] = max(this_rowmax[1], rowmax[mma_id_q][1]);
-
             // rescale previous O for new rowmax
             float rescale[2];
-            rescale[0] = attention_exp<EXP_APPROX>(
-                rowmax[mma_id_q][0] - this_rowmax[0]);
-            rescale[1] = attention_exp<EXP_APPROX>(
-                rowmax[mma_id_q][1] - this_rowmax[1]);
-            for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
-                O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
-                O_rmem[mma_id_q][mma_id_d][1] *= rescale[0];
-                O_rmem[mma_id_q][mma_id_d][2] *= rescale[1];
-                O_rmem[mma_id_q][mma_id_d][3] *= rescale[1];
+            if constexpr (EXP_APPROX) {
+                // -----------------------------------------------------------
+                // Stage 4: INTEGER-SNAPPED rowmax. The block max is snapped
+                // UP onto the rung grid (the +0.5f guarantees R >= max * k,
+                // so n <= 0 still holds element-wise; a uniform rung shift
+                // cancels between numerator and denominator). Two payoffs:
+                //   * the rescale is exactly 2^(R_old - R_new) from bits —
+                //     old O entries match their re-quantization exactly;
+                //   * R changes only when the max crosses a rung (~1/k raw
+                //     units), so most iterations the whole warp votes "no
+                //     change" and SKIPS the 64-FMUL O-rescale loop.
+                // -----------------------------------------------------------
+                const float R_old0 = rowmax[mma_id_q][0];
+                const float R_old1 = rowmax[mma_id_q][1];
+                const float R0 = fmaxf(fmaf(this_rowmax[0], softmax_scale, 0.5f) + TA_MAGIC, R_old0);
+                const float R1 = fmaxf(fmaf(this_rowmax[1], softmax_scale, 0.5f) + TA_MAGIC, R_old1);
+                rowmax[mma_id_q][0] = R0;
+                rowmax[mma_id_q][1] = R1;
+
+                const bool rung_change = (R0 != R_old0) || (R1 != R_old1);
+                if (__any_sync(0xFFFFFFFFu, rung_change)) {
+                    // R_old - R is an exact non-positive integer (unit grid);
+                    // re-biasing by TA_MAGIC and flooring guards the
+                    // first-block jump from TA_MAGIC_FLOOR (2^-126 ~ 0).
+                    const float d0 = fmaxf((R_old0 - R0) + TA_MAGIC, TA_MAGIC_FLOOR);
+                    const float d1 = fmaxf((R_old1 - R1) + TA_MAGIC, TA_MAGIC_FLOOR);
+                    rescale[0] = ta_pow2_from_bits(__float_as_uint(d0));
+                    rescale[1] = ta_pow2_from_bits(__float_as_uint(d1));
+                    for (int mma_id_d = 0; mma_id_d < O_TILES; mma_id_d++) {
+                        O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
+                        O_rmem[mma_id_q][mma_id_d][1] *= rescale[0];
+                        O_rmem[mma_id_q][mma_id_d][2] *= rescale[1];
+                        O_rmem[mma_id_q][mma_id_d][3] *= rescale[1];
+                    }
+                } else {
+                    rescale[0] = 1.0f;
+                    rescale[1] = 1.0f;
+                }
+            } else {
+                // new rowmax (raw domain)
+                this_rowmax[0] = max(this_rowmax[0], rowmax[mma_id_q][0]);
+                this_rowmax[1] = max(this_rowmax[1], rowmax[mma_id_q][1]);
+
+                rescale[0] = __expf((rowmax[mma_id_q][0] - this_rowmax[0]) * softmax_scale);
+                rescale[1] = __expf((rowmax[mma_id_q][1] - this_rowmax[1]) * softmax_scale);
+                for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
+                    O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
+                    O_rmem[mma_id_q][mma_id_d][1] *= rescale[0];
+                    O_rmem[mma_id_q][mma_id_d][2] *= rescale[1];
+                    O_rmem[mma_id_q][mma_id_d][3] *= rescale[1];
+                }
+
+                // save new rowmax
+                rowmax[mma_id_q][0] = this_rowmax[0];
+                rowmax[mma_id_q][1] = this_rowmax[1];
             }
 
-            // save new rowmax
-            rowmax[mma_id_q][0] = this_rowmax[0];
-            rowmax[mma_id_q][1] = this_rowmax[1];
-
-            // softmax numerator and rowsumexp
             float this_rowsumexp[2] = {};
-            for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
-                float *regs = S_rmem[mma_id_q][mma_id_kv];
-                regs[0] = attention_exp<EXP_APPROX>(
-                    regs[0] - rowmax[mma_id_q][0]);
-                regs[1] = attention_exp<EXP_APPROX>(
-                    regs[1] - rowmax[mma_id_q][0]);
-                regs[2] = attention_exp<EXP_APPROX>(
-                    regs[2] - rowmax[mma_id_q][1]);
-                regs[3] = attention_exp<EXP_APPROX>(
-                    regs[3] - rowmax[mma_id_q][1]);
 
-                this_rowsumexp[0] += regs[0] + regs[1];
-                this_rowsumexp[1] += regs[2] + regs[3];
+            if constexpr (EXP_APPROX) {
+                // -----------------------------------------------------------
+                // Stage 1 + 3: one FFMA does scale * s in log2 domain AND
+                // the round-to-integer (the snapped rung + magic constant
+                // ride in the per-row addend c = 2*MAGIC - R, an exact
+                // unit-grid FADD); one FMNMX guards the bottom (-INF mask
+                // values, NaN, exponent-wrap safety n >= -126). The biased
+                // weight 4 * 2^n is then one LEA on the bits — no MUFU.EX2
+                // and no x6 range loop. Weights overwrite S_rmem in place so
+                // the cvt pack loop below is shared with the baseline
+                // (identical register profile and nibble order).
+                // -----------------------------------------------------------
+                const float c0 = TA_MAGIC_X2 - rowmax[mma_id_q][0];
+                const float c1 = TA_MAGIC_X2 - rowmax[mma_id_q][1];
+
+                for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+                    float *regs = S_rmem[mma_id_q][mma_id_kv];
+                    const float r0 = fmaxf(fmaf(regs[0], softmax_scale, c0), TA_MAGIC_FLOOR);
+                    const float r1 = fmaxf(fmaf(regs[1], softmax_scale, c0), TA_MAGIC_FLOOR);
+                    const float r2 = fmaxf(fmaf(regs[2], softmax_scale, c1), TA_MAGIC_FLOOR);
+                    const float r3 = fmaxf(fmaf(regs[3], softmax_scale, c1), TA_MAGIC_FLOOR);
+
+                    // No FP rowsum here: the denominator is accumulated by
+                    // the PV mma against the all-ones tile (Stage 5).
+                    regs[0] = ta_pow2x4_from_bits(__float_as_uint(r0));
+                    regs[1] = ta_pow2x4_from_bits(__float_as_uint(r1));
+                    regs[2] = ta_pow2x4_from_bits(__float_as_uint(r2));
+                    regs[3] = ta_pow2x4_from_bits(__float_as_uint(r3));
+                }
+            } else {
+                // -----------------------------------------------------------
+                // Baseline path: __expf, with the scale fused into the exp
+                // argument (the raw-domain rowmax makes both paths share
+                // bookkeeping) and the constant x6 range multiply (Stage 2).
+                // -----------------------------------------------------------
+                const float c0 = -rowmax[mma_id_q][0] * softmax_scale;
+                const float c1 = -rowmax[mma_id_q][1] * softmax_scale;
+
+                for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+                    float *regs = S_rmem[mma_id_q][mma_id_kv];
+                    regs[0] = __expf(fmaf(regs[0], softmax_scale, c0));
+                    regs[1] = __expf(fmaf(regs[1], softmax_scale, c0));
+                    regs[2] = __expf(fmaf(regs[2], softmax_scale, c1));
+                    regs[3] = __expf(fmaf(regs[3], softmax_scale, c1));
+
+                    this_rowsumexp[0] += regs[0] + regs[1];
+                    this_rowsumexp[1] += regs[2] + regs[3];
+                }
+
+                // Stage 2: inv == FP4_MAX * exp(0) == 6.0 exactly; the old
+                // per-block loop recomputed this constant with 16 MUFU ops.
+                constexpr float FP4_MAX = 6.0f;
+                for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+                    float *regs = S_rmem[mma_id_q][mma_id_kv];
+                    regs[0] *= FP4_MAX;
+                    regs[1] *= FP4_MAX;
+                    regs[2] *= FP4_MAX;
+                    regs[3] *= FP4_MAX;
+                }
             }
 
-            // butterfly reduction within 4 threads
-            this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 1);
-            this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 2);
-            this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 1);
-            this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 2);
-
-            // accumulate to running rowsum
-            rowsum[mma_id_q][0] = rowsum[mma_id_q][0] * rescale[0] + this_rowsumexp[0];
-            rowsum[mma_id_q][1] = rowsum[mma_id_q][1] * rescale[1] + this_rowsumexp[1];
-
-            constexpr float FP4_RANGE = 448.0f * 6.0f;
-            constexpr float FP4_MAX = 6.0f;
-            float sf_P_upper[BLOCK_KV / MMA_N / 2];
-            float sf_P_lower[BLOCK_KV / MMA_N / 2];
-
-            for (int blk = 0; blk < BLOCK_KV / MMA_N /2 ; blk++) {
-                const int t0 = 2 * blk;
-                const int t1 = t0 + 1;
-                const float gmax_upper = rowmax[mma_id_q][0];
-                const float gmax_lower = rowmax[mma_id_q][1];
-                const bool valid_upper = gmax_upper > -FLT_MAX * 0.5f;
-                const bool valid_lower = gmax_lower > -FLT_MAX * 0.5f;
-                const float inv_upper = valid_upper
-                    ? (FP4_MAX * attention_exp<EXP_APPROX>(
-                          rowmax[mma_id_q][0] - gmax_upper))
-                    : 0.0f;
-                const float inv_lower = valid_lower
-                    ? (FP4_MAX * attention_exp<EXP_APPROX>(
-                          rowmax[mma_id_q][1] - gmax_lower))
-                    : 0.0f;
-                sf_P_upper[blk] = valid_upper
-                    ? (FP4_RANGE / FP4_MAX * attention_exp<EXP_APPROX>(
-                          gmax_upper - rowmax[mma_id_q][0]))
-                    : 1.0f;
-                sf_P_lower[blk] = valid_lower
-                    ? (FP4_RANGE / FP4_MAX * attention_exp<EXP_APPROX>(
-                          gmax_lower - rowmax[mma_id_q][1]))
-                    : 1.0f;
-
-                S_rmem[mma_id_q][t0][0] *= inv_upper;
-                S_rmem[mma_id_q][t0][1] *= inv_upper;
-                S_rmem[mma_id_q][t1][0] *= inv_upper;
-                S_rmem[mma_id_q][t1][1] *= inv_upper;
-                S_rmem[mma_id_q][t0][2] *= inv_lower;
-                S_rmem[mma_id_q][t0][3] *= inv_lower;
-                S_rmem[mma_id_q][t1][2] *= inv_lower;
-                S_rmem[mma_id_q][t1][3] *= inv_lower;
-            }
-
+            // cvt-based e2m1 quantization, shared by both paths. Approx
+            // inputs are exact powers of two in [2^-124, 4]: cvt.rn lands
+            // them on codes {6, 4, 2, 1}, and everything at or below 0.25
+            // rounds to 0 (0.25 is a tie, to even).
             for (int g = 0; g < BLOCK_KV / MMA_N / 4; g++) {
                 int blk = 4 * g;
                 float *r0 = S_rmem[mma_id_q][blk];
@@ -375,19 +516,30 @@ void fp4_attention_kernel(
                     r2[3], r2[2], r3[3], r3[2]);
             }
 
-            for (int mma_sc_id = 0; mma_sc_id < BLOCK_KV / MMA_K; mma_sc_id++) {
-                int base = mma_sc_id * 4;
-                uint32_t sfP_upper_packed = ta_cvt_4xf32_to_e4m3_packed(
-                    sf_P_upper[base + 1], sf_P_upper[base + 0],
-                    sf_P_upper[base + 3], sf_P_upper[base + 2]);
+            // Baseline only: butterfly-reduce the FP rowsum and fold it into
+            // the running total. The approx denominator instead rides the PV
+            // mma (Stage 5): no shuffles, no per-iteration rowsum update.
+            if constexpr (!EXP_APPROX) {
+                this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 1);
+                this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 2);
+                this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 1);
+                this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 2);
 
-                uint32_t sfP_lower_packed = ta_cvt_4xf32_to_e4m3_packed(
-                    sf_P_lower[base + 1], sf_P_lower[base + 0],
-                    sf_P_lower[base + 3], sf_P_lower[base + 2]);
-
-                S_fp4_s_rmem[mma_id_q][mma_sc_id] =
-                    (lane_id % 4 == 0) ? sfP_upper_packed : sfP_lower_packed;
+                rowsum[mma_id_q][0] = rowsum[mma_id_q][0] * rescale[0] + this_rowsumexp[0];
+                rowsum[mma_id_q][1] = rowsum[mma_id_q][1] * rescale[1] + this_rowsumexp[1];
             }
+
+            // ---------------------------------------------------------------
+            // Stage 2: P's e4m3 block scale is the CONSTANT 448 (== the old
+            // FP4_RANGE/FP4_MAX * exp(0)). 448 in e4m3 is the byte 0x7E;
+            // replicated four times. The old code burned 16 exp(0) MUFU ops
+            // plus an e4m3 cvt per row-group per iteration to compute this.
+            // A fully-masked row contributes zero through its codes (all 0),
+            // so the constant scale is safe there too — the old `valid`
+            // guard is unnecessary.
+            // ---------------------------------------------------------------
+            for (int mma_sc_id = 0; mma_sc_id < BLOCK_KV / MMA_K; mma_sc_id++)
+                S_fp4_s_rmem[mma_id_q][mma_sc_id] = 0x7E7E7E7Eu;
         }
 
         // V layout in smem: [HEAD_DIM, BLOCK_KV/2], stride = BLOCK_KV/2 bytes.
@@ -417,16 +569,23 @@ void fp4_attention_kernel(
                     : "r"(V_sf_smem + offset));
             }
 
-        // MMA O += P @ V
+        // MMA O += P @ V. Approx (Stage 5): tile HEAD_DIM/MMA_N is P @ ones
+        // (e2m1 code 2 == 1.0 in every nibble, e4m3 scale 1.0 == 0x38) — the
+        // mma reduces the quantized weights along kv, so every column of
+        // that tile holds the row's denominator. No smem, ldmatrix, or
+        // shuffles back this tile; the operands are compile-time constants.
+        uint32_t ones_b[2] = {0x22222222u, 0x22222222u};
         for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
-            for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++)
-                for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++)
+            for (int mma_id_d = 0; mma_id_d < O_TILES; mma_id_d++)
+                for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++) {
+                    const bool sum_tile = EXP_APPROX && mma_id_d == HEAD_DIM / MMA_N;
                     ta_mma_m16n8k64_nvfp4(
                         S_fp4_rmem[mma_id_q][mma_id_kv],
-                        V_rmem[mma_id_kv][mma_id_d],
+                        sum_tile ? ones_b : V_rmem[mma_id_kv][mma_id_d],
                         S_fp4_s_rmem[mma_id_q][mma_id_kv],
-                        sfV_rmem[mma_id_kv][mma_id_d],
+                        sum_tile ? 0x38383838u : sfV_rmem[mma_id_kv][mma_id_d],
                         O_rmem[mma_id_q][mma_id_d]);
+                }
 
         K += BLOCK_KV * HEAD_DIM_2;
         S_K += BLOCK_KV * SCALE_DIM;
@@ -435,7 +594,13 @@ void fp4_attention_kernel(
         S_V += BLOCK_KV / 16;
     }
 
-    constexpr float FP4_RANGE_INV = 1.0f / (448.0f * 6.0f);
+    // Epilogue. Approx: numerator and denominator both came through the PV
+    // mma with identical P codes and the 448 scale, so EVERY packaging
+    // constant cancels — norm is simply 1/sum_tile (cols of the ones tile
+    // all hold the row's denominator; [0]/[2] are this thread's rows).
+    // Baseline: stored exp * 6 with sf = 448 while rowsum accumulated plain
+    // exp -> divide by 448*6.
+    constexpr float P_DEQUANT_INV = 1.0f / (448.0f * 6.0f);
 
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
         for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
@@ -444,8 +609,14 @@ void fp4_attention_kernel(
 
             float *regs = O_rmem[mma_id_q][mma_id_d];
 
-            float norm0 = FP4_RANGE_INV / rowsum[mma_id_q][0];
-            float norm1 = FP4_RANGE_INV / rowsum[mma_id_q][1];
+            float norm0, norm1;
+            if constexpr (EXP_APPROX) {
+                norm0 = 1.0f / O_rmem[mma_id_q][HEAD_DIM / MMA_N][0];
+                norm1 = 1.0f / O_rmem[mma_id_q][HEAD_DIM / MMA_N][2];
+            } else {
+                norm0 = P_DEQUANT_INV / rowsum[mma_id_q][0];
+                norm1 = P_DEQUANT_INV / rowsum[mma_id_q][1];
+            }
 
             regs[0] *= norm0;
             regs[1] *= norm0;
