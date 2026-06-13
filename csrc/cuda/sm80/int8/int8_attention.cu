@@ -64,6 +64,9 @@ __global__ void int8_attention_kernel(
     int num_q_heads,
     int num_kv_heads
 ) {
+    constexpr int KV_CHUNK = 128;
+
+    const int tid = threadIdx.x;
     const int q_idx = blockIdx.x;
     const int q_token = q_idx % q_len;
     const int q_head = (q_idx / q_len) % num_q_heads;
@@ -74,79 +77,23 @@ __global__ void int8_attention_kernel(
     const int o_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM;
     const int sq_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * SCALE_DIM;
 
-    __shared__ float score_mem[128];
-    __shared__ float denom_mem[128];
+    __shared__ float scores[KV_CHUNK];
+    __shared__ float reduce_mem[KV_CHUNK];
 
-    // Phase 1: find the largest QK score for numerical stability.
-    float local_max = -INFINITY;
-    float local_denom = 0.0f;
+    const int out_d = tid;
+    const bool has_output = out_d < HEAD_DIM;
+    const int v_group = out_d / 32;
 
-    for (int kv_token = threadIdx.x; kv_token < kv_len; kv_token += blockDim.x) {
+    float running_max = -INFINITY;
+    float running_denom = 0.0f;
+    float running_acc = 0.0f;
+
+    for (int kv_start = 0; kv_start < kv_len; kv_start += KV_CHUNK) {
+        const int kv_token = kv_start + tid;
         float score = -INFINITY;
-        score = compute_int8_score<HEAD_DIM, SCALE_DIM>(
-            Q, K, S_Q, S_K, q_offset, sq_offset, batch, kv_capacity, kv_token,
-            num_kv_heads, kv_head);
 
-        if constexpr (CAUSAL) {
-            if (kv_token > q_token) {
-                score = -INFINITY;
-            }
-        }
-
-        if (isfinite(score)) {
-            if (local_denom == 0.0f) {
-                local_max = score;
-                local_denom = 1.0f;
-            } else {
-                float new_max = fmaxf(score, local_max);
-                local_denom = local_denom * expf(local_max - new_max) + expf(score - new_max);
-                local_max = new_max;
-            }
-        }
-    }
-
-    score_mem[threadIdx.x] = local_max;
-    denom_mem[threadIdx.x] = local_denom;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-        if (threadIdx.x < stride) {
-            float m1 = score_mem[threadIdx.x];
-            float m2 = score_mem[threadIdx.x + stride];
-
-            float l1 = denom_mem[threadIdx.x];
-            float l2 = denom_mem[threadIdx.x + stride];
-
-            if (l1 == 0.0f) {
-                score_mem[threadIdx.x] = m2;
-                denom_mem[threadIdx.x] = l2;
-            } else if (l2 == 0.0f) {
-                score_mem[threadIdx.x] = m1;
-                denom_mem[threadIdx.x] = l1;
-            } else {
-                float m = fmax(m1, m2);
-                float l = l1 * expf(m1 - m) + l2 * expf(m2 - m);
-                score_mem[threadIdx.x] = m;
-                denom_mem[threadIdx.x] = l;
-            }
-        }
-        __syncthreads();
-    }
-
-    float max_score = score_mem[0];
-    float denom = denom_mem[0];
-
-    // Phase 3: use softmax probabilities to mix V into each output channel.
-    int out_d = threadIdx.x;
-    if (out_d < HEAD_DIM) {
-        const int v_group = out_d / 32;
-        float acc = 0.0f;
-
-        for (int kv_token = 0; kv_token < kv_len; kv_token++) {
-            const int v_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * HEAD_DIM;
-            const int sv_offset = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * SCALE_DIM;
-
-            float score = compute_int8_score<HEAD_DIM, SCALE_DIM>(
+        if (kv_token < kv_len) {
+            score = compute_int8_score<HEAD_DIM, SCALE_DIM>(
                 Q, K, S_Q, S_K, q_offset, sq_offset, batch, kv_capacity, kv_token,
                 num_kv_heads, kv_head);
 
@@ -155,12 +102,78 @@ __global__ void int8_attention_kernel(
                     score = -INFINITY;
                 }
             }
-            const float p = expf(score - max_score) / denom;
-            const float v_real = float(V[v_offset + out_d]) * S_V[sv_offset + v_group];
-            acc += p * v_real;
         }
 
-        O[o_offset + out_d] = int8_attention_from_float<T>(acc);
+        scores[tid] = score;
+        reduce_mem[tid] = score;
+        __syncthreads();
+
+        for (int stride = KV_CHUNK / 2; stride > 0; stride /= 2) {
+            if (tid < stride) {
+                reduce_mem[tid] = fmaxf(reduce_mem[tid], reduce_mem[tid + stride]);
+            }
+            __syncthreads();
+        }
+
+        const float chunk_max = reduce_mem[0];
+        __syncthreads();
+
+        float local_chunk_denom = 0.0f;
+        if (isfinite(score) && isfinite(chunk_max)) {
+            local_chunk_denom = expf(score - chunk_max);
+        }
+
+        reduce_mem[tid] = local_chunk_denom;
+        __syncthreads();
+
+        for (int stride = KV_CHUNK / 2; stride > 0; stride /= 2) {
+            if (tid < stride) {
+                reduce_mem[tid] += reduce_mem[tid + stride];
+            }
+            __syncthreads();
+        }
+
+        const float chunk_denom = reduce_mem[0];
+        float chunk_acc = 0.0f;
+
+        if (has_output && chunk_denom > 0.0f) {
+            const int chunk_end = min(kv_start + KV_CHUNK, kv_len);
+            for (int token = kv_start; token < chunk_end; token++) {
+                const int score_idx = token - kv_start;
+                const float token_score = scores[score_idx];
+                if (!isfinite(token_score)) {
+                    continue;
+                }
+
+                const int v_offset = ((batch * kv_capacity + token) * num_kv_heads + kv_head) * HEAD_DIM;
+                const int sv_offset = ((batch * kv_capacity + token) * num_kv_heads + kv_head) * SCALE_DIM;
+                const float weight = expf(token_score - chunk_max);
+                const float v_real = float(V[v_offset + out_d]) * S_V[sv_offset + v_group];
+                chunk_acc += weight * v_real;
+            }
+        }
+
+        if (chunk_denom > 0.0f) {
+            if (running_denom == 0.0f) {
+                running_max = chunk_max;
+                running_denom = chunk_denom;
+                running_acc = chunk_acc;
+            } else {
+                const float new_max = fmaxf(running_max, chunk_max);
+                const float old_scale = expf(running_max - new_max);
+                const float chunk_scale = expf(chunk_max - new_max);
+
+                running_acc = running_acc * old_scale + chunk_acc * chunk_scale;
+                running_denom = running_denom * old_scale + chunk_denom * chunk_scale;
+                running_max = new_max;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (has_output) {
+        O[o_offset + out_d] = int8_attention_from_float<T>(running_acc / running_denom);
     }
 }
 
