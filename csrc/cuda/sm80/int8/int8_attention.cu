@@ -202,6 +202,7 @@ __global__ void int8_attention_kernel_block_q(
     const int kv_head = q_head * num_kv_heads / num_q_heads;
     const int q_block_start = q_block_idx * BLOCK_Q;
     const int out_d = tid;
+    const bool has_output = out_d < HEAD_DIM;
 
     float running_max[BLOCK_Q];
     float running_denom[BLOCK_Q];
@@ -222,10 +223,9 @@ __global__ void int8_attention_kernel_block_q(
             float score = -INFINITY;
 
             const int q_token = q_block_start + q_i;
-            const bool valid_q = q_token < q_len;
             const int q_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM;
             const int sq_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * SCALE_DIM;
-            const int o_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM;
+            const bool valid_q = q_token < q_len;
 
             if (valid_q && kv_token < kv_len) {
                 score = compute_int8_score<HEAD_DIM, SCALE_DIM>(
@@ -270,8 +270,6 @@ __global__ void int8_attention_kernel_block_q(
 
             const float chunk_denom = reduce_mem[0];
             float chunk_acc = 0.0f;
-
-            const bool has_output = out_d < HEAD_DIM;
             const int v_group = out_d / 32;
 
             if (has_output && chunk_denom > 0.0f) {
@@ -309,9 +307,17 @@ __global__ void int8_attention_kernel_block_q(
 
             __syncthreads();
 
-            if (valid_q && has_output) {
-                O[o_offset + out_d] = int8_attention_from_float<T>(running_acc[q_i] / running_denom[q_i]);
-            }
+        }
+
+    }
+
+    for (int q_i = 0; q_i < BLOCK_Q; q_i++) {
+        const int q_token = q_block_start + q_i;
+        const bool valid_q = q_token < q_len;
+        const int o_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM;
+
+        if (valid_q && has_output) {
+            O[o_offset + out_d] = int8_attention_from_float<T>(running_acc[q_i] / running_denom[q_i]);
         }
     }
 }
