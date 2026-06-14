@@ -201,6 +201,7 @@ __global__ void int8_attention_kernel_block_q(
     const int batch = blockIdx.x / (q_blocks * num_q_heads);
     const int kv_head = q_head * num_kv_heads / num_q_heads;
     const int q_block_start = q_block_idx * BLOCK_Q;
+    const int out_d = tid;
 
     float running_max[BLOCK_Q];
     float running_denom[BLOCK_Q];
@@ -212,25 +213,18 @@ __global__ void int8_attention_kernel_block_q(
         running_acc[i] = 0.0f;
     }
 
-    for (int q_i = 0; q_i < BLOCK_Q; q_i++) {
-        const int q_token = q_block_start + q_i;
-        if (q_token >= q_len) {
-            continue;
-        }
-        const int q_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM;
-        const int o_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM;
-        const int sq_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * SCALE_DIM;
-
+    for (int kv_start = 0; kv_start < kv_len; kv_start += KV_CHUNK) {
         __shared__ float scores[KV_CHUNK];
         __shared__ float reduce_mem[KV_CHUNK];
 
-        const int out_d = tid;
-        const bool has_output = out_d < HEAD_DIM;
-        const int v_group = out_d / 32;
-
-        for (int kv_start = 0; kv_start < kv_len; kv_start += KV_CHUNK) {
+        for (int q_i = 0; q_i < BLOCK_Q; q_i++) {
             const int kv_token = kv_start + tid;
             float score = -INFINITY;
+
+            const int q_token = q_block_start + q_i;
+            const int q_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM;
+            const int sq_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * SCALE_DIM;
+            const int o_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM;
 
             if (kv_token < kv_len) {
                 score = compute_int8_score<HEAD_DIM, SCALE_DIM>(
@@ -276,6 +270,9 @@ __global__ void int8_attention_kernel_block_q(
             const float chunk_denom = reduce_mem[0];
             float chunk_acc = 0.0f;
 
+            const bool has_output = out_d < HEAD_DIM;
+            const int v_group = out_d / 32;
+
             if (has_output && chunk_denom > 0.0f) {
                 const int chunk_end = min(kv_start + KV_CHUNK, kv_len);
                 for (int token = kv_start; token < chunk_end; token++) {
@@ -310,12 +307,12 @@ __global__ void int8_attention_kernel_block_q(
             }
 
             __syncthreads();
-        }
 
-        if (has_output) {
-            O[o_offset + out_d] = int8_attention_from_float<T>(running_acc[q_i] / running_denom[q_i]);
+            const bool valid_q = q_token < q_len;
+            if (valid_q && has_output) {
+                O[o_offset + out_d] = int8_attention_from_float<T>(running_acc[q_i] / running_denom[q_i]);
+            }
         }
-
     }
 }
 
