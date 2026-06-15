@@ -16,9 +16,12 @@ DEFAULT_MODEL = "Qwen/Qwen3-8B"
 DEFAULT_DATASET = "emozilla/pg19"
 FLASH_ATTN_IMPLEMENTATION = "flash_attention_2"
 METHODS = {
-    "fp16": "fp16",
-    "fp4": "fp4",
-    "thrift": "thrift",
+    "fp16": {"method": "fp16", "label": "fp16", "exp_approx": False},
+    "fp4": {"method": "fp4", "label": "fp4", "exp_approx": False},
+    "fp4_exp": {"method": "fp4", "label": "fp4_exp", "exp_approx": False},
+    "fp4_exp_approx": {"method": "fp4", "label": "fp4_exp_approx", "exp_approx": True},
+    "fp4_approx": {"method": "fp4", "label": "fp4_exp_approx", "exp_approx": True},
+    "thrift": {"method": "thrift", "label": "thrift", "exp_approx": False},
 }
 
 
@@ -60,7 +63,11 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--lengths", default="131072")
-    parser.add_argument("--methods", default="fp16,fp4,thrift")
+    parser.add_argument(
+        "--methods",
+        default="fp4,fp4_exp_approx",
+        help="Comma-separated methods. Use fp4 for standard exp, fp4_exp_approx for approximate exp; fp16 and thrift are opt-in.",
+    )
     parser.add_argument("--fractions", default="0.05")
     parser.add_argument("--num-docs", type=int, default=1)
     parser.add_argument("--text-file", type=Path, default=None)
@@ -136,22 +143,37 @@ def main() -> None:
 
     rows = []
     for raw_method in methods:
-        method = METHODS[raw_method.lower()]
+        try:
+            method_spec = METHODS[raw_method.lower()]
+        except KeyError as exc:
+            choices = ", ".join(sorted(METHODS))
+            raise SystemExit(f"unknown method {raw_method!r}; choose from: {choices}") from exc
+
+        method = method_spec["method"]
+        exp_approx = bool(method_spec["exp_approx"])
         run_fractions = fractions if method == "thrift" else [None]
 
         for fraction in run_fractions:
-            label = f"thrift_{fraction * 100:g}pct".replace(".", "p") if method == "thrift" else method
+            label = (
+                f"thrift_{fraction * 100:g}pct".replace(".", "p")
+                if method == "thrift"
+                else method_spec["label"]
+            )
 
             if method == "fp16":
                 model.set_attn_implementation(FLASH_ATTN_IMPLEMENTATION)
                 print(f"\n{label}: fp16 FlashAttention 2")
             else:
-                impl_name = "thrift_fp4" if method == "fp4" else f"thrift_attention_{fraction * 100:g}pct".replace(".", "p")
+                if method == "fp4":
+                    impl_name = "thrift_fp4_exp_approx" if exp_approx else f"thrift_{label}"
+                else:
+                    impl_name = f"thrift_attention_{fraction * 100:g}pct".replace(".", "p")
                 attn_impl = register_transformers_attention(
                     TransformersAttentionConfig(
                         name=impl_name,
                         method="fp4" if method == "fp4" else "thrift",
                         fraction=0.0 if fraction is None else fraction,
+                        exp_approx=exp_approx,
                     )
                 )
                 model.set_attn_implementation(attn_impl)
@@ -186,6 +208,7 @@ def main() -> None:
                     "method": method,
                     "label": label,
                     "fraction": fraction,
+                    "exp_approx": exp_approx,
                     "length": length,
                     "status": "ok",
                     "mean_nll": mean_nll,
@@ -196,16 +219,24 @@ def main() -> None:
                 rows.append(row)
                 print(f"  length={length:<6} nll={mean_nll:.4f} forward_s={forward_s:.3f}")
 
-    baselines = {row["length"]: row["mean_nll"] for row in rows if row["label"] == "fp16"}
+    fp16_baselines = {row["length"]: row["mean_nll"] for row in rows if row["label"] == "fp16"}
+    fp4_baselines = {
+        row["length"]: row["mean_nll"]
+        for row in rows
+        if row["method"] == "fp4" and not row["exp_approx"]
+    }
     for row in rows:
-        if row["length"] in baselines:
-            row["delta_vs_fp16"] = row["mean_nll"] - baselines[row["length"]]
+        if row["length"] in fp4_baselines:
+            row["delta_vs_fp4"] = row["mean_nll"] - fp4_baselines[row["length"]]
+        if row["length"] in fp16_baselines:
+            row["delta_vs_fp16"] = row["mean_nll"] - fp16_baselines[row["length"]]
 
     columns = [
         ("length", "tokens"),
         ("label", "method"),
         ("mean_nll", "mean_nll"),
-        ("delta_vs_fp16", "delta"),
+        ("delta_vs_fp4", "delta_fp4"),
+        ("delta_vs_fp16", "delta_fp16"),
         ("forward_s", "forward_s"),
         ("forward_tok_s", "tok/s"),
         ("status", "status"),

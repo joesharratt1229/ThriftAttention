@@ -9,8 +9,8 @@ __device__ __forceinline__
 float ex2_approx_ftz(float x)
 {
     float r = x + 12582912.0f;
-    uint32_t b = (__float_as_uint(r) << 23) + 0x3F800000u;
-    return __uint_as_float(b);
+    return __uint_as_float((__float_as_uint(r) << 23) + 0x3F800000u);
+
 }
 
 #include "main_exp.cu"
