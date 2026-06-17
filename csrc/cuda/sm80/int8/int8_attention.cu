@@ -48,6 +48,29 @@ __device__ float compute_int8_score(
     return score * rsqrtf(float(HEAD_DIM));
 }
 
+template <int HEAD_DIM, int SCALE_DIM>
+__device__ float compute_int8_score_from_chunk(
+    const int8_t* Q,
+    const int8_t* K,
+    const float* S_Q,
+    const float* S_K,
+    const int q_offset,
+    const int sq_offset,
+    const int local_token
+)
+{
+    float score = 0.0f;
+    for (int d = 0; d < HEAD_DIM; d++) {
+        const int group = d / 32;
+        const int q_val = int(Q[q_offset + d]);
+        const int k_val = int(K[local_token * HEAD_DIM + d]);
+        const float scale = S_Q[sq_offset + group] * S_K[local_token * SCALE_DIM + group];
+        score += float(q_val * k_val) * scale;
+    }
+
+    return score * rsqrtf(float(HEAD_DIM));
+}
+
 template <typename T, bool CAUSAL, int HEAD_DIM, int INT8_HEAD_DIM, int SCALE_DIM>
 __global__ void int8_attention_kernel(
     const int8_t* Q,
@@ -214,23 +237,61 @@ __global__ void int8_attention_kernel_block_q(
         running_acc[i] = 0.0f;
     }
 
+    __shared__ float scores[KV_CHUNK];
+    __shared__ float reduce_mem[KV_CHUNK];
+
+    __shared__ int8_t k_chunk[KV_CHUNK][HEAD_DIM];
+    __shared__ int8_t v_chunk[KV_CHUNK][HEAD_DIM];
+    __shared__ float sk_chunk[KV_CHUNK][SCALE_DIM];
+    __shared__ float sv_chunk[KV_CHUNK][SCALE_DIM];
+
     for (int kv_start = 0; kv_start < kv_len; kv_start += KV_CHUNK) {
-        __shared__ float scores[KV_CHUNK];
-        __shared__ float reduce_mem[KV_CHUNK];
+        const int kv_token = kv_start + tid;
+
+        for (int idx = tid; idx < KV_CHUNK * HEAD_DIM; idx += blockDim.x) {
+            int local_token = idx / HEAD_DIM;
+            int d = idx % HEAD_DIM;
+            int kv_token = kv_start + local_token;
+
+            if (kv_token < kv_len) {
+                int src = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * HEAD_DIM + d;
+                k_chunk[local_token][d] = K[src];
+                v_chunk[local_token][d] = V[src];
+            } else {
+                k_chunk[local_token][d] = 0;
+                v_chunk[local_token][d] = 0;
+            }
+        }
+
+        for (int idx = tid; idx < KV_CHUNK * SCALE_DIM; idx += blockDim.x) {
+            int local_token = idx / SCALE_DIM;
+            int g = idx % SCALE_DIM;
+            int kv_token = kv_start + local_token;
+
+            if (kv_token < kv_len) {
+                int src = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * SCALE_DIM + g;
+                sk_chunk[local_token][g] = S_K[src];
+                sv_chunk[local_token][g] = S_V[src];
+            } else {
+                sk_chunk[local_token][g] = 0.0f;
+                sv_chunk[local_token][g] = 0.0f;
+            }
+        }
+
+        __syncthreads();
 
         for (int q_i = 0; q_i < BLOCK_Q; q_i++) {
-            const int kv_token = kv_start + tid;
             float score = -INFINITY;
 
             const int q_token = q_block_start + q_i;
             const int q_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM;
             const int sq_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * SCALE_DIM;
             const bool valid_q = q_token < q_len;
+            const int local_token = kv_token - kv_start;
 
             if (valid_q && kv_token < kv_len) {
-                score = compute_int8_score<HEAD_DIM, SCALE_DIM>(
-                    Q, K, S_Q, S_K, q_offset, sq_offset, batch, kv_capacity, kv_token,
-                    num_kv_heads, kv_head);
+                score = compute_int8_score_from_chunk<HEAD_DIM, SCALE_DIM>(
+                    Q, &k_chunk[0][0], S_Q, &sk_chunk[0][0], q_offset, sq_offset, local_token);
 
                 if constexpr (CAUSAL) {
                     if (kv_token > q_token) {
@@ -281,10 +342,8 @@ __global__ void int8_attention_kernel_block_q(
                         continue;
                     }
 
-                    const int v_offset = ((batch * kv_capacity + token) * num_kv_heads + kv_head) * HEAD_DIM;
-                    const int sv_offset = ((batch * kv_capacity + token) * num_kv_heads + kv_head) * SCALE_DIM;
                     const float weight = expf(token_score - chunk_max);
-                    const float v_real = float(V[v_offset + out_d]) * S_V[sv_offset + v_group];
+                    const float v_real = float(v_chunk[score_idx][out_d]) * sv_chunk[score_idx][v_group];
                     chunk_acc += weight * v_real;
                 }
             }
@@ -306,7 +365,6 @@ __global__ void int8_attention_kernel_block_q(
             }
 
             __syncthreads();
-
         }
 
     }
