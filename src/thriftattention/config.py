@@ -25,3 +25,4 @@ class AttentionConfig:
     implementation: AttentionImplementation = "auto"
     fallback: FallbackBackend = "error"
     exp_approx: bool = False
+    microblock_p: bool = False

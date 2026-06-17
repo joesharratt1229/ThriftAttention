@@ -21,6 +21,8 @@ METHODS = {
     "fp4_exp": {"method": "fp4", "label": "fp4_exp", "exp_approx": False},
     "fp4_exp_approx": {"method": "fp4", "label": "fp4_exp_approx", "exp_approx": True},
     "fp4_approx": {"method": "fp4", "label": "fp4_exp_approx", "exp_approx": True},
+    "fp4_microblock": {"method": "fp4", "label": "fp4_microblock", "exp_approx": True, "microblock_p": True},
+    "fp4_exp_microblock": {"method": "fp4", "label": "fp4_microblock", "exp_approx": True, "microblock_p": True},
     "thrift": {"method": "thrift", "label": "thrift", "exp_approx": False},
 }
 
@@ -66,7 +68,7 @@ def main() -> None:
     parser.add_argument(
         "--methods",
         default="fp4,fp4_exp_approx",
-        help="Comma-separated methods. Use fp4 for standard exp, fp4_exp_approx for approximate exp; fp16 and thrift are opt-in.",
+        help="Comma-separated methods. Use fp4 for standard exp, fp4_exp_approx for approximate exp, fp4_microblock for microblock-P; fp16 and thrift are opt-in.",
     )
     parser.add_argument("--fractions", default="0.05")
     parser.add_argument("--num-docs", type=int, default=1)
@@ -151,6 +153,7 @@ def main() -> None:
 
         method = method_spec["method"]
         exp_approx = bool(method_spec["exp_approx"])
+        microblock_p = bool(method_spec.get("microblock_p", False))
         run_fractions = fractions if method == "thrift" else [None]
 
         for fraction in run_fractions:
@@ -165,7 +168,7 @@ def main() -> None:
                 print(f"\n{label}: fp16 FlashAttention 2")
             else:
                 if method == "fp4":
-                    impl_name = "thrift_fp4_exp_approx" if exp_approx else f"thrift_{label}"
+                    impl_name = f"thrift_{label}"
                 else:
                     impl_name = f"thrift_attention_{fraction * 100:g}pct".replace(".", "p")
                 attn_impl = register_transformers_attention(
@@ -174,6 +177,7 @@ def main() -> None:
                         method="fp4" if method == "fp4" else "thrift",
                         fraction=0.0 if fraction is None else fraction,
                         exp_approx=exp_approx,
+                        microblock_p=microblock_p,
                     )
                 )
                 model.set_attn_implementation(attn_impl)
@@ -209,6 +213,7 @@ def main() -> None:
                     "label": label,
                     "fraction": fraction,
                     "exp_approx": exp_approx,
+                    "microblock_p": microblock_p,
                     "length": length,
                     "status": "ok",
                     "mean_nll": mean_nll,

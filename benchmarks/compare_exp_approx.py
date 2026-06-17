@@ -38,7 +38,11 @@ class ErrorStats:
     max_abs: float
     mean_abs: float
     max_rel: float
-    cosine: float
+    exact_approx_cosine: float
+    exact_vanilla_cosine: float
+    approx_vanilla_cosine: float
+    vanilla_nan: int
+    vanilla_inf: int
     exact_nan: int
     exact_inf: int
     approx_nan: int
@@ -127,7 +131,7 @@ def make_kernel_fns(
         return fn(*packed, is_bf16, False)
 
     def run_exp_approx() -> torch.Tensor:
-        return fn(*packed, is_bf16, True)
+        return fn(*packed, is_bf16, True, args.microblock_p)
 
     return run_exp, run_exp_approx
 
@@ -140,6 +144,37 @@ def measure_one(fn: TensorFn) -> float:
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end)
+
+
+def run_vanilla_attention(
+    args: argparse.Namespace,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> torch.Tensor:
+    enable_gqa = q.size(1) != k.size(1)
+    with torch.no_grad():
+        try:
+            return torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                is_causal=args.causal,
+                enable_gqa=enable_gqa,
+            )
+        except TypeError:
+            if enable_gqa:
+                repeats = q.size(1) // k.size(1)
+                k = k.repeat_interleave(repeats, dim=1)
+                v = v.repeat_interleave(repeats, dim=1)
+            return torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                is_causal=args.causal,
+            )
 
 
 def measure_pair(
@@ -167,23 +202,38 @@ def measure_pair(
     return summarize(exp_times), summarize(approx_times)
 
 
-def compare_outputs(run_exp: TensorFn, run_exp_approx: TensorFn) -> ErrorStats:
+def cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    value = torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0)
+    return float(value.item())
+
+
+def compare_outputs(
+    args: argparse.Namespace,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    run_exp: TensorFn,
+    run_exp_approx: TensorFn,
+) -> ErrorStats:
+    out_vanilla = run_vanilla_attention(args, q, k, v)
     out_exp = run_exp()
     out_approx = run_exp_approx()
     torch.cuda.synchronize()
 
+    vanilla = out_vanilla.float()
     exact = out_exp.float()
     approx = out_approx.float()
     diff = (exact - approx).abs()
     denom = exact.abs().clamp_min(1.0e-6)
-    cosine = torch.nn.functional.cosine_similarity(
-        exact.flatten(), approx.flatten(), dim=0
-    )
     return ErrorStats(
         max_abs=float(diff.max().item()),
         mean_abs=float(diff.mean().item()),
         max_rel=float((diff / denom).max().item()),
-        cosine=float(cosine.item()),
+        exact_approx_cosine=cosine(exact, approx),
+        exact_vanilla_cosine=cosine(exact, vanilla),
+        approx_vanilla_cosine=cosine(approx, vanilla),
+        vanilla_nan=int(torch.isnan(vanilla).sum().item()),
+        vanilla_inf=int(torch.isinf(vanilla).sum().item()),
         exact_nan=int(torch.isnan(exact).sum().item()),
         exact_inf=int(torch.isinf(exact).sum().item()),
         approx_nan=int(torch.isnan(approx).sum().item()),
@@ -229,6 +279,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--non-causal", dest="causal", action="store_false")
+    parser.add_argument(
+        "--microblock-p",
+        action="store_true",
+        help="Benchmark the exp_approx kernel variant that uses microblock P scales.",
+    )
     parser.add_argument("--skip-error", action="store_true", help="Skip output-difference metrics.")
     args = parser.parse_args()
     args.seq_lens = parse_int_list(args.seq_lens)
@@ -236,14 +291,14 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def print_header() -> None:
+def print_header(approx_label: str) -> None:
     print(
-        "seq  q_len  exp_ms  exp_approx_ms  speedup  "
-        "max_abs  mean_abs  max_rel  cosine"
+        f"seq  q_len  exp_ms  {approx_label}_ms  speedup  "
+        "max_abs  mean_abs  max_rel  exp_app_cos  exp_van_cos  app_van_cos"
     )
     print(
         "---  -----  ------  -------------  -------  "
-        "-------  --------  -------  ------"
+        "-------  --------  -------  -----------  -----------  -----------"
     )
 
 
@@ -251,11 +306,12 @@ def main() -> None:
     args = parse_args()
     validate_args(args)
 
-    print_header()
+    approx_label = "microblock_p" if args.microblock_p else "exp_approx"
+    print_header(approx_label)
     for seq_len in args.seq_lens:
         q, k, v = make_qkv(args, seq_len)
         run_exp, run_exp_approx = make_kernel_fns(args, q, k, v)
-        errors = None if args.skip_error else compare_outputs(run_exp, run_exp_approx)
+        errors = None if args.skip_error else compare_outputs(args, q, k, v, run_exp, run_exp_approx)
         exp_stats, approx_stats = measure_pair(
             run_exp,
             run_exp_approx,
@@ -266,15 +322,18 @@ def main() -> None:
         speedup = exp_stats.median_ms / approx_stats.median_ms
         q_len = q.shape[2]
         if errors is None:
-            error_cols = "-        -         -        -"
+            error_cols = "-        -         -        -          -          -"
         else:
             error_cols = (
                 f"{errors.max_abs:.3e}  {errors.mean_abs:.3e}  "
-                f"{errors.max_rel:.3e}  {errors.cosine:.5f}"
+                f"{errors.max_rel:.3e}  {errors.exact_approx_cosine:.5f}      "
+                f"{errors.exact_vanilla_cosine:.5f}      {errors.approx_vanilla_cosine:.5f}"
             )
             if any(
                 count
                 for count in (
+                    errors.vanilla_nan,
+                    errors.vanilla_inf,
                     errors.exact_nan,
                     errors.exact_inf,
                     errors.approx_nan,
@@ -283,8 +342,9 @@ def main() -> None:
             ):
                 print(
                     "nonfinite: "
+                    f"vanilla nan={errors.vanilla_nan} inf={errors.vanilla_inf}; "
                     f"exp nan={errors.exact_nan} inf={errors.exact_inf}; "
-                    f"exp_approx nan={errors.approx_nan} inf={errors.approx_inf}"
+                    f"{approx_label} nan={errors.approx_nan} inf={errors.approx_inf}"
                 )
 
         print(

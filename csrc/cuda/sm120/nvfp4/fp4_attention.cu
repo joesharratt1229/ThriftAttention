@@ -122,7 +122,7 @@ float ta_pow2x4_from_bits(uint32_t br)
     return __uint_as_float((br << 23) + 0x40800000u);
 }
 
-template<typename T, bool CAUSAL, bool EXP_APPROX,
+template<typename T, bool CAUSAL, bool EXP_APPROX, bool MICROBLOCK_P,
          int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
          int HEAD_DIM_2, int SCALE_DIM,
          int NUM_WARPS, int WARP_Q>
@@ -360,20 +360,63 @@ void fp4_attention_kernel(
 
         for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
             // ---------------------------------------------------------------
-            // Stage 1: rowmax over RAW scores. The old `*= softmax_scale`
-            // loop (32 FMULs/thread/iter) is gone; max commutes with the
-            // positive scale, so the scale is applied later inside one FFMA.
+            // Stage 1: rowmax over RAW scores. In microblock-P mode each
+            // 16-entry P scale block is owned by a lane pair: lanes 0/1 hold
+            // one block and lanes 2/3 hold the other. The block max only
+            // reduces over XOR-1. XOR-2 is used only to exchange the other
+            // pair's already-reduced max so rowmax and the four-scale word
+            // can be formed without merging the microblocks.
             // ---------------------------------------------------------------
+            constexpr int P_SCALE_MMA_N_TILES = 4;
+            // checks whether bit 1 of lane id is set
+            const bool quad_pair_hi = (lane_id & 2) != 0;
+            float own0_upper = -FLT_MAX, own0_lower = -FLT_MAX;
+            float own1_upper = -FLT_MAX, own1_lower = -FLT_MAX;
+            float other0_upper = -FLT_MAX, other0_lower = -FLT_MAX;
+            float other1_upper = -FLT_MAX, other1_lower = -FLT_MAX;
             float this_rowmax[2] = {-FLT_MAX, -FLT_MAX};
-            for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
-                float *regs = S_rmem[mma_id_q][mma_id_kv];
-                this_rowmax[0] = max(this_rowmax[0], max(regs[0], regs[1]));
-                this_rowmax[1] = max(this_rowmax[1], max(regs[2], regs[3]));
+
+            if constexpr (EXP_APPROX && MICROBLOCK_P) {
+                //seperates out into 32 physical columsn
+                for (int mma_id_kv = 0; mma_id_kv < P_SCALE_MMA_N_TILES; mma_id_kv++) {
+                    //computes block max for lower and upper tile
+                    float *regs = S_rmem[mma_id_q][mma_id_kv];
+                    own0_upper = max(own0_upper, max(regs[0], regs[1]));
+                    own0_lower = max(own0_lower, max(regs[2], regs[3]));
+                }
+                for (int mma_id_kv = P_SCALE_MMA_N_TILES; mma_id_kv < 2 * P_SCALE_MMA_N_TILES; mma_id_kv++) {
+                    float *regs = S_rmem[mma_id_q][mma_id_kv];
+                    own1_upper = max(own1_upper, max(regs[0], regs[1]));
+                    own1_lower = max(own1_lower, max(regs[2], regs[3]));
+                }
+                
+                // pair reduction in quad (a0,...,a7)(a8,....,a15) gets merged 
+                // applies this to all parts of tile owned
+                own0_upper = max(own0_upper, __shfl_xor_sync(0xFFFFFFFF, own0_upper, 1));
+                own0_lower = max(own0_lower, __shfl_xor_sync(0xFFFFFFFF, own0_lower, 1));
+                own1_upper = max(own1_upper, __shfl_xor_sync(0xFFFFFFFF, own1_upper, 1));
+                own1_lower = max(own1_lower, __shfl_xor_sync(0xFFFFFFFF, own1_lower, 1));
+                
+
+                //reuses block max computation to obtain rowmax
+                other0_upper = __shfl_xor_sync(0xFFFFFFFF, own0_upper, 2);
+                other0_lower = __shfl_xor_sync(0xFFFFFFFF, own0_lower, 2);
+                other1_upper = __shfl_xor_sync(0xFFFFFFFF, own1_upper, 2);
+                other1_lower = __shfl_xor_sync(0xFFFFFFFF, own1_lower, 2);
+
+                this_rowmax[0] = max(max(own0_upper, own1_upper), max(other0_upper, other1_upper));
+                this_rowmax[1] = max(max(own0_lower, own1_lower), max(other0_lower, other1_lower));
+            } else {
+                for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+                    float *regs = S_rmem[mma_id_q][mma_id_kv];
+                    this_rowmax[0] = max(this_rowmax[0], max(regs[0], regs[1]));
+                    this_rowmax[1] = max(this_rowmax[1], max(regs[2], regs[3]));
+                }
+                this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[0], 1));
+                this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[0], 2));
+                this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[1], 1));
+                this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[1], 2));
             }
-            this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[0], 1));
-            this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[0], 2));
-            this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[1], 1));
-            this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[1], 2));
 
             // rescale previous O for new rowmax
             float rescale[2];
@@ -436,7 +479,97 @@ void fp4_attention_kernel(
 
             float this_rowsumexp[2] = {};
 
-            if constexpr (EXP_APPROX) {
+            if constexpr (EXP_APPROX && MICROBLOCK_P) {
+                // -----------------------------------------------------------
+                // Microblock-P approx path. Each e4m3 P scale covers 16
+                // logical P entries: four MMA_N fragments across one lane
+                // pair, separately for the upper/lower row groups.
+                //
+                // B is snapped onto the same integer log2 rung grid as the
+                // running row max R. P codes store 4 * 2^(x - B), while the
+                // e4m3 scale stores 448 * 2^(B - R). The 448 range multiplier
+                // preserves e4m3 dynamic range and cancels against the
+                // denominator tile, exactly like the uniform-scale approx
+                // path's packaging constant.
+                // -----------------------------------------------------------
+
+                //same scale is used for P@V and P@ones so 1792 factor cancels out
+                constexpr float P_SCALE_RANGE = 448.0f;
+                static_assert(BLOCK_KV == MMA_K);
+
+                // compute clamped maximum for [a0,...,a15][a32, ... ,a47] for lower and upper rows respectively
+                own0_upper = fminf(fmaxf(fmaf(own0_upper, softmax_scale, 0.5f) + TA_MAGIC, TA_MAGIC_FLOOR), rowmax[mma_id_q][0]);
+                own0_lower = fminf(fmaxf(fmaf(own0_lower, softmax_scale, 0.5f) + TA_MAGIC, TA_MAGIC_FLOOR), rowmax[mma_id_q][1]);
+                own1_upper = fminf(fmaxf(fmaf(own1_upper, softmax_scale, 0.5f) + TA_MAGIC, TA_MAGIC_FLOOR), rowmax[mma_id_q][0]);
+                own1_lower = fminf(fmaxf(fmaf(own1_lower, softmax_scale, 0.5f) + TA_MAGIC, TA_MAGIC_FLOOR), rowmax[mma_id_q][1]);
+                
+
+                //we get TA_MAGIC - B
+                const float c0_upper = TA_MAGIC_X2 - own0_upper;
+                const float c0_lower = TA_MAGIC_X2 - own0_lower;
+                const float c1_upper = TA_MAGIC_X2 - own1_upper;
+                const float c1_lower = TA_MAGIC_X2 - own1_lower;
+
+                for (int mma_id_kv = 0; mma_id_kv < P_SCALE_MMA_N_TILES; mma_id_kv++) {
+                    float *regs = S_rmem[mma_id_q][mma_id_kv];
+                    // TA_MAGIC + (regs[0] * softmax_scale - B sofmax_scale)
+                    const float e0 = fmaxf(fmaf(regs[0], softmax_scale, c0_upper), TA_MAGIC_FLOOR);
+                    const float e1 = fmaxf(fmaf(regs[1], softmax_scale, c0_upper), TA_MAGIC_FLOOR);
+                    const float e2 = fmaxf(fmaf(regs[2], softmax_scale, c0_lower), TA_MAGIC_FLOOR);
+                    const float e3 = fmaxf(fmaf(regs[3], softmax_scale, c0_lower), TA_MAGIC_FLOOR);
+                    //scale so max is at top of e2m1 exponent range
+                    regs[0] = ta_pow2x4_from_bits(__float_as_uint(e0));
+                    regs[1] = ta_pow2x4_from_bits(__float_as_uint(e1));
+                    regs[2] = ta_pow2x4_from_bits(__float_as_uint(e2));
+                    regs[3] = ta_pow2x4_from_bits(__float_as_uint(e3));
+                }
+                // implements this in two tiles
+                for (int mma_id_kv = P_SCALE_MMA_N_TILES; mma_id_kv < 2 * P_SCALE_MMA_N_TILES; mma_id_kv++) {
+                    float *regs = S_rmem[mma_id_q][mma_id_kv];
+                    const float e0 = fmaxf(fmaf(regs[0], softmax_scale, c1_upper), TA_MAGIC_FLOOR);
+                    const float e1 = fmaxf(fmaf(regs[1], softmax_scale, c1_upper), TA_MAGIC_FLOOR);
+                    const float e2 = fmaxf(fmaf(regs[2], softmax_scale, c1_lower), TA_MAGIC_FLOOR);
+                    const float e3 = fmaxf(fmaf(regs[3], softmax_scale, c1_lower), TA_MAGIC_FLOOR);
+                    regs[0] = ta_pow2x4_from_bits(__float_as_uint(e0));
+                    regs[1] = ta_pow2x4_from_bits(__float_as_uint(e1));
+                    regs[2] = ta_pow2x4_from_bits(__float_as_uint(e2));
+                    regs[3] = ta_pow2x4_from_bits(__float_as_uint(e3));
+                }
+
+                float sf_own0_upper = P_SCALE_RANGE * ta_pow2_from_bits(__float_as_uint(
+                    fmaxf((own0_upper - rowmax[mma_id_q][0]) + TA_MAGIC, TA_MAGIC_FLOOR)));
+                float sf_own0_lower = P_SCALE_RANGE * ta_pow2_from_bits(__float_as_uint(
+                    fmaxf((own0_lower - rowmax[mma_id_q][1]) + TA_MAGIC, TA_MAGIC_FLOOR)));
+                float sf_own1_upper = P_SCALE_RANGE * ta_pow2_from_bits(__float_as_uint(
+                    fmaxf((own1_upper - rowmax[mma_id_q][0]) + TA_MAGIC, TA_MAGIC_FLOOR)));
+                float sf_own1_lower = P_SCALE_RANGE * ta_pow2_from_bits(__float_as_uint(
+                    fmaxf((own1_lower - rowmax[mma_id_q][1]) + TA_MAGIC, TA_MAGIC_FLOOR)));
+                
+                //shuffle 
+                // at this point lane 0 and 1 own [s0, s2] in 64 row dimension
+                // warp shuffle so that lane 0 [s0, s1, s2, s3]
+                const float sf_other0_upper = __shfl_xor_sync(0xFFFFFFFF, sf_own0_upper, 2);
+                const float sf_other0_lower = __shfl_xor_sync(0xFFFFFFFF, sf_own0_lower, 2);
+                const float sf_other1_upper = __shfl_xor_sync(0xFFFFFFFF, sf_own1_upper, 2);
+                const float sf_other1_lower = __shfl_xor_sync(0xFFFFFFFF, sf_own1_lower, 2);
+
+                //mapping back to stable names
+                const float sf0_upper = quad_pair_hi ? sf_other0_upper : sf_own0_upper;
+                const float sf0_lower = quad_pair_hi ? sf_other0_lower : sf_own0_lower;
+                const float sf1_upper = quad_pair_hi ? sf_own0_upper : sf_other0_upper;
+                const float sf1_lower = quad_pair_hi ? sf_own0_lower : sf_other0_lower;
+                const float sf2_upper = quad_pair_hi ? sf_other1_upper : sf_own1_upper;
+                const float sf2_lower = quad_pair_hi ? sf_other1_lower : sf_own1_lower;
+                const float sf3_upper = quad_pair_hi ? sf_own1_upper : sf_other1_upper;
+                const float sf3_lower = quad_pair_hi ? sf_own1_lower : sf_other1_lower;
+
+                const uint32_t sfP_upper_packed = ta_cvt_4xf32_to_e4m3_packed(
+                    sf1_upper, sf0_upper, sf3_upper, sf2_upper);
+                const uint32_t sfP_lower_packed = ta_cvt_4xf32_to_e4m3_packed(
+                    sf1_lower, sf0_lower, sf3_lower, sf2_lower);
+                S_fp4_s_rmem[mma_id_q][0] =
+                    (lane_id % 4 == 0) ? sfP_upper_packed : sfP_lower_packed;
+            } else if constexpr (EXP_APPROX) {
                 // -----------------------------------------------------------
                 // Stage 1 + 3: one FFMA does scale * s in log2 domain AND
                 // the round-to-integer (the snapped rung + magic constant
@@ -529,17 +662,18 @@ void fp4_attention_kernel(
                 rowsum[mma_id_q][1] = rowsum[mma_id_q][1] * rescale[1] + this_rowsumexp[1];
             }
 
-            // ---------------------------------------------------------------
-            // Stage 2: P's e4m3 block scale is the CONSTANT 448 (== the old
-            // FP4_RANGE/FP4_MAX * exp(0)). 448 in e4m3 is the byte 0x7E;
-            // replicated four times. The old code burned 16 exp(0) MUFU ops
-            // plus an e4m3 cvt per row-group per iteration to compute this.
-            // A fully-masked row contributes zero through its codes (all 0),
-            // so the constant scale is safe there too — the old `valid`
-            // guard is unnecessary.
-            // ---------------------------------------------------------------
-            for (int mma_sc_id = 0; mma_sc_id < BLOCK_KV / MMA_K; mma_sc_id++)
-                S_fp4_s_rmem[mma_id_q][mma_sc_id] = 0x7E7E7E7Eu;
+            if constexpr (!EXP_APPROX || !MICROBLOCK_P) {
+                // -----------------------------------------------------------
+                // Stage 2: P's e4m3 block scale is the CONSTANT 448 (== the
+                // old FP4_RANGE/FP4_MAX * exp(0)). 448 in e4m3 is the byte
+                // 0x7E; replicated four times. The old code burned 16 exp(0)
+                // MUFU ops plus an e4m3 cvt per row-group per iteration to
+                // compute this. A fully-masked row contributes zero through
+                // its codes (all 0), so the constant scale is safe there too.
+                // -----------------------------------------------------------
+                for (int mma_sc_id = 0; mma_sc_id < BLOCK_KV / MMA_K; mma_sc_id++)
+                    S_fp4_s_rmem[mma_id_q][mma_sc_id] = 0x7E7E7E7Eu;
+            }
         }
 
         // V layout in smem: [HEAD_DIM, BLOCK_KV/2], stride = BLOCK_KV/2 bytes.
@@ -630,7 +764,7 @@ void fp4_attention_kernel(
         }
 }
 
-template<typename T, bool CAUSAL, bool EXP_APPROX, int HEAD_DIM>
+template<typename T, bool CAUSAL, bool EXP_APPROX, bool MICROBLOCK_P, int HEAD_DIM>
 static void launch_fp4_attention(
     const __nv_fp4x2_e2m1* Q, const __nv_fp4x2_e2m1* K, const __nv_fp4x2_e2m1* V,
     const __nv_fp8_e4m3* S_Q, const __nv_fp8_e4m3* S_K, const __nv_fp8_e4m3* S_V,
@@ -656,7 +790,7 @@ static void launch_fp4_attention(
     constexpr int smem_size = q_phase_smem + v_phase_smem > k_phase_smem
                             ? q_phase_smem + v_phase_smem : k_phase_smem;
 
-    auto kernel = fp4_attention_kernel<T, CAUSAL, EXP_APPROX,
+    auto kernel = fp4_attention_kernel<T, CAUSAL, EXP_APPROX, MICROBLOCK_P,
                                        BLOCK_Q, BLOCK_KV, HEAD_DIM,
                                        HEAD_DIM_2, SCALE_DIM,
                                        NUM_WARPS, WARP_Q>;
@@ -667,7 +801,7 @@ static void launch_fp4_attention(
         bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
 }
 
-template<typename T, bool CAUSAL, bool EXP_APPROX>
+template<typename T, bool CAUSAL, bool EXP_APPROX, bool MICROBLOCK_P>
 static void dispatch_fp4_attention(
     const __nv_fp4x2_e2m1* Q,
     const __nv_fp4x2_e2m1* K,
@@ -684,11 +818,11 @@ static void dispatch_fp4_attention(
     int num_kv_heads,
     int head_dim) {
     if (head_dim == 64) {
-        launch_fp4_attention<T, CAUSAL, EXP_APPROX, 64>(
+        launch_fp4_attention<T, CAUSAL, EXP_APPROX, MICROBLOCK_P, 64>(
             Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
             kv_capacity, num_q_heads, num_kv_heads);
     } else {
-        launch_fp4_attention<T, CAUSAL, EXP_APPROX, 128>(
+        launch_fp4_attention<T, CAUSAL, EXP_APPROX, MICROBLOCK_P, 128>(
             Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
             kv_capacity, num_q_heads, num_kv_heads);
     }
@@ -710,7 +844,8 @@ static void fp4_attention_nvfp4_typed(
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
-    bool exp_approx) {
+    bool exp_approx,
+    bool microblock_p) {
     auto Q = reinterpret_cast<const __nv_fp4x2_e2m1*>(Q_raw);
     auto K = reinterpret_cast<const __nv_fp4x2_e2m1*>(K_raw);
     auto V = reinterpret_cast<const __nv_fp4x2_e2m1*>(V_raw);
@@ -720,11 +855,17 @@ static void fp4_attention_nvfp4_typed(
     auto O = reinterpret_cast<T*>(O_raw);
 
     if (exp_approx) {
-        dispatch_fp4_attention<T, CAUSAL, true>(
-            Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
-            kv_capacity, num_q_heads, num_kv_heads, head_dim);
+        if (microblock_p) {
+            dispatch_fp4_attention<T, CAUSAL, true, true>(
+                Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
+                kv_capacity, num_q_heads, num_kv_heads, head_dim);
+        } else {
+            dispatch_fp4_attention<T, CAUSAL, true, false>(
+                Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
+                kv_capacity, num_q_heads, num_kv_heads, head_dim);
+        }
     } else {
-        dispatch_fp4_attention<T, CAUSAL, false>(
+        dispatch_fp4_attention<T, CAUSAL, false, false>(
             Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
             kv_capacity, num_q_heads, num_kv_heads, head_dim);
     }
@@ -746,17 +887,18 @@ void fp4_attention_causal_nvfp4(
     int num_kv_heads,
     int head_dim,
     bool is_bf16,
-    bool exp_approx) {
+    bool exp_approx,
+    bool microblock_p) {
     if (is_bf16) {
         fp4_attention_nvfp4_typed<__nv_bfloat16, true>(
             Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
             bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads,
-            head_dim, exp_approx);
+            head_dim, exp_approx, microblock_p);
     } else {
         fp4_attention_nvfp4_typed<half, true>(
             Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
             bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads,
-            head_dim, exp_approx);
+            head_dim, exp_approx, microblock_p);
     }
 }
 
@@ -776,16 +918,17 @@ void fp4_attention_noncausal_nvfp4(
     int num_kv_heads,
     int head_dim,
     bool is_bf16,
-    bool exp_approx) {
+    bool exp_approx,
+    bool microblock_p) {
     if (is_bf16) {
         fp4_attention_nvfp4_typed<__nv_bfloat16, false>(
             Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
             bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads,
-            head_dim, exp_approx);
+            head_dim, exp_approx, microblock_p);
     } else {
         fp4_attention_nvfp4_typed<half, false>(
             Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
             bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads,
-            head_dim, exp_approx);
+            head_dim, exp_approx, microblock_p);
     }
 }

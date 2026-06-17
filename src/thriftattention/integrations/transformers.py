@@ -44,6 +44,7 @@ class TransformersAttentionConfig:
     implementation: AttentionImplementation = "auto"
     fallback: FallbackBackend = "error"
     exp_approx: bool = False
+    microblock_p: bool = False
 
     def attention_config(self) -> AttentionConfig:
         return AttentionConfig(
@@ -62,6 +63,7 @@ class TransformersAttentionConfig:
             ),
             fallback=_validate_choice("fallback", self.fallback, ("error",)),
             exp_approx=bool(self.exp_approx),
+            microblock_p=bool(self.microblock_p),
         )
 
 

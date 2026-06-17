@@ -1,0 +1,13 @@
+{
+  "ce_chunk": 1024,
+  "dataset": "emozilla/pg19",
+  "device": "cuda",
+  "fractions": "0.05",
+  "lengths": "16384",
+  "methods": "fp4,fp4_exp_approx",
+  "model": "Qwen/Qwen3-8B",
+  "num_docs": 1,
+  "output": "results/long_context_quality",
+  "seed": 1234,
+  "text_file": null
+}
