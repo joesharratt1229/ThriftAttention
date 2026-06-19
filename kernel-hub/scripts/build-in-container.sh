@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VARIANT="${VARIANT:-torch212-cxx11-cu130-x86_64-linux}"
+VARIANT="${VARIANT:-torch211-cxx11-cu128-x86_64-linux}"
 OUT_DIR="/work/kernel-hub/build-output/${VARIANT}"
 
 echo "=== Installing apt deps ==="
@@ -9,12 +9,19 @@ apt update && apt install -y git curl xz-utils ca-certificates
 
 echo "=== Configuring nix ==="
 mkdir -p /etc/nix
-printf 'build-users-group =\nsandbox = true\nexperimental-features = nix-command flakes\naccept-flake-config = true\n' > /etc/nix/nix.conf
+printf 'build-users-group =\nsandbox = true\nexperimental-features = nix-command flakes\naccept-flake-config = true\nmax-jobs = auto\ncores = 0\n' > /etc/nix/nix.conf
 
-echo "=== Installing nix ==="
-mkdir -m 0755 /nix && chown root /nix
-sh <(curl -L https://nixos.org/nix/install) --no-daemon
-. ~/.nix-profile/etc/profile.d/nix.sh
+if [ -x /nix/var/nix/profiles/default/bin/nix ]; then
+  echo "=== Reusing existing nix install in /nix ==="
+  export PATH=/nix/var/nix/profiles/default/bin:${PATH}
+else
+  echo "=== Installing nix into persistent /nix ==="
+  # /nix exists (bind-mounted) but may be empty; chown so the installer can write
+  chown root:root /nix
+  sh <(curl -L https://nixos.org/nix/install) --no-daemon
+  . ~/.nix-profile/etc/profile.d/nix.sh
+fi
+
 nix --version
 
 echo "=== Building ${VARIANT} ==="
