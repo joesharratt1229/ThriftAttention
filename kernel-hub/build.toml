@@ -9,7 +9,6 @@ repo-id = "hrsh-venket/thrift-attention"
 
 [torch]
 src = [
-    "torch-ext/registration.h",
     "torch-ext/torch_binding.h",
     "torch-ext/torch_binding.cpp",
 ]
