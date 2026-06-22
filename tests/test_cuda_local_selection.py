@@ -65,6 +65,7 @@ def require_sm120_cuda() -> None:
         (1, 2, 5, 6, 3, True, 64),
         (2, 3, 5, 3, 3, True, 64),
         (1, 4, 7, 9, 1, True, 128),
+        (1, 1, 2, 4, 0, True, 64),
         (1, 2, 5, 6, 3, False, 64),
         (2, 1, 4, 4, 4, False, 128),
     ],
@@ -104,6 +105,7 @@ def test_local_block_topk_matches_reference(
         (1, 2, 3, 7, 3, 64),
         (2, 3, 4, 5, 5, 128),
         (1, 1, 1, 1, 1, 64),
+        (1, 2, 3, 4, 0, 64),
     ],
 )
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -130,25 +132,3 @@ def test_single_query_local_topk_matches_reference(
 
     torch.cuda.synchronize()
     assert torch.equal(actual, expected)
-
-
-def test_local_block_topk_allows_empty_selection() -> None:
-    require_sm120_cuda()
-    device = torch.device("cuda")
-    q = torch.empty(1, 1, 2 * 64, 64, device=device, dtype=torch.float16)
-
-    actual = extension.local_block_topk(q, 4, 0, True)
-
-    assert actual.shape == (1, 2, 0)
-    assert actual.dtype == torch.int32
-
-
-def test_single_query_local_topk_allows_empty_selection() -> None:
-    require_sm120_cuda()
-    device = torch.device("cuda")
-    q_grouped = torch.empty(1, 2, 3, 64, device=device, dtype=torch.float16)
-
-    actual = extension.single_query_local_topk(q_grouped, 0, 4)
-
-    assert actual.shape == (2, 0)
-    assert actual.dtype == torch.int32

@@ -55,31 +55,6 @@ void single_query_local_topk_kernel(
     }
 }
 
-cudaError_t launch_local_block_topk(
-    int32_t* topk_out,
-    int flat_heads,
-    int num_q_blocks,
-    int num_kv_blocks,
-    int topk_count,
-    bool causal) {
-    const dim3 grid_size(num_q_blocks, flat_heads);
-    local_block_topk_kernel<<<grid_size, 256>>>(
-        topk_out, num_q_blocks, num_kv_blocks, topk_count, causal);
-
-    return cudaGetLastError();
-}
-
-cudaError_t launch_single_query_local_topk(
-    int32_t* topk_out,
-    int flat_heads,
-    int num_kv_blocks,
-    int topk_count) {
-    single_query_local_topk_kernel<<<flat_heads, 256>>>(
-        topk_out, num_kv_blocks, topk_count);
-
-    return cudaGetLastError();
-}
-
 }  // namespace
 
 cudaError_t local_block_topk(
@@ -92,8 +67,10 @@ cudaError_t local_block_topk(
     if (flat_heads <= 0 || num_q_blocks <= 0 || topk_count <= 0) {
         return cudaSuccess;
     }
-    return launch_local_block_topk(
-        topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count, causal);
+    const dim3 grid_size(num_q_blocks, flat_heads);
+    local_block_topk_kernel<<<grid_size, 256>>>(
+        topk_out, num_q_blocks, num_kv_blocks, topk_count, causal);
+    return cudaGetLastError();
 }
 
 cudaError_t single_query_local_topk(
@@ -104,5 +81,6 @@ cudaError_t single_query_local_topk(
     if (flat_heads <= 0 || topk_count <= 0) {
         return cudaSuccess;
     }
-    return launch_single_query_local_topk(topk_out, flat_heads, num_kv_blocks, topk_count);
+    single_query_local_topk_kernel<<<flat_heads, 256>>>(topk_out, num_kv_blocks, topk_count);
+    return cudaGetLastError();
 }

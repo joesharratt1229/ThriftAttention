@@ -1,7 +1,10 @@
+from typing import get_args
+
 import pytest
 
 torch = pytest.importorskip("torch")
 
+from thriftattention.config import AttentionConfig, SelectionMethod
 from thriftattention.selection import get_selection_policy, resolve_top_k
 
 
@@ -64,44 +67,31 @@ def test_get_selection_policy_resolves_local():
     assert get_selection_policy("local").name == "local"
 
 
-def test_select_local_key_blocks_uses_recent_blocks(monkeypatch):
-    from thriftattention import selection
+def test_attention_config_accepts_local_selection():
+    assert "local" in get_args(SelectionMethod)
+    assert AttentionConfig(selection="local").selection == "local"
+
+
+def test_local_decode_indices_uses_recent_blocks():
     from thriftattention.selection import local
 
-    monkeypatch.setattr(local, "check_qkv", lambda *args, **kwargs: None)
-
-    q = torch.empty(1, 1, 1, 2, dtype=torch.float16)
-    k = torch.empty(1, 1, 8, 2, dtype=torch.float16)
-
-    selected = selection.select_local_key_blocks(q, k, top_k=2, block_size=2)
+    selected = local.local_decode_indices(1, 4, 2, device=torch.device("cpu"))
 
     assert selected.tolist() == [[2, 3]]
 
 
-def test_select_local_block_pairs_applies_causal_window(monkeypatch):
-    from thriftattention import selection
+def test_local_block_indices_applies_causal_window():
     from thriftattention.selection import local
 
-    monkeypatch.setattr(local, "check_qkv", lambda *args, **kwargs: None)
-
-    q = torch.empty(1, 1, 8, 2, dtype=torch.float16)
-    k = torch.empty(1, 1, 8, 2, dtype=torch.float16)
-
-    selected = selection.select_local_block_pairs(q, k, causal=True, top_k=3, block_size=2)
+    selected = local.local_block_indices(1, 4, 4, 3, causal=True, device=torch.device("cpu"))
 
     assert selected.tolist() == [[[0, -1, -1], [0, 1, -1], [0, 1, 2], [1, 2, 3]]]
 
 
-def test_select_local_block_pairs_uses_centered_noncausal_window(monkeypatch):
-    from thriftattention import selection
+def test_local_block_indices_uses_centered_noncausal_window():
     from thriftattention.selection import local
 
-    monkeypatch.setattr(local, "check_qkv", lambda *args, **kwargs: None)
-
-    q = torch.empty(1, 1, 10, 2, dtype=torch.float16)
-    k = torch.empty(1, 1, 12, 2, dtype=torch.float16)
-
-    selected = selection.select_local_block_pairs(q, k, causal=False, top_k=3, block_size=2)
+    selected = local.local_block_indices(1, 5, 6, 3, causal=False, device=torch.device("cpu"))
 
     assert selected.tolist() == [[[0, 1, 2], [0, 1, 2], [1, 2, 3], [2, 3, 4], [3, 4, 5]]]
 
