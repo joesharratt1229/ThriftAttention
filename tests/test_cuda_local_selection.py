@@ -3,13 +3,13 @@ from __future__ import annotations
 import pytest
 
 torch = pytest.importorskip("torch")
-_C = pytest.importorskip("thriftattention._C")
+extension = pytest.importorskip("thriftattention._C")
 
 
 DTYPES = (torch.float16, torch.bfloat16)
 
 
-def _expected_local_block_topk(
+def expected_local_block_topk(
     flat_heads: int,
     num_q_blocks: int,
     num_kv_blocks: int,
@@ -38,7 +38,7 @@ def _expected_local_block_topk(
     ).contiguous()
 
 
-def _expected_single_query_local_topk(
+def expected_single_query_local_topk(
     flat_heads: int,
     num_kv_blocks: int,
     topk_count: int,
@@ -52,7 +52,7 @@ def _expected_single_query_local_topk(
     ).contiguous()
 
 
-def _requires_sm120_cuda() -> None:
+def require_sm120_cuda() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
     if torch.cuda.get_device_capability() < (12, 0):
@@ -80,12 +80,12 @@ def test_local_block_topk_matches_reference(
     causal: bool,
     head_dim: int,
 ) -> None:
-    _requires_sm120_cuda()
+    require_sm120_cuda()
     device = torch.device("cuda")
     q = torch.empty(batch, heads, num_q_blocks * 64, head_dim, device=device, dtype=dtype)
 
-    actual = _C.local_block_topk(q, num_kv_blocks, topk_count, causal)
-    expected = _expected_local_block_topk(
+    actual = extension.local_block_topk(q, num_kv_blocks, topk_count, causal)
+    expected = expected_local_block_topk(
         batch * heads,
         num_q_blocks,
         num_kv_blocks,
@@ -116,12 +116,12 @@ def test_single_query_local_topk_matches_reference(
     topk_count: int,
     head_dim: int,
 ) -> None:
-    _requires_sm120_cuda()
+    require_sm120_cuda()
     device = torch.device("cuda")
     q_grouped = torch.empty(batch, kv_heads, groups, head_dim, device=device, dtype=dtype)
 
-    actual = _C.single_query_local_topk(q_grouped, topk_count, num_kv_blocks)
-    expected = _expected_single_query_local_topk(
+    actual = extension.single_query_local_topk(q_grouped, topk_count, num_kv_blocks)
+    expected = expected_single_query_local_topk(
         batch * kv_heads,
         num_kv_blocks,
         topk_count,
@@ -133,22 +133,22 @@ def test_single_query_local_topk_matches_reference(
 
 
 def test_local_block_topk_allows_empty_selection() -> None:
-    _requires_sm120_cuda()
+    require_sm120_cuda()
     device = torch.device("cuda")
     q = torch.empty(1, 1, 2 * 64, 64, device=device, dtype=torch.float16)
 
-    actual = _C.local_block_topk(q, 4, 0, True)
+    actual = extension.local_block_topk(q, 4, 0, True)
 
     assert actual.shape == (1, 2, 0)
     assert actual.dtype == torch.int32
 
 
 def test_single_query_local_topk_allows_empty_selection() -> None:
-    _requires_sm120_cuda()
+    require_sm120_cuda()
     device = torch.device("cuda")
     q_grouped = torch.empty(1, 2, 3, 64, device=device, dtype=torch.float16)
 
-    actual = _C.single_query_local_topk(q_grouped, 0, 4)
+    actual = extension.single_query_local_topk(q_grouped, 0, 4)
 
     assert actual.shape == (2, 0)
     assert actual.dtype == torch.int32

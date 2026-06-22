@@ -8,7 +8,7 @@ from thriftattention.selection.base import SelectionConfig
 from thriftattention.selection.block_mean import resolve_top_k
 
 
-def _local_block_indices(
+def local_block_indices(
     flat_heads: int,
     num_q_blocks: int,
     num_kv_blocks: int,
@@ -36,7 +36,7 @@ def _local_block_indices(
     return indices.unsqueeze(0).expand(flat_heads, -1, -1).contiguous()
 
 
-def _local_decode_indices(
+def local_decode_indices(
     flat_heads: int,
     num_kv_blocks: int,
     selected_count: int,
@@ -64,7 +64,6 @@ def select_local_block_pairs(
     block_size: int = 64,
     is_bf16: bool = False,
 ) -> torch.Tensor:
-    """Return a contiguous local KV-block window for each query block."""
     del is_bf16
     check_qkv(q, k, k)
     require_block_aligned("q", q.shape[2], block_size)
@@ -95,7 +94,7 @@ def select_local_block_pairs(
             block_size,
         )
 
-    return _local_block_indices(
+    return local_block_indices(
         q.shape[0] * q.shape[1],
         q.shape[2] // block_size,
         num_kv_blocks,
@@ -114,7 +113,6 @@ def select_local_key_blocks(
     block_size: int = 64,
     is_bf16: bool = False,
 ) -> torch.Tensor:
-    """Return trailing local KV blocks for single-query attention."""
     del is_bf16
     check_qkv(q, k, k)
     if q.shape[2] != 1:
@@ -128,7 +126,9 @@ def select_local_key_blocks(
         top_k=top_k,
         fraction=fraction,
     )
-    batch, q_heads, _, head_dim = q.shape
+    batch = q.shape[0]
+    q_heads = q.shape[1]
+    head_dim = q.shape[3]
     kv_heads = k.shape[1]
     groups = q_heads // kv_heads
     if selected_count == 0:
@@ -147,7 +147,7 @@ def select_local_key_blocks(
             num_kv_blocks,
         )
 
-    return _local_decode_indices(
+    return local_decode_indices(
         batch * kv_heads,
         num_kv_blocks,
         selected_count,

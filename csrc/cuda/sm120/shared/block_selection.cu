@@ -440,57 +440,6 @@ void single_query_quest_topk_kernel(
     }
 }
 
-// Per-query-block local window selection.
-//
-// out: [flat_heads, num_q_blocks, topk_count]
-__global__ __launch_bounds__(256)
-void local_block_topk_kernel(
-    int32_t* __restrict__ topk_out,
-    int num_q_blocks,
-    int num_kv_blocks,
-    int topk_count,
-    bool causal) {
-    const int row_id = blockIdx.x;
-    const int q_block_id = row_id % num_q_blocks;
-    const int tid = threadIdx.x;
-    int32_t* out = topk_out + static_cast<int64_t>(row_id) * topk_count;
-
-    int start = 0;
-    int valid_count = topk_count;
-    if (causal) {
-        const int end = min(q_block_id, num_kv_blocks - 1);
-        const int available = min(end + 1, topk_count);
-        start = max(0, end - topk_count + 1);
-        valid_count = available;
-    } else {
-        const int center = min(q_block_id, num_kv_blocks - 1);
-        const int max_start = max(num_kv_blocks - topk_count, 0);
-        start = min(max(center - topk_count / 2, 0), max_start);
-    }
-
-    for (int rank = tid; rank < topk_count; rank += blockDim.x) {
-        out[rank] = rank < valid_count ? start + rank : -1;
-    }
-}
-
-// Single-token decode local window selection.
-//
-// out: [flat_heads, topk_count]
-__global__ __launch_bounds__(256)
-void single_query_local_topk_kernel(
-    int32_t* __restrict__ topk_out,
-    int num_kv_blocks,
-    int topk_count) {
-    const int flat_head_id = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int start = num_kv_blocks - topk_count;
-    int32_t* out = topk_out + static_cast<int64_t>(flat_head_id) * topk_count;
-
-    for (int rank = tid; rank < topk_count; rank += blockDim.x) {
-        out[rank] = start + rank;
-    }
-}
-
 // Chunk-parallel exact single-query selection. Each local CTA scores a
 // contiguous 64-block chunk for one KV head, emits that chunk's local top-k,
 // then the last completed chunk CTA merges the final top-k from all local
@@ -875,31 +824,6 @@ void dispatch_single_query_quest_topk(
     }
 }
 
-cudaError_t launch_local_block_topk(
-    int32_t* topk_out,
-    int flat_heads,
-    int num_q_blocks,
-    int num_kv_blocks,
-    int topk_count,
-    bool causal) {
-    const int grid_size = flat_heads * num_q_blocks;
-    local_block_topk_kernel<<<grid_size, 256>>>(
-        topk_out, num_q_blocks, num_kv_blocks, topk_count, causal);
-
-    return cudaGetLastError();
-}
-
-cudaError_t launch_single_query_local_topk(
-    int32_t* topk_out,
-    int flat_heads,
-    int num_kv_blocks,
-    int topk_count) {
-    single_query_local_topk_kernel<<<flat_heads, 256>>>(
-        topk_out, num_kv_blocks, topk_count);
-
-    return cudaGetLastError();
-}
-
 template<typename T, int HEAD_DIM>
 void launch_single_query_key_mean_topk_chunked(
     const T* q_grouped,
@@ -1175,33 +1099,6 @@ void single_query_quest_topk(
             q_grouped_raw, k_min_raw, k_max_raw, topk_out_raw, flat_heads, groups,
             num_kv_blocks, k_stat_capacity_blocks, head_dim, topk_count);
     }
-}
-
-cudaError_t local_block_topk(
-    void* topk_out_raw,
-    int flat_heads,
-    int num_q_blocks,
-    int num_kv_blocks,
-    int topk_count,
-    bool causal) {
-    if (flat_heads <= 0 || num_q_blocks <= 0 || topk_count <= 0) {
-        return cudaSuccess;
-    }
-    auto topk_out = reinterpret_cast<int32_t*>(topk_out_raw);
-    return launch_local_block_topk(
-        topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count, causal);
-}
-
-cudaError_t single_query_local_topk(
-    void* topk_out_raw,
-    int flat_heads,
-    int num_kv_blocks,
-    int topk_count) {
-    if (flat_heads <= 0 || topk_count <= 0) {
-        return cudaSuccess;
-    }
-    auto topk_out = reinterpret_cast<int32_t*>(topk_out_raw);
-    return launch_single_query_local_topk(topk_out, flat_heads, num_kv_blocks, topk_count);
 }
 
 template<typename T>

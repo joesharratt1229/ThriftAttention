@@ -209,15 +209,16 @@ void single_query_quest_topk(
     int head_dim,
     int topk_count,
     bool is_bf16);
+// Implemented in csrc/cuda/sm120/nvfp4/block_selection.cu.
 cudaError_t local_block_topk(
-    void* topk_out,
+    int32_t* topk_out,
     int flat_heads,
     int num_q_blocks,
     int num_kv_blocks,
     int topk_count,
     bool causal);
 cudaError_t single_query_local_topk(
-    void* topk_out,
+    int32_t* topk_out,
     int flat_heads,
     int num_kv_blocks,
     int topk_count);
@@ -1330,7 +1331,7 @@ static at::Tensor local_block_topk_impl(
     }
 
     const cudaError_t err = local_block_topk(
-        topk.data_ptr(), flat_heads, num_q_blocks, num_kv_blocks, topk_count, causal);
+        topk.data_ptr<int32_t>(), flat_heads, num_q_blocks, num_kv_blocks, topk_count, causal);
     TORCH_CHECK(err == cudaSuccess,
                 "local_block_topk kernel launch failed: ", cudaGetErrorString(err));
 
@@ -1359,7 +1360,7 @@ static at::Tensor single_query_local_topk_impl(
     }
 
     const cudaError_t err = single_query_local_topk(
-        topk.data_ptr(), flat_heads, num_kv_blocks, topk_count);
+        topk.data_ptr<int32_t>(), flat_heads, num_kv_blocks, topk_count);
     TORCH_CHECK(err == cudaSuccess,
                 "single_query_local_topk kernel launch failed: ", cudaGetErrorString(err));
 
