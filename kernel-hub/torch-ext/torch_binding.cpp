@@ -1014,73 +1014,73 @@ at::Tensor single_query_key_mean_topk_into_impl(
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def("fp4_attention_causal_nvfp4_packed(Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
-    ops.impl("fp4_attention_causal_nvfp4_packed", torch::kCUDA, &fp4_attention_causal_nvfp4_packed);
+    ops.impl("fp4_attention_causal_nvfp4_packed", c10::kCUDA, &fp4_attention_causal_nvfp4_packed);
 
     ops.def("fp4_attention_noncausal_nvfp4_packed(Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
-    ops.impl("fp4_attention_noncausal_nvfp4_packed", torch::kCUDA, &fp4_attention_noncausal_nvfp4_packed);
+    ops.impl("fp4_attention_noncausal_nvfp4_packed", c10::kCUDA, &fp4_attention_noncausal_nvfp4_packed);
 
     ops.def("fp4_attention_single_query_nvfp4_packed(Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
-    ops.impl("fp4_attention_single_query_nvfp4_packed", torch::kCUDA, &fp4_attention_single_query_nvfp4_packed);
+    ops.impl("fp4_attention_single_query_nvfp4_packed", c10::kCUDA, &fp4_attention_single_query_nvfp4_packed);
 
     ops.def("fp4_attention_causal_mxfp4_packed(Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
-    ops.impl("fp4_attention_causal_mxfp4_packed", torch::kCUDA, &fp4_attention_causal_mxfp4_packed);
+    ops.impl("fp4_attention_causal_mxfp4_packed", c10::kCUDA, &fp4_attention_causal_mxfp4_packed);
 
     ops.def("fp4_attention_noncausal_mxfp4_packed(Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
-    ops.impl("fp4_attention_noncausal_mxfp4_packed", torch::kCUDA, &fp4_attention_noncausal_mxfp4_packed);
+    ops.impl("fp4_attention_noncausal_mxfp4_packed", c10::kCUDA, &fp4_attention_noncausal_mxfp4_packed);
 
     ops.def("fp4_attention_single_query_mxfp4_packed(Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
-    ops.impl("fp4_attention_single_query_mxfp4_packed", torch::kCUDA, &fp4_attention_single_query_mxfp4_packed);
+    ops.impl("fp4_attention_single_query_mxfp4_packed", c10::kCUDA, &fp4_attention_single_query_mxfp4_packed);
 
     ops.def("thrift_attention_causal_nvfp4_packed(Tensor q_hi, Tensor k_hi, Tensor v_hi, Tensor selected_blocks, Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
-    ops.impl("thrift_attention_causal_nvfp4_packed", torch::kCUDA, &thrift_attention_causal_nvfp4_packed);
+    ops.impl("thrift_attention_causal_nvfp4_packed", c10::kCUDA, &thrift_attention_causal_nvfp4_packed);
 
     ops.def("thrift_attention_noncausal_nvfp4_packed(Tensor q_hi, Tensor k_hi, Tensor v_hi, Tensor selected_blocks, Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
-    ops.impl("thrift_attention_noncausal_nvfp4_packed", torch::kCUDA, &thrift_attention_noncausal_nvfp4_packed);
+    ops.impl("thrift_attention_noncausal_nvfp4_packed", c10::kCUDA, &thrift_attention_noncausal_nvfp4_packed);
 
     ops.def("thrift_attention_single_query_nvfp4_packed(Tensor q_hi, Tensor k_hi, Tensor v_hi, Tensor selected_blocks, Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
-    ops.impl("thrift_attention_single_query_nvfp4_packed", torch::kCUDA, &thrift_attention_single_query_nvfp4_packed);
+    ops.impl("thrift_attention_single_query_nvfp4_packed", c10::kCUDA, &thrift_attention_single_query_nvfp4_packed);
 
     ops.def("thrift_attention_causal_mxfp4_packed(Tensor q_hi, Tensor k_hi, Tensor v_hi, Tensor selected_blocks, Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
-    ops.impl("thrift_attention_causal_mxfp4_packed", torch::kCUDA, &thrift_attention_causal_mxfp4_packed);
+    ops.impl("thrift_attention_causal_mxfp4_packed", c10::kCUDA, &thrift_attention_causal_mxfp4_packed);
 
     ops.def("thrift_attention_noncausal_mxfp4_packed(Tensor q_hi, Tensor k_hi, Tensor v_hi, Tensor selected_blocks, Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
-    ops.impl("thrift_attention_noncausal_mxfp4_packed", torch::kCUDA, &thrift_attention_noncausal_mxfp4_packed);
+    ops.impl("thrift_attention_noncausal_mxfp4_packed", c10::kCUDA, &thrift_attention_noncausal_mxfp4_packed);
 
     ops.def("thrift_attention_single_query_mxfp4_packed(Tensor q_hi, Tensor k_hi, Tensor v_hi, Tensor selected_blocks, Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
-    ops.impl("thrift_attention_single_query_mxfp4_packed", torch::kCUDA, &thrift_attention_single_query_mxfp4_packed);
+    ops.impl("thrift_attention_single_query_mxfp4_packed", c10::kCUDA, &thrift_attention_single_query_mxfp4_packed);
 
     ops.def("nvfp4_quantize(Tensor x, bool is_bf16=False) -> Tensor[]");
-    ops.impl("nvfp4_quantize", torch::kCUDA, &nvfp4_quantize);
+    ops.impl("nvfp4_quantize", c10::kCUDA, &nvfp4_quantize);
 
     ops.def("nvfp4_quantize_permuted(Tensor x, bool is_bf16=False) -> Tensor[]");
-    ops.impl("nvfp4_quantize_permuted", torch::kCUDA, &nvfp4_quantize_permuted);
+    ops.impl("nvfp4_quantize_permuted", c10::kCUDA, &nvfp4_quantize_permuted);
 
     ops.def("nvfp4_quantize_transposed(Tensor x, bool is_bf16=False) -> Tensor[]");
-    ops.impl("nvfp4_quantize_transposed", torch::kCUDA, &nvfp4_quantize_transposed);
+    ops.impl("nvfp4_quantize_transposed", c10::kCUDA, &nvfp4_quantize_transposed);
 
     ops.def("mxfp4_quantize(Tensor x, bool is_bf16=False) -> Tensor[]");
-    ops.impl("mxfp4_quantize", torch::kCUDA, &mxfp4_quantize);
+    ops.impl("mxfp4_quantize", c10::kCUDA, &mxfp4_quantize);
 
     ops.def("mxfp4_quantize_permuted(Tensor x, bool is_bf16=False) -> Tensor[]");
-    ops.impl("mxfp4_quantize_permuted", torch::kCUDA, &mxfp4_quantize_permuted);
+    ops.impl("mxfp4_quantize_permuted", c10::kCUDA, &mxfp4_quantize_permuted);
 
     ops.def("mxfp4_quantize_transposed(Tensor x, bool is_bf16=False) -> Tensor[]");
-    ops.impl("mxfp4_quantize_transposed", torch::kCUDA, &mxfp4_quantize_transposed);
+    ops.impl("mxfp4_quantize_transposed", c10::kCUDA, &mxfp4_quantize_transposed);
 
     ops.def("block_mean_topk(Tensor q_mean, Tensor k_mean, int topk_count, bool causal=True, bool is_bf16=False) -> Tensor");
-    ops.impl("block_mean_topk", torch::kCUDA, &block_mean_topk_impl);
+    ops.impl("block_mean_topk", c10::kCUDA, &block_mean_topk_impl);
 
     ops.def("quest_block_topk(Tensor q_mean, Tensor k_min, Tensor k_max, int topk_count, bool causal=True, bool is_bf16=False) -> Tensor");
-    ops.impl("quest_block_topk", torch::kCUDA, &quest_block_topk_impl);
+    ops.impl("quest_block_topk", c10::kCUDA, &quest_block_topk_impl);
 
     ops.def("single_query_key_mean_topk(Tensor q_grouped, Tensor k_mean, int topk_count, int num_kv_blocks, bool is_bf16=False) -> Tensor");
-    ops.impl("single_query_key_mean_topk", torch::kCUDA, &single_query_key_mean_topk_impl);
+    ops.impl("single_query_key_mean_topk", c10::kCUDA, &single_query_key_mean_topk_impl);
 
     ops.def("single_query_quest_topk(Tensor q_grouped, Tensor k_min, Tensor k_max, int topk_count, int num_kv_blocks, bool is_bf16=False) -> Tensor");
-    ops.impl("single_query_quest_topk", torch::kCUDA, &single_query_quest_topk_impl);
+    ops.impl("single_query_quest_topk", c10::kCUDA, &single_query_quest_topk_impl);
 
     ops.def("single_query_key_mean_topk_into(Tensor q_grouped, Tensor k_mean, Tensor! topk, Tensor! local_scores, Tensor! local_indices, Tensor! done_counts, int num_kv_blocks, bool is_bf16=False) -> Tensor");
-    ops.impl("single_query_key_mean_topk_into", torch::kCUDA, &single_query_key_mean_topk_into_impl);
+    ops.impl("single_query_key_mean_topk_into", c10::kCUDA, &single_query_key_mean_topk_into_impl);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
