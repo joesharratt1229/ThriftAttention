@@ -69,6 +69,8 @@ def select_local_block_pairs(
     require_block_aligned("q", q.shape[2], block_size)
     require_block_aligned("k", k.shape[2], block_size)
 
+    flat_heads = q.shape[0] * q.shape[1]
+    num_q_blocks = q.shape[2] // block_size
     num_kv_blocks = k.shape[2] // block_size
     selected_count = resolve_top_k(
         num_kv_blocks,
@@ -76,16 +78,7 @@ def select_local_block_pairs(
         top_k=top_k,
         fraction=fraction,
     )
-    if selected_count == 0:
-        return torch.empty(
-            q.shape[0] * q.shape[1],
-            q.shape[2] // block_size,
-            0,
-            device=q.device,
-            dtype=torch.int32,
-        )
-
-    if q.is_cuda:
+    if q.is_cuda and selected_count > 0:
         return get_extension().local_block_topk(
             q,
             num_kv_blocks,
@@ -95,8 +88,8 @@ def select_local_block_pairs(
         )
 
     return local_block_indices(
-        q.shape[0] * q.shape[1],
-        q.shape[2] // block_size,
+        flat_heads,
+        num_q_blocks,
         num_kv_blocks,
         selected_count,
         causal=causal,
@@ -131,15 +124,9 @@ def select_local_key_blocks(
     head_dim = q.shape[3]
     kv_heads = k.shape[1]
     groups = q_heads // kv_heads
-    if selected_count == 0:
-        return torch.empty(
-            batch * kv_heads,
-            0,
-            device=q.device,
-            dtype=torch.int32,
-        )
+    flat_heads = batch * kv_heads
 
-    if q.is_cuda:
+    if q.is_cuda and selected_count > 0:
         q_grouped = q.reshape(batch, kv_heads, groups, head_dim).contiguous()
         return get_extension().single_query_local_topk(
             q_grouped,
@@ -148,7 +135,7 @@ def select_local_key_blocks(
         )
 
     return local_decode_indices(
-        batch * kv_heads,
+        flat_heads,
         num_kv_blocks,
         selected_count,
         device=q.device,
