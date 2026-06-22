@@ -60,6 +60,52 @@ def test_get_selection_policy_resolves_quest():
     assert get_selection_policy("quest").name == "quest"
 
 
+def test_get_selection_policy_resolves_local():
+    assert get_selection_policy("local").name == "local"
+
+
+def test_select_local_key_blocks_uses_recent_blocks(monkeypatch):
+    from thriftattention import selection
+    from thriftattention.selection import local
+
+    monkeypatch.setattr(local, "check_qkv", lambda *args, **kwargs: None)
+
+    q = torch.empty(1, 1, 1, 2, dtype=torch.float16)
+    k = torch.empty(1, 1, 8, 2, dtype=torch.float16)
+
+    selected = selection.select_local_key_blocks(q, k, top_k=2, block_size=2)
+
+    assert selected.tolist() == [[2, 3]]
+
+
+def test_select_local_block_pairs_applies_causal_window(monkeypatch):
+    from thriftattention import selection
+    from thriftattention.selection import local
+
+    monkeypatch.setattr(local, "check_qkv", lambda *args, **kwargs: None)
+
+    q = torch.empty(1, 1, 8, 2, dtype=torch.float16)
+    k = torch.empty(1, 1, 8, 2, dtype=torch.float16)
+
+    selected = selection.select_local_block_pairs(q, k, causal=True, top_k=3, block_size=2)
+
+    assert selected.tolist() == [[[0, -1, -1], [0, 1, -1], [0, 1, 2], [1, 2, 3]]]
+
+
+def test_select_local_block_pairs_uses_centered_noncausal_window(monkeypatch):
+    from thriftattention import selection
+    from thriftattention.selection import local
+
+    monkeypatch.setattr(local, "check_qkv", lambda *args, **kwargs: None)
+
+    q = torch.empty(1, 1, 10, 2, dtype=torch.float16)
+    k = torch.empty(1, 1, 12, 2, dtype=torch.float16)
+
+    selected = selection.select_local_block_pairs(q, k, causal=False, top_k=3, block_size=2)
+
+    assert selected.tolist() == [[[0, 1, 2], [0, 1, 2], [1, 2, 3], [2, 3, 4], [3, 4, 5]]]
+
+
 def test_select_quest_key_blocks_uses_minmax(monkeypatch):
     from thriftattention import selection
     from thriftattention.selection import quest
