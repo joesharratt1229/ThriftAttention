@@ -30,4 +30,5 @@ src = [
     "csrc/cuda/sm120/mxfp4/single_query_attention.cu",
     "csrc/cuda/sm120/mxfp4/quantization.cu",
     "csrc/cuda/sm120/shared/block_selection.cu",
+    "csrc/include/thriftattention/sm120/cuda_common.cuh",
 ]
