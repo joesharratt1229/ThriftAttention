@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from thrift_attention.config import SelectionMethod
+from ..config import SelectionMethod
 
 from .base import SelectionConfig, SelectionPolicy
 from .block_mean import (

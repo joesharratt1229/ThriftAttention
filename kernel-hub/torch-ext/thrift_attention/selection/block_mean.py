@@ -4,9 +4,9 @@ import math
 
 import torch
 
-from thrift_attention._checks import check_qkv, require_block_aligned
-from thrift_attention._extension import get_extension
-from thrift_attention.selection.base import SelectionConfig
+from .._checks import check_qkv, require_block_aligned
+from .._extension import get_extension
+from .base import SelectionConfig
 
 
 def resolve_top_k(

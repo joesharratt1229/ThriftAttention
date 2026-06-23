@@ -4,8 +4,8 @@ from typing import Protocol
 
 import torch
 
-from thrift_attention.config import AttentionConfig
-from thrift_attention.quant.formats import QuantFormat
+from ..config import AttentionConfig
+from ..quant.formats import QuantFormat
 
 
 class AttentionBackend(Protocol):

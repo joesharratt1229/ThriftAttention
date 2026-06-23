@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import torch
 
-from thrift_attention._checks import require_supported_head_dim
-from thrift_attention.backends.base import AttentionBackend
-from thrift_attention.backends.sm120 import SM120_NVFP4_BACKEND
-from thrift_attention.config import AttentionConfig
-from thrift_attention.quant.formats import QuantFormat
+from .._checks import require_supported_head_dim
+from ..config import AttentionConfig
+from ..quant.formats import QuantFormat
+from .base import AttentionBackend
+from .sm120 import SM120_NVFP4_BACKEND
 
 
 def select_backend(

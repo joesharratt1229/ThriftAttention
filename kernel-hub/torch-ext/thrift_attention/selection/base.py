@@ -5,7 +5,7 @@ from typing import Protocol
 
 import torch
 
-from thrift_attention.config import SelectionMethod
+from ..config import SelectionMethod
 
 
 @dataclass(frozen=True)

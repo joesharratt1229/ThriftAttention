@@ -5,8 +5,8 @@ from typing import Protocol
 
 import torch
 
-from thrift_attention.config import QuantFormatName
-from thrift_attention.quantization import (
+from ..config import QuantFormatName
+from ..quantization import (
     mxfp4_quantize,
     mxfp4_quantize_permuted,
     mxfp4_quantize_transposed,

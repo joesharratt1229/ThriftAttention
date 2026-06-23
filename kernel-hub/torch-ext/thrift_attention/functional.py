@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import torch
 
-from thrift_attention.backends.registry import select_backend
-from thrift_attention.config import AttentionConfig
-from thrift_attention.quant.formats import get_quant_format
-from thrift_attention.selection import get_selection_policy
-from thrift_attention.selection.base import SelectionConfig
+from .backends.registry import select_backend
+from .config import AttentionConfig
+from .quant.formats import get_quant_format
+from .selection import get_selection_policy
+from .selection.base import SelectionConfig
 
 
 def attention(

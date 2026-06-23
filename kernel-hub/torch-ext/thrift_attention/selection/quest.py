@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import torch
 
-from thrift_attention._checks import check_qkv, require_block_aligned
-from thrift_attention._extension import get_extension
-from thrift_attention.selection.base import SelectionConfig
-from thrift_attention.selection.block_mean import resolve_top_k
+from .._checks import check_qkv, require_block_aligned
+from .._extension import get_extension
+from .base import SelectionConfig
+from .block_mean import resolve_top_k
 
 
 def block_minmax(

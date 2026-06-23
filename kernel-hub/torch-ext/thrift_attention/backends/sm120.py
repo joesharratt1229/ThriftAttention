@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import torch
 
-from thrift_attention.backends.single_query import (
+from .._checks import check_qkv, require_block_aligned
+from .._extension import get_extension
+from ..config import AttentionConfig
+from ..quant.formats import QuantFormat
+from .single_query import (
     _group_single_query,
     _ungroup_single_query,
     _use_single_query,
 )
-from thrift_attention._checks import check_qkv, require_block_aligned
-from thrift_attention._extension import get_extension
-from thrift_attention.config import AttentionConfig
-from thrift_attention.quant.formats import QuantFormat
 
 
 
