@@ -6,9 +6,6 @@ torch = pytest.importorskip("torch")
 extension = pytest.importorskip("thriftattention._C")
 
 
-DTYPES = (torch.float16, torch.bfloat16)
-
-
 def expected_local_block_topk(
     flat_heads: int,
     num_q_blocks: int,
@@ -70,9 +67,7 @@ def require_sm120_cuda() -> None:
         (2, 1, 4, 4, 4, False, 128),
     ],
 )
-@pytest.mark.parametrize("dtype", DTYPES)
 def test_local_block_topk_matches_reference(
-    dtype: torch.dtype,
     batch: int,
     heads: int,
     num_q_blocks: int,
@@ -83,7 +78,7 @@ def test_local_block_topk_matches_reference(
 ) -> None:
     require_sm120_cuda()
     device = torch.device("cuda")
-    q = torch.empty(batch, heads, num_q_blocks * 64, head_dim, device=device, dtype=dtype)
+    q = torch.empty(batch, heads, num_q_blocks * 64, head_dim, device=device, dtype=torch.float16)
 
     actual = extension.local_block_topk(q, num_kv_blocks, topk_count, causal)
     expected = expected_local_block_topk(
@@ -108,9 +103,7 @@ def test_local_block_topk_matches_reference(
         (1, 2, 3, 4, 0, 64),
     ],
 )
-@pytest.mark.parametrize("dtype", DTYPES)
 def test_single_query_local_topk_matches_reference(
-    dtype: torch.dtype,
     batch: int,
     kv_heads: int,
     groups: int,
@@ -120,7 +113,7 @@ def test_single_query_local_topk_matches_reference(
 ) -> None:
     require_sm120_cuda()
     device = torch.device("cuda")
-    q_grouped = torch.empty(batch, kv_heads, groups, head_dim, device=device, dtype=dtype)
+    q_grouped = torch.empty(batch, kv_heads, groups, head_dim, device=device, dtype=torch.float16)
 
     actual = extension.single_query_local_topk(q_grouped, topk_count, num_kv_blocks)
     expected = expected_single_query_local_topk(

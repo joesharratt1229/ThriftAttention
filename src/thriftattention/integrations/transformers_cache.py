@@ -654,6 +654,7 @@ def cached_prefill_attention(
 
     selected_blocks = _select_cached_prefill_blocks(
         q,
+        k_fp16,
         layer,
         config,
         real_q_len=cache.prefill_real_seq_len,
@@ -707,6 +708,7 @@ def _select_cached_decode_blocks(
 
 def _select_cached_prefill_blocks(
     q: torch.Tensor,
+    k: torch.Tensor,
     layer: ThriftAttentionCacheLayer,
     config: AttentionConfig,
     real_q_len: int | None = None,
@@ -715,7 +717,7 @@ def _select_cached_prefill_blocks(
     if config.selection == "local":
         return select_local_block_pairs(
             q,
-            layer.key_view().contiguous(),
+            k,
             causal=config.causal,
             top_k=config.top_k,
             fraction=config.fraction,

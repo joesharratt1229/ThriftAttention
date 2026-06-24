@@ -8,52 +8,6 @@ from thriftattention.selection.base import SelectionConfig
 from thriftattention.selection.block_mean import resolve_top_k
 
 
-def local_block_indices(
-    flat_heads: int,
-    num_q_blocks: int,
-    num_kv_blocks: int,
-    selected_count: int,
-    *,
-    causal: bool,
-    device: torch.device,
-) -> torch.Tensor:
-    if selected_count == 0:
-        return torch.empty(flat_heads, num_q_blocks, 0, device=device, dtype=torch.int32)
-
-    ranks = torch.arange(selected_count, device=device, dtype=torch.int32)
-    q_blocks = torch.arange(num_q_blocks, device=device, dtype=torch.int32)
-    if causal:
-        ends = q_blocks.clamp(max=num_kv_blocks - 1)
-        valid_counts = (ends + 1).clamp(max=selected_count)
-        starts = (ends - selected_count + 1).clamp(min=0)
-        indices = starts[:, None] + ranks[None, :]
-        indices = indices.masked_fill(ranks.view(1, -1) >= valid_counts.view(-1, 1), -1)
-    else:
-        centers = q_blocks.clamp(max=num_kv_blocks - 1)
-        max_start = max(num_kv_blocks - selected_count, 0)
-        starts = (centers - selected_count // 2).clamp(min=0, max=max_start)
-        indices = starts[:, None] + ranks[None, :]
-    return indices.unsqueeze(0).expand(flat_heads, -1, -1).contiguous()
-
-
-def local_decode_indices(
-    flat_heads: int,
-    num_kv_blocks: int,
-    selected_count: int,
-    *,
-    device: torch.device,
-) -> torch.Tensor:
-    if selected_count == 0:
-        return torch.empty(flat_heads, 0, device=device, dtype=torch.int32)
-    row = torch.arange(
-        num_kv_blocks - selected_count,
-        num_kv_blocks,
-        device=device,
-        dtype=torch.int32,
-    )
-    return row.unsqueeze(0).expand(flat_heads, -1).contiguous()
-
-
 def select_local_block_pairs(
     q: torch.Tensor,
     k: torch.Tensor,

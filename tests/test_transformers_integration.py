@@ -179,6 +179,7 @@ def test_cached_prefill_local_selection_uses_local_policy(monkeypatch):
 
     selected = cache_mod._select_cached_prefill_blocks(
         q,
+        k,
         layer,
         AttentionConfig(selection="local", top_k=2),
     )

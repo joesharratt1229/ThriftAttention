@@ -72,30 +72,6 @@ def test_attention_config_accepts_local_selection():
     assert AttentionConfig(selection="local").selection == "local"
 
 
-def test_local_decode_indices_uses_recent_blocks():
-    from thriftattention.selection import local
-
-    selected = local.local_decode_indices(1, 4, 2, device=torch.device("cpu"))
-
-    assert selected.tolist() == [[2, 3]]
-
-
-def test_local_block_indices_applies_causal_window():
-    from thriftattention.selection import local
-
-    selected = local.local_block_indices(1, 4, 4, 3, causal=True, device=torch.device("cpu"))
-
-    assert selected.tolist() == [[[0, -1, -1], [0, 1, -1], [0, 1, 2], [1, 2, 3]]]
-
-
-def test_local_block_indices_uses_centered_noncausal_window():
-    from thriftattention.selection import local
-
-    selected = local.local_block_indices(1, 5, 6, 3, causal=False, device=torch.device("cpu"))
-
-    assert selected.tolist() == [[[0, 1, 2], [0, 1, 2], [1, 2, 3], [2, 3, 4], [3, 4, 5]]]
-
-
 def test_select_quest_key_blocks_uses_minmax(monkeypatch):
     from thriftattention import selection
     from thriftattention.selection import quest
