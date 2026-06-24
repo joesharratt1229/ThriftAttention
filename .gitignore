@@ -1,3 +1,5 @@
 *pycache*
 *cpython*
 *egg-info*
+ta-kernel-build-*.out
+.DS_Store
