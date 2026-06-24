@@ -7,7 +7,7 @@ from typing import Literal
 AttentionMethod = Literal["thrift", "fp4"]
 SelectionMethod = Literal["block_mean", "quest"]
 QuantFormatName = Literal["nvfp4", "mxfp4"]
-AttentionBackendName = Literal["auto", "sm120"]
+AttentionBackendName = Literal["auto", "sm100", "sm120"]
 AttentionImplementation = Literal["auto", "tiled", "single_query"]
 FallbackBackend = Literal["error"]
 
