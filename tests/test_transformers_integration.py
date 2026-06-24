@@ -149,7 +149,7 @@ def test_cached_decode_local_selection_uses_local_extension(monkeypatch):
     q_grouped = torch.empty(1, 1, 1, 64)
     layer = SimpleNamespace(seq_len=256)
 
-    selected = cache_mod._select_cached_decode_blocks(
+    selected = cache_mod.select_cached_decode_blocks(
         q_grouped,
         layer,
         AttentionConfig(selection="local", top_k=2),
@@ -177,7 +177,7 @@ def test_cached_prefill_local_selection_uses_local_policy(monkeypatch):
     k = torch.empty(1, 1, 256, 64, dtype=torch.float16)
     layer = SimpleNamespace(key_view=lambda: k)
 
-    selected = cache_mod._select_cached_prefill_blocks(
+    selected = cache_mod.select_cached_prefill_blocks(
         q,
         k,
         layer,

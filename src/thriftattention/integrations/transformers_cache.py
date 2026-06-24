@@ -602,7 +602,7 @@ def cached_decode_attention(
     if config.method != "thrift":
         raise ValueError(f"unsupported ThriftAttention method {config.method!r}")
 
-    selected_blocks = _select_cached_decode_blocks(q_grouped, layer, config)
+    selected_blocks = select_cached_decode_blocks(q_grouped, layer, config)
     out = get_extension().thrift_attention_single_query_nvfp4_packed(
         q_grouped,
         layer.key_view(),
@@ -652,7 +652,7 @@ def cached_prefill_attention(
     if config.method != "thrift":
         raise ValueError(f"unsupported ThriftAttention method {config.method!r}")
 
-    selected_blocks = _select_cached_prefill_blocks(
+    selected_blocks = select_cached_prefill_blocks(
         q,
         k_fp16,
         layer,
@@ -680,7 +680,7 @@ def cached_prefill_attention(
     )
 
 
-def _select_cached_decode_blocks(
+def select_cached_decode_blocks(
     q_grouped: torch.Tensor,
     layer: ThriftAttentionCacheLayer,
     config: AttentionConfig,
@@ -706,7 +706,7 @@ def _select_cached_decode_blocks(
     return get_extension().single_query_local_topk(q_grouped, selected_count, complete_blocks)
 
 
-def _select_cached_prefill_blocks(
+def select_cached_prefill_blocks(
     q: torch.Tensor,
     k: torch.Tensor,
     layer: ThriftAttentionCacheLayer,
