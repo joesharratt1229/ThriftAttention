@@ -1,0 +1,33 @@
+[general]
+name = "thrift-attention"
+version = 1
+license = "Apache-2.0"
+backends = ["cuda"]
+
+[general.hub]
+repo-id = "hrsh-venket/thrift-attention"
+
+[torch]
+src = [
+    "csrc/bindings.cpp",
+]
+
+[kernel.thrift_attention]
+backend = "cuda"
+cuda-capabilities = ["12.0a"]
+depends = ["torch"]
+include = ["csrc/include"]
+src = [
+    "csrc/cuda/sm120/nvfp4/fp4_attention.cu",
+    "csrc/cuda/sm120/nvfp4/single_query_fp4_attention.cu",
+    "csrc/cuda/sm120/nvfp4/thrift_attention.cu",
+    "csrc/cuda/sm120/nvfp4/single_query_attention.cu",
+    "csrc/cuda/sm120/nvfp4/quantization.cu",
+    "csrc/cuda/sm120/mxfp4/fp4_attention.cu",
+    "csrc/cuda/sm120/mxfp4/single_query_fp4_attention.cu",
+    "csrc/cuda/sm120/mxfp4/thrift_attention.cu",
+    "csrc/cuda/sm120/mxfp4/single_query_attention.cu",
+    "csrc/cuda/sm120/mxfp4/quantization.cu",
+    "csrc/cuda/sm120/shared/block_selection.cu",
+    "csrc/include/thriftattention/sm120/cuda_common.cuh",
+]

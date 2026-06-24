@@ -1,4 +1,29 @@
-#include <torch/extension.h>
+// Bare torch/library.h + ATen — NOT torch/extension.h, which drags in
+// pybind11 headers that break under -DPy_LIMITED_API (kernel-builder's abi3
+// compile mode).
+#include <torch/library.h>
+#include <ATen/ATen.h>
+
+// TORCH_LIBRARY_EXPAND / REGISTER_EXTENSION come from kernel-builder's
+// registration.h when available; the pip build's include path doesn't have it,
+// so we vendor the same three-line definitions inline.
+#if defined(__has_include) && __has_include("registration.h")
+  #include "registration.h"
+#else
+  #include <Python.h>
+  #define _TA_CONCAT(a, b) a##b
+  #define TA_CONCAT(a, b) _TA_CONCAT(a, b)
+  #define _TA_STRINGIFY(a) #a
+  #define TA_STRINGIFY(a) _TA_STRINGIFY(a)
+  #define TORCH_LIBRARY_EXPAND(NAME, MODULE) TORCH_LIBRARY(NAME, MODULE)
+  #define TORCH_LIBRARY_IMPL_EXPAND(NAME, DEVICE, MODULE) TORCH_LIBRARY_IMPL(NAME, DEVICE, MODULE)
+  #define REGISTER_EXTENSION(NAME) \
+    PyMODINIT_FUNC TA_CONCAT(PyInit_, NAME)() { \
+      static struct PyModuleDef module = { \
+          PyModuleDef_HEAD_INIT, TA_STRINGIFY(NAME), nullptr, 0, nullptr}; \
+      return PyModule_Create(&module); \
+    }
+#endif
 
 #include <algorithm>
 #include <cstdlib>
@@ -1078,7 +1103,7 @@ static std::vector<at::Tensor> mxfp4_quantize_transposed_permuted(const at::Tens
 static at::Tensor block_mean_topk_impl(
     const at::Tensor& q_mean,
     const at::Tensor& k_mean,
-    int topk_count,
+    int64_t topk_count,
     bool causal = true,
     bool is_bf16 = false) {
     TORCH_CHECK(q_mean.is_cuda() && k_mean.is_cuda(),
@@ -1124,7 +1149,7 @@ static at::Tensor quest_block_topk_impl(
     const at::Tensor& q_mean,
     const at::Tensor& k_min,
     const at::Tensor& k_max,
-    int topk_count,
+    int64_t topk_count,
     bool causal = true,
     bool is_bf16 = false) {
     TORCH_CHECK(q_mean.is_cuda() && k_min.is_cuda() && k_max.is_cuda(),
@@ -1171,8 +1196,8 @@ static at::Tensor quest_block_topk_impl(
 static at::Tensor single_query_key_mean_topk_impl(
     const at::Tensor& q_grouped,
     const at::Tensor& k_mean,
-    int topk_count,
-    int num_kv_blocks,
+    int64_t topk_count,
+    int64_t num_kv_blocks,
     bool is_bf16 = false) {
     TORCH_CHECK(q_grouped.is_cuda() && k_mean.is_cuda(),
                 "q_grouped and k_mean must be CUDA tensors");
@@ -1220,7 +1245,7 @@ static at::Tensor single_query_key_mean_topk_impl(
 
     constexpr int chunk_blocks = 64;
     const int chunk_count = (num_kv_blocks + chunk_blocks - 1) / chunk_blocks;
-    const int local_count = std::min(topk_count, chunk_blocks);
+    const int local_count = std::min(static_cast<int>(topk_count), chunk_blocks);
     at::Tensor local_scores = at::empty(
         {flat_heads, chunk_count, local_count},
         at::TensorOptions().dtype(at::kFloat).device(q_grouped.device()));
@@ -1240,8 +1265,8 @@ static at::Tensor single_query_quest_topk_impl(
     const at::Tensor& q_grouped,
     const at::Tensor& k_min,
     const at::Tensor& k_max,
-    int topk_count,
-    int num_kv_blocks,
+    int64_t topk_count,
+    int64_t num_kv_blocks,
     bool is_bf16 = false) {
     TORCH_CHECK(q_grouped.is_cuda() && k_min.is_cuda() && k_max.is_cuda(),
                 "q_grouped, k_min, and k_max must be CUDA tensors");
@@ -1296,7 +1321,7 @@ static at::Tensor single_query_key_mean_topk_into_impl(
     at::Tensor& local_scores,
     at::Tensor& local_indices,
     at::Tensor& done_counts,
-    int num_kv_blocks,
+    int64_t num_kv_blocks,
     bool is_bf16 = false) {
     TORCH_CHECK(q_grouped.is_cuda() && k_mean.is_cuda(),
                 "q_grouped and k_mean must be CUDA tensors");
@@ -1357,7 +1382,7 @@ static at::Tensor single_query_key_mean_topk_into_impl(
 
     constexpr int chunk_blocks = 64;
     const int chunk_count = (num_kv_blocks + chunk_blocks - 1) / chunk_blocks;
-    const int local_count = std::min(topk_count, chunk_blocks);
+    const int local_count = std::min(static_cast<int>(topk_count), chunk_blocks);
     TORCH_CHECK(local_scores.dim() == 3 && local_scores.size(0) == flat_heads &&
                 local_scores.size(1) >= chunk_count && local_scores.size(2) >= local_count,
                 "local_scores workspace is too small");
@@ -1373,209 +1398,88 @@ static at::Tensor single_query_key_mean_topk_into_impl(
     return topk;
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("fp4_attention_causal_nvfp4_packed", &fp4_attention_causal_nvfp4_packed,
-          pybind11::arg("q_packed"),
-          pybind11::arg("k_packed"),
-          pybind11::arg("v_packed_t"),
-          pybind11::arg("q_scale"),
-          pybind11::arg("k_scale"),
-          pybind11::arg("v_scale_t"),
-          pybind11::arg("is_bf16") = false,
-          "Pure NVFP4 causal attention over packed tensors");
-    m.def("fp4_attention_noncausal_nvfp4_packed", &fp4_attention_noncausal_nvfp4_packed,
-          pybind11::arg("q_packed"),
-          pybind11::arg("k_packed"),
-          pybind11::arg("v_packed_t"),
-          pybind11::arg("q_scale"),
-          pybind11::arg("k_scale"),
-          pybind11::arg("v_scale_t"),
-          pybind11::arg("is_bf16") = false,
-          "Pure NVFP4 non-causal attention over packed tensors");
-    m.def("fp4_attention_single_query_nvfp4_packed", &fp4_attention_single_query_nvfp4_packed,
-          pybind11::arg("q_packed"),
-          pybind11::arg("k_packed"),
-          pybind11::arg("v_packed_t"),
-          pybind11::arg("q_scale"),
-          pybind11::arg("k_scale"),
-          pybind11::arg("v_scale_t"),
-          pybind11::arg("is_bf16") = false,
-          "Pure NVFP4 single-query attention over packed tensors");
-    m.def("fp4_attention_causal_mxfp4_packed", &fp4_attention_causal_mxfp4_packed,
-          pybind11::arg("q_packed"),
-          pybind11::arg("k_packed"),
-          pybind11::arg("v_packed_t"),
-          pybind11::arg("q_scale"),
-          pybind11::arg("k_scale"),
-          pybind11::arg("v_scale_t"),
-          pybind11::arg("is_bf16") = false,
-          "Pure MXFP4 causal attention over packed tensors");
-    m.def("fp4_attention_noncausal_mxfp4_packed", &fp4_attention_noncausal_mxfp4_packed,
-          pybind11::arg("q_packed"),
-          pybind11::arg("k_packed"),
-          pybind11::arg("v_packed_t"),
-          pybind11::arg("q_scale"),
-          pybind11::arg("k_scale"),
-          pybind11::arg("v_scale_t"),
-          pybind11::arg("is_bf16") = false,
-          "Pure MXFP4 non-causal attention over packed tensors");
-    m.def("fp4_attention_single_query_mxfp4_packed", &fp4_attention_single_query_mxfp4_packed,
-          pybind11::arg("q_packed"),
-          pybind11::arg("k_packed"),
-          pybind11::arg("v_packed_t"),
-          pybind11::arg("q_scale"),
-          pybind11::arg("k_scale"),
-          pybind11::arg("v_scale_t"),
-          pybind11::arg("is_bf16") = false,
-          "Pure MXFP4 single-query attention over packed tensors");
-    m.def("thrift_attention_causal_nvfp4_packed", &thrift_attention_causal_nvfp4_packed,
-          pybind11::arg("q_hi"),
-          pybind11::arg("k_hi"),
-          pybind11::arg("v_hi"),
-          pybind11::arg("selected_blocks"),
-          pybind11::arg("q_packed"),
-          pybind11::arg("k_packed"),
-          pybind11::arg("v_packed_t"),
-          pybind11::arg("q_scale"),
-          pybind11::arg("k_scale"),
-          pybind11::arg("v_scale_t"),
-          pybind11::arg("is_bf16") = false,
-          "ThriftAttention causal attention over packed tensors");
-    m.def("thrift_attention_noncausal_nvfp4_packed", &thrift_attention_noncausal_nvfp4_packed,
-          pybind11::arg("q_hi"),
-          pybind11::arg("k_hi"),
-          pybind11::arg("v_hi"),
-          pybind11::arg("selected_blocks"),
-          pybind11::arg("q_packed"),
-          pybind11::arg("k_packed"),
-          pybind11::arg("v_packed_t"),
-          pybind11::arg("q_scale"),
-          pybind11::arg("k_scale"),
-          pybind11::arg("v_scale_t"),
-          pybind11::arg("is_bf16") = false,
-          "ThriftAttention non-causal attention over packed tensors");
-    m.def("thrift_attention_single_query_nvfp4_packed", &thrift_attention_single_query_nvfp4_packed,
-          pybind11::arg("q_hi"),
-          pybind11::arg("k_hi"),
-          pybind11::arg("v_hi"),
-          pybind11::arg("selected_blocks"),
-          pybind11::arg("q_packed"),
-          pybind11::arg("k_packed"),
-          pybind11::arg("v_packed_t"),
-          pybind11::arg("q_scale"),
-          pybind11::arg("k_scale"),
-          pybind11::arg("v_scale_t"),
-          pybind11::arg("is_bf16") = false,
-          "ThriftAttention single-query attention over packed tensors");
-    m.def("thrift_attention_single_query_mxfp4_packed", &thrift_attention_single_query_mxfp4_packed,
-          pybind11::arg("q_hi"),
-          pybind11::arg("k_hi"),
-          pybind11::arg("v_hi"),
-          pybind11::arg("selected_blocks"),
-          pybind11::arg("q_packed"),
-          pybind11::arg("k_packed"),
-          pybind11::arg("v_packed_t"),
-          pybind11::arg("q_scale"),
-          pybind11::arg("k_scale"),
-          pybind11::arg("v_scale_t"),
-          pybind11::arg("is_bf16") = false,
-          "ThriftAttention single-query attention over MXFP4 packed tensors");
-    m.def("thrift_attention_causal_mxfp4_packed", &thrift_attention_causal_mxfp4_packed,
-          pybind11::arg("q_hi"),
-          pybind11::arg("k_hi"),
-          pybind11::arg("v_hi"),
-          pybind11::arg("selected_blocks"),
-          pybind11::arg("q_packed"),
-          pybind11::arg("k_packed"),
-          pybind11::arg("v_packed_t"),
-          pybind11::arg("q_scale"),
-          pybind11::arg("k_scale"),
-          pybind11::arg("v_scale_t"),
-          pybind11::arg("is_bf16") = false,
-          "ThriftAttention causal attention over MXFP4 packed tensors");
-    m.def("thrift_attention_noncausal_mxfp4_packed", &thrift_attention_noncausal_mxfp4_packed,
-          pybind11::arg("q_hi"),
-          pybind11::arg("k_hi"),
-          pybind11::arg("v_hi"),
-          pybind11::arg("selected_blocks"),
-          pybind11::arg("q_packed"),
-          pybind11::arg("k_packed"),
-          pybind11::arg("v_packed_t"),
-          pybind11::arg("q_scale"),
-          pybind11::arg("k_scale"),
-          pybind11::arg("v_scale_t"),
-          pybind11::arg("is_bf16") = false,
-          "ThriftAttention non-causal attention over MXFP4 packed tensors");
-    m.def("nvfp4_quantize", &nvfp4_quantize,
-          pybind11::arg("x"),
-          pybind11::arg("is_bf16") = false,
-          "Quantize contiguous FP16/BF16 tensors to packed NVFP4 with FP8 scales");
-    m.def("nvfp4_quantize_permuted", &nvfp4_quantize_permuted,
-          pybind11::arg("x"),
-          pybind11::arg("is_bf16") = false,
-          "Quantize contiguous FP16/BF16 tensors to packed NVFP4 with Sage-style sequence permutation");
-    m.def("nvfp4_quantize_transposed", &nvfp4_quantize_transposed,
-          pybind11::arg("x"),
-          pybind11::arg("is_bf16") = false,
-          "Quantize contiguous FP16/BF16 tensors to transposed packed NVFP4 with FP8 scales");
-    m.def("nvfp4_quantize_transposed_permuted", &nvfp4_quantize_transposed_permuted,
-          pybind11::arg("x"),
-          pybind11::arg("is_bf16") = false,
-          "Quantize contiguous FP16/BF16 tensors to transposed packed NVFP4 with Sage-style sequence permutation");
-    m.def("mxfp4_quantize", &mxfp4_quantize,
-          pybind11::arg("x"),
-          pybind11::arg("is_bf16") = false,
-          "Quantize contiguous FP16/BF16 tensors to packed MXFP4 with E8M0 scales");
-    m.def("mxfp4_quantize_permuted", &mxfp4_quantize_permuted,
-          pybind11::arg("x"),
-          pybind11::arg("is_bf16") = false,
-          "Quantize contiguous FP16/BF16 tensors to packed MXFP4 with Sage-style sequence permutation");
-    m.def("mxfp4_quantize_transposed", &mxfp4_quantize_transposed,
-          pybind11::arg("x"),
-          pybind11::arg("is_bf16") = false,
-          "Quantize contiguous FP16/BF16 tensors to transposed packed MXFP4 with E8M0 scales");
-    m.def("mxfp4_quantize_transposed_permuted", &mxfp4_quantize_transposed_permuted,
-          pybind11::arg("x"),
-          pybind11::arg("is_bf16") = false,
-          "Quantize contiguous FP16/BF16 tensors to transposed packed MXFP4 with Sage-style sequence permutation");
-    m.def("block_mean_topk", &block_mean_topk_impl,
-          pybind11::arg("q_mean"),
-          pybind11::arg("k_mean"),
-          pybind11::arg("topk_count"),
-          pybind11::arg("causal") = true,
-          pybind11::arg("is_bf16") = false,
-          "Select KV blocks using block-mean QK scores");
-    m.def("quest_block_topk", &quest_block_topk_impl,
-          pybind11::arg("q_mean"),
-          pybind11::arg("k_min"),
-          pybind11::arg("k_max"),
-          pybind11::arg("topk_count"),
-          pybind11::arg("causal") = true,
-          pybind11::arg("is_bf16") = false,
-          "Select KV blocks using QUEST query-aware min/max scores");
-    m.def("single_query_key_mean_topk", &single_query_key_mean_topk_impl,
-          pybind11::arg("q_grouped"),
-          pybind11::arg("k_mean"),
-          pybind11::arg("topk_count"),
-          pybind11::arg("num_kv_blocks"),
-          pybind11::arg("is_bf16") = false,
-          "Select decode KV blocks using grouped single-query block-mean QK scores");
-    m.def("single_query_quest_topk", &single_query_quest_topk_impl,
-          pybind11::arg("q_grouped"),
-          pybind11::arg("k_min"),
-          pybind11::arg("k_max"),
-          pybind11::arg("topk_count"),
-          pybind11::arg("num_kv_blocks"),
-          pybind11::arg("is_bf16") = false,
-          "Select decode KV blocks using grouped single-query QUEST min/max scores");
-    m.def("single_query_key_mean_topk_into", &single_query_key_mean_topk_into_impl,
-          pybind11::arg("q_grouped"),
-          pybind11::arg("k_mean"),
-          pybind11::arg("topk"),
-          pybind11::arg("local_scores"),
-          pybind11::arg("local_indices"),
-          pybind11::arg("done_counts"),
-          pybind11::arg("num_kv_blocks"),
-          pybind11::arg("is_bf16") = false,
-          "Select decode KV blocks into preallocated top-k workspace");
+// ---- TORCH_LIBRARY registration ----
+//
+// Operators are registered under TORCH_EXTENSION_NAME so this single file serves both:
+//   * setup.py pip build (TORCH_EXTENSION_NAME = "_C") -> reached via torch.ops._C.*
+//   * kernel-builder Hub build (name set by kernel-builder) -> reached via the kernel
+//     package's `_ops.ops` namespace.
+
+TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+    ops.def("fp4_attention_causal_nvfp4_packed(Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
+    ops.impl("fp4_attention_causal_nvfp4_packed", c10::kCUDA, &fp4_attention_causal_nvfp4_packed);
+
+    ops.def("fp4_attention_noncausal_nvfp4_packed(Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
+    ops.impl("fp4_attention_noncausal_nvfp4_packed", c10::kCUDA, &fp4_attention_noncausal_nvfp4_packed);
+
+    ops.def("fp4_attention_single_query_nvfp4_packed(Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
+    ops.impl("fp4_attention_single_query_nvfp4_packed", c10::kCUDA, &fp4_attention_single_query_nvfp4_packed);
+
+    ops.def("fp4_attention_causal_mxfp4_packed(Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
+    ops.impl("fp4_attention_causal_mxfp4_packed", c10::kCUDA, &fp4_attention_causal_mxfp4_packed);
+
+    ops.def("fp4_attention_noncausal_mxfp4_packed(Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
+    ops.impl("fp4_attention_noncausal_mxfp4_packed", c10::kCUDA, &fp4_attention_noncausal_mxfp4_packed);
+
+    ops.def("fp4_attention_single_query_mxfp4_packed(Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
+    ops.impl("fp4_attention_single_query_mxfp4_packed", c10::kCUDA, &fp4_attention_single_query_mxfp4_packed);
+
+    ops.def("thrift_attention_causal_nvfp4_packed(Tensor q_hi, Tensor k_hi, Tensor v_hi, Tensor selected_blocks, Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
+    ops.impl("thrift_attention_causal_nvfp4_packed", c10::kCUDA, &thrift_attention_causal_nvfp4_packed);
+
+    ops.def("thrift_attention_noncausal_nvfp4_packed(Tensor q_hi, Tensor k_hi, Tensor v_hi, Tensor selected_blocks, Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
+    ops.impl("thrift_attention_noncausal_nvfp4_packed", c10::kCUDA, &thrift_attention_noncausal_nvfp4_packed);
+
+    ops.def("thrift_attention_single_query_nvfp4_packed(Tensor q_hi, Tensor k_hi, Tensor v_hi, Tensor selected_blocks, Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
+    ops.impl("thrift_attention_single_query_nvfp4_packed", c10::kCUDA, &thrift_attention_single_query_nvfp4_packed);
+
+    ops.def("thrift_attention_causal_mxfp4_packed(Tensor q_hi, Tensor k_hi, Tensor v_hi, Tensor selected_blocks, Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
+    ops.impl("thrift_attention_causal_mxfp4_packed", c10::kCUDA, &thrift_attention_causal_mxfp4_packed);
+
+    ops.def("thrift_attention_noncausal_mxfp4_packed(Tensor q_hi, Tensor k_hi, Tensor v_hi, Tensor selected_blocks, Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
+    ops.impl("thrift_attention_noncausal_mxfp4_packed", c10::kCUDA, &thrift_attention_noncausal_mxfp4_packed);
+
+    ops.def("thrift_attention_single_query_mxfp4_packed(Tensor q_hi, Tensor k_hi, Tensor v_hi, Tensor selected_blocks, Tensor q_packed, Tensor k_packed, Tensor v_packed_t, Tensor q_scale, Tensor k_scale, Tensor v_scale_t, bool is_bf16=False) -> Tensor");
+    ops.impl("thrift_attention_single_query_mxfp4_packed", c10::kCUDA, &thrift_attention_single_query_mxfp4_packed);
+
+    ops.def("nvfp4_quantize(Tensor x, bool is_bf16=False) -> Tensor[]");
+    ops.impl("nvfp4_quantize", c10::kCUDA, &nvfp4_quantize);
+
+    ops.def("nvfp4_quantize_permuted(Tensor x, bool is_bf16=False) -> Tensor[]");
+    ops.impl("nvfp4_quantize_permuted", c10::kCUDA, &nvfp4_quantize_permuted);
+
+    ops.def("nvfp4_quantize_transposed(Tensor x, bool is_bf16=False) -> Tensor[]");
+    ops.impl("nvfp4_quantize_transposed", c10::kCUDA, &nvfp4_quantize_transposed);
+
+    ops.def("nvfp4_quantize_transposed_permuted(Tensor x, bool is_bf16=False) -> Tensor[]");
+    ops.impl("nvfp4_quantize_transposed_permuted", c10::kCUDA, &nvfp4_quantize_transposed_permuted);
+
+    ops.def("mxfp4_quantize(Tensor x, bool is_bf16=False) -> Tensor[]");
+    ops.impl("mxfp4_quantize", c10::kCUDA, &mxfp4_quantize);
+
+    ops.def("mxfp4_quantize_permuted(Tensor x, bool is_bf16=False) -> Tensor[]");
+    ops.impl("mxfp4_quantize_permuted", c10::kCUDA, &mxfp4_quantize_permuted);
+
+    ops.def("mxfp4_quantize_transposed(Tensor x, bool is_bf16=False) -> Tensor[]");
+    ops.impl("mxfp4_quantize_transposed", c10::kCUDA, &mxfp4_quantize_transposed);
+
+    ops.def("mxfp4_quantize_transposed_permuted(Tensor x, bool is_bf16=False) -> Tensor[]");
+    ops.impl("mxfp4_quantize_transposed_permuted", c10::kCUDA, &mxfp4_quantize_transposed_permuted);
+
+    ops.def("block_mean_topk(Tensor q_mean, Tensor k_mean, int topk_count, bool causal=True, bool is_bf16=False) -> Tensor");
+    ops.impl("block_mean_topk", c10::kCUDA, &block_mean_topk_impl);
+
+    ops.def("quest_block_topk(Tensor q_mean, Tensor k_min, Tensor k_max, int topk_count, bool causal=True, bool is_bf16=False) -> Tensor");
+    ops.impl("quest_block_topk", c10::kCUDA, &quest_block_topk_impl);
+
+    ops.def("single_query_key_mean_topk(Tensor q_grouped, Tensor k_mean, int topk_count, int num_kv_blocks, bool is_bf16=False) -> Tensor");
+    ops.impl("single_query_key_mean_topk", c10::kCUDA, &single_query_key_mean_topk_impl);
+
+    ops.def("single_query_quest_topk(Tensor q_grouped, Tensor k_min, Tensor k_max, int topk_count, int num_kv_blocks, bool is_bf16=False) -> Tensor");
+    ops.impl("single_query_quest_topk", c10::kCUDA, &single_query_quest_topk_impl);
+
+    ops.def("single_query_key_mean_topk_into(Tensor q_grouped, Tensor k_mean, Tensor! topk, Tensor! local_scores, Tensor! local_indices, Tensor! done_counts, int num_kv_blocks, bool is_bf16=False) -> Tensor");
+    ops.impl("single_query_key_mean_topk_into", c10::kCUDA, &single_query_key_mean_topk_into_impl);
 }
+
+REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
