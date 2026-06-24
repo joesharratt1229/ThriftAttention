@@ -134,6 +134,59 @@ def test_active_cache_config_overrides_registered_config(monkeypatch):
     assert resolved.top_k == 7
 
 
+def test_cached_decode_local_selection_uses_local_extension(monkeypatch):
+    from thriftattention.integrations import transformers_cache as cache_mod
+
+    calls = []
+
+    class Extension:
+        @staticmethod
+        def single_query_local_topk(q_grouped, selected_count, num_kv_blocks):
+            calls.append((tuple(q_grouped.shape), selected_count, num_kv_blocks))
+            return torch.tensor([[2, 3]], dtype=torch.int32)
+
+    monkeypatch.setattr(cache_mod, "get_extension", lambda: Extension)
+    q_grouped = torch.empty(1, 1, 1, 64)
+    layer = SimpleNamespace(seq_len=256)
+
+    selected = cache_mod._select_cached_decode_blocks(
+        q_grouped,
+        layer,
+        AttentionConfig(selection="local", top_k=2),
+    )
+
+    assert selected.tolist() == [[2, 3]]
+    assert calls == [((1, 1, 1, 64), 2, 4)]
+
+
+def test_cached_prefill_local_selection_uses_local_policy(monkeypatch):
+    from thriftattention.integrations import transformers_cache as cache_mod
+    from thriftattention.selection import local
+
+    calls = []
+
+    class Extension:
+        @staticmethod
+        def local_block_topk(q, num_kv_blocks, selected_count, causal, block_size):
+            calls.append((tuple(q.shape), num_kv_blocks, selected_count, causal, block_size))
+            return torch.tensor([[[0, 1], [1, 2]]], dtype=torch.int32)
+
+    monkeypatch.setattr(local, "check_qkv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(local, "get_extension", lambda: Extension)
+    q = torch.empty(1, 1, 128, 64, dtype=torch.float16)
+    k = torch.empty(1, 1, 256, 64, dtype=torch.float16)
+    layer = SimpleNamespace(key_view=lambda: k)
+
+    selected = cache_mod._select_cached_prefill_blocks(
+        q,
+        layer,
+        AttentionConfig(selection="local", top_k=2),
+    )
+
+    assert selected.tolist() == [[[0, 1], [1, 2]]]
+    assert calls == [((1, 1, 128, 64), 4, 2, True, 64)]
+
+
 def test_cache_crop_zeroes_rounded_physical_tail():
     from thriftattention.integrations.transformers_cache import ThriftAttentionCacheLayer
 

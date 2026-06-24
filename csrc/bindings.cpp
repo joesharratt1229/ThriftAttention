@@ -209,7 +209,7 @@ void single_query_quest_topk(
     int head_dim,
     int topk_count,
     bool is_bf16);
-// Implemented in csrc/cuda/sm120/nvfp4/block_selection.cu.
+// Implemented in csrc/cuda/sm120/shared/block_selection.cu.
 cudaError_t local_block_topk(
     int32_t* topk_out,
     int flat_heads,

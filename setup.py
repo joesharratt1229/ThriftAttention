@@ -101,7 +101,6 @@ def cuda_extension() -> CUDAExtension:
         "csrc/cuda/sm120/nvfp4/thrift_attention.cu",
         "csrc/cuda/sm120/nvfp4/single_query_attention.cu",
         "csrc/cuda/sm120/nvfp4/quantization.cu",
-        "csrc/cuda/sm120/nvfp4/block_selection.cu",
         "csrc/cuda/sm120/mxfp4/fp4_attention.cu",
         "csrc/cuda/sm120/mxfp4/single_query_fp4_attention.cu",
         "csrc/cuda/sm120/mxfp4/thrift_attention.cu",

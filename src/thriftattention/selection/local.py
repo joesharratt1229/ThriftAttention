@@ -64,7 +64,6 @@ def select_local_block_pairs(
     block_size: int = 64,
     is_bf16: bool = False,
 ) -> torch.Tensor:
-    del is_bf16
     check_qkv(q, k, k)
     require_block_aligned("q", q.shape[2], block_size)
     require_block_aligned("k", k.shape[2], block_size)
@@ -78,22 +77,15 @@ def select_local_block_pairs(
         top_k=top_k,
         fraction=fraction,
     )
-    if q.is_cuda and selected_count > 0:
-        return get_extension().local_block_topk(
-            q,
-            num_kv_blocks,
-            selected_count,
-            causal,
-            block_size,
-        )
+    if selected_count == 0:
+        return torch.empty(flat_heads, num_q_blocks, 0, device=q.device, dtype=torch.int32)
 
-    return local_block_indices(
-        flat_heads,
-        num_q_blocks,
+    return get_extension().local_block_topk(
+        q,
         num_kv_blocks,
         selected_count,
-        causal=causal,
-        device=q.device,
+        causal,
+        block_size,
     )
 
 
@@ -106,7 +98,6 @@ def select_local_key_blocks(
     block_size: int = 64,
     is_bf16: bool = False,
 ) -> torch.Tensor:
-    del is_bf16
     check_qkv(q, k, k)
     if q.shape[2] != 1:
         raise ValueError("single-query local selection expects q sequence length 1")
@@ -125,20 +116,14 @@ def select_local_key_blocks(
     kv_heads = k.shape[1]
     groups = q_heads // kv_heads
     flat_heads = batch * kv_heads
+    if selected_count == 0:
+        return torch.empty(flat_heads, 0, device=q.device, dtype=torch.int32)
 
-    if q.is_cuda and selected_count > 0:
-        q_grouped = q.reshape(batch, kv_heads, groups, head_dim).contiguous()
-        return get_extension().single_query_local_topk(
-            q_grouped,
-            selected_count,
-            num_kv_blocks,
-        )
-
-    return local_decode_indices(
-        flat_heads,
-        num_kv_blocks,
+    q_grouped = q.reshape(batch, kv_heads, groups, head_dim).contiguous()
+    return get_extension().single_query_local_topk(
+        q_grouped,
         selected_count,
-        device=q.device,
+        num_kv_blocks,
     )
 
 
