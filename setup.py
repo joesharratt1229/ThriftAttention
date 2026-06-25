@@ -65,6 +65,7 @@ CUDA_ARCHITECTURES = {
     )
 }
 DEFAULT_CUDA_ARCHITECTURE = "sm120"
+CUDA_ARCHITECTURE_ENV = "THRIFTATTENTION_CUDA_ARCH"
 
 
 def _parse_version(value: str, components: int) -> tuple[int, ...]:
@@ -133,7 +134,35 @@ def _check_build_prerequisites(architecture: CudaArchitecture) -> None:
         )
 
 
-CUDA_ARCHITECTURE = CUDA_ARCHITECTURES[DEFAULT_CUDA_ARCHITECTURE]
+def _detect_cuda_architecture_name() -> str:
+    requested = os.environ.get(CUDA_ARCHITECTURE_ENV, "auto").strip().lower()
+    valid_names = ", ".join(["auto", *sorted(CUDA_ARCHITECTURES)])
+
+    if requested in CUDA_ARCHITECTURES:
+        return requested
+    if requested != "auto":
+        raise RuntimeError(
+            f"{CUDA_ARCHITECTURE_ENV} must be one of: {valid_names}; "
+            f"got {requested!r}."
+        )
+
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        if major == 8 and minor in (0, 6):
+            return "sm80"
+        if major == 12:
+            return "sm120"
+        raise RuntimeError(
+            "Could not auto-select ThriftAttention CUDA architecture for "
+            f"visible GPU capability sm{major}{minor}. Set "
+            f"{CUDA_ARCHITECTURE_ENV}=sm80 or sm120 explicitly."
+        )
+
+    return DEFAULT_CUDA_ARCHITECTURE
+
+
+CUDA_ARCHITECTURE_NAME = _detect_cuda_architecture_name()
+CUDA_ARCHITECTURE = CUDA_ARCHITECTURES[CUDA_ARCHITECTURE_NAME]
 _check_build_prerequisites(CUDA_ARCHITECTURE)
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", CUDA_ARCHITECTURE.torch_arch)
 
