@@ -55,10 +55,12 @@ CUDA_ARCHITECTURES = {
         torch_arch="8.0;8.6",
         min_cuda=(12, 8),
         sources=(
-            "csrc/bindings_sm80_debug.cpp",
+            "csrc/bindings_sm80.cpp",
             # "csrc/cuda/sm80/shared/block_selection.cu",
             "csrc/cuda/sm80/shared/mma_test.cu",
             "csrc/cuda/sm80/int8/int8_attention.cu",
+            "csrc/cuda/sm80/int4/int4_attention.cu",
+            "csrc/cuda/sm80/int4/quantization.cu",
         )
     )
 }

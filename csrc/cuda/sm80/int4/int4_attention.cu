@@ -8,30 +8,32 @@
 
 #define FULL_MASK 0xffffffff
 
-__device__ inline uint32_t pack4_s8_attention(int8_t x0, int8_t x1, int8_t x2, int8_t x3) {
-    return static_cast<uint32_t>(static_cast<uint8_t>(x0)) |
-           (static_cast<uint32_t>(static_cast<uint8_t>(x1)) << 8) |
-           (static_cast<uint32_t>(static_cast<uint8_t>(x2)) << 16) |
-           (static_cast<uint32_t>(static_cast<uint8_t>(x3)) << 24);
-}
-
 template <typename T>
-__device__ inline T int8_attention_from_float(float value);
+__device__ inline T int4_attention_from_float(float value);
 
 template <>
-__device__ inline half int8_attention_from_float<half>(float value) {
+__device__ inline half int4_attention_from_float<half>(float value) {
     return __float2half(value);
 }
 
 template <>
-__device__ inline __nv_bfloat16 int8_attention_from_float<__nv_bfloat16>(float value) {
+__device__ inline __nv_bfloat16 int4_attention_from_float<__nv_bfloat16>(float value) {
     return __float2bfloat16(value);
 }
 
-template <int HEAD_DIM, int SCALE_DIM, int BLOCK_Q, int KV_CHUNK>
-__device__ void compute_int8_scores_mma_tile(
-    const int8_t* q_chunk,
-    const int8_t* k_chunk,
+__device__ inline int8_t unpack_s4(uint8_t packed, int index) {
+    const int nibble = (packed >> (4 * index)) & 0xf;
+    return static_cast<int8_t>(nibble >= 8 ? nibble - 16 : nibble);
+}
+
+__device__ inline uint32_t load_packed_s4x8(const uint8_t* ptr) {
+    return *reinterpret_cast<const uint32_t*>(ptr);
+}
+
+template <int HEAD_DIM, int SCALE_DIM, int KV_CHUNK>
+__device__ void compute_int4_scores_mma_tile(
+    const uint8_t* q_chunk,
+    const uint8_t* k_chunk,
     const float* sq_chunk,
     const float* sk_chunk,
     float* scores,
@@ -42,6 +44,8 @@ __device__ void compute_int8_scores_mma_tile(
     int kv_len,
     bool causal)
 {
+    constexpr int HEAD_DIM_2 = HEAD_DIM / 2;
+
     const int lane = threadIdx.x;
     const int tid4 = lane & 3;
     const int groupID = lane >> 2;
@@ -57,45 +61,21 @@ __device__ void compute_int8_scores_mma_tile(
 
     #pragma unroll
     for (int group = 0; group < SCALE_DIM; group++) {
-        const int head_offset = group * 32;
+        const int byte_offset = group * 32;
         uint32_t a_frag[4];
         uint32_t b_frag[2];
         int32_t acc[4] = {0, 0, 0, 0};
 
-        a_frag[0] = pack4_s8_attention(
-            q_chunk[row0 * HEAD_DIM + head_offset + tid4 * 4 + 0],
-            q_chunk[row0 * HEAD_DIM + head_offset + tid4 * 4 + 1],
-            q_chunk[row0 * HEAD_DIM + head_offset + tid4 * 4 + 2],
-            q_chunk[row0 * HEAD_DIM + head_offset + tid4 * 4 + 3]);
-        a_frag[1] = pack4_s8_attention(
-            q_chunk[row1 * HEAD_DIM + head_offset + tid4 * 4 + 0],
-            q_chunk[row1 * HEAD_DIM + head_offset + tid4 * 4 + 1],
-            q_chunk[row1 * HEAD_DIM + head_offset + tid4 * 4 + 2],
-            q_chunk[row1 * HEAD_DIM + head_offset + tid4 * 4 + 3]);
-        a_frag[2] = pack4_s8_attention(
-            q_chunk[row0 * HEAD_DIM + head_offset + 16 + tid4 * 4 + 0],
-            q_chunk[row0 * HEAD_DIM + head_offset + 16 + tid4 * 4 + 1],
-            q_chunk[row0 * HEAD_DIM + head_offset + 16 + tid4 * 4 + 2],
-            q_chunk[row0 * HEAD_DIM + head_offset + 16 + tid4 * 4 + 3]);
-        a_frag[3] = pack4_s8_attention(
-            q_chunk[row1 * HEAD_DIM + head_offset + 16 + tid4 * 4 + 0],
-            q_chunk[row1 * HEAD_DIM + head_offset + 16 + tid4 * 4 + 1],
-            q_chunk[row1 * HEAD_DIM + head_offset + 16 + tid4 * 4 + 2],
-            q_chunk[row1 * HEAD_DIM + head_offset + 16 + tid4 * 4 + 3]);
+        a_frag[0] = load_packed_s4x8(q_chunk + row0 * HEAD_DIM_2 + byte_offset + tid4 * 4);
+        a_frag[1] = load_packed_s4x8(q_chunk + row1 * HEAD_DIM_2 + byte_offset + tid4 * 4);
+        a_frag[2] = load_packed_s4x8(q_chunk + row0 * HEAD_DIM_2 + byte_offset + 16 + tid4 * 4);
+        a_frag[3] = load_packed_s4x8(q_chunk + row1 * HEAD_DIM_2 + byte_offset + 16 + tid4 * 4);
 
         const int k_row = kv_tile + groupID;
-        b_frag[0] = pack4_s8_attention(
-            k_chunk[k_row * HEAD_DIM + head_offset + tid4 * 4 + 0],
-            k_chunk[k_row * HEAD_DIM + head_offset + tid4 * 4 + 1],
-            k_chunk[k_row * HEAD_DIM + head_offset + tid4 * 4 + 2],
-            k_chunk[k_row * HEAD_DIM + head_offset + tid4 * 4 + 3]);
-        b_frag[1] = pack4_s8_attention(
-            k_chunk[k_row * HEAD_DIM + head_offset + 16 + tid4 * 4 + 0],
-            k_chunk[k_row * HEAD_DIM + head_offset + 16 + tid4 * 4 + 1],
-            k_chunk[k_row * HEAD_DIM + head_offset + 16 + tid4 * 4 + 2],
-            k_chunk[k_row * HEAD_DIM + head_offset + 16 + tid4 * 4 + 3]);
+        b_frag[0] = load_packed_s4x8(k_chunk + k_row * HEAD_DIM_2 + byte_offset + tid4 * 4);
+        b_frag[1] = load_packed_s4x8(k_chunk + k_row * HEAD_DIM_2 + byte_offset + 16 + tid4 * 4);
 
-        ta_mma_m16n8k32_s8(a_frag, b_frag, acc);
+        ta_mma_m16n8k64_s4(a_frag, b_frag, acc);
 
         score0 += static_cast<float>(acc[0]) * sq_chunk[row0 * SCALE_DIM + group] * sk_chunk[(kv_tile + col0) * SCALE_DIM + group];
         score1 += static_cast<float>(acc[1]) * sq_chunk[row0 * SCALE_DIM + group] * sk_chunk[(kv_tile + col1) * SCALE_DIM + group];
@@ -121,10 +101,10 @@ __device__ void compute_int8_scores_mma_tile(
 }
 
 template <typename T, bool CAUSAL, int HEAD_DIM, int SCALE_DIM, int BLOCK_Q>
-__global__ void int8_attention_kernel_mma_qk(
-    const int8_t* Q,
-    const int8_t* K,
-    const int8_t* V,
+__global__ void int4_attention_kernel_mma_qk(
+    const uint8_t* Q,
+    const uint8_t* K,
+    const uint8_t* V,
     const float* S_Q,
     const float* S_K,
     const float* S_V,
@@ -134,8 +114,9 @@ __global__ void int8_attention_kernel_mma_qk(
     int kv_len,
     int kv_capacity,
     int num_q_heads,
-    int num_kv_heads
-) {
+    int num_kv_heads)
+{
+    constexpr int HEAD_DIM_2 = HEAD_DIM / 2;
     constexpr int KV_CHUNK = 64;
 
     const int tid = threadIdx.x;
@@ -149,11 +130,11 @@ __global__ void int8_attention_kernel_mma_qk(
     const int q_block_start = q_block_idx * BLOCK_Q;
     const int out_d = tid;
     const bool has_output = out_d < HEAD_DIM;
-    const int v_group = out_d / 32;
+    const int v_group = out_d / 64;
 
-    __shared__ int8_t q_chunk[BLOCK_Q][HEAD_DIM];
-    __shared__ int8_t k_chunk[KV_CHUNK][HEAD_DIM];
-    __shared__ int8_t v_chunk[KV_CHUNK][HEAD_DIM];
+    __shared__ uint8_t q_chunk[BLOCK_Q][HEAD_DIM_2];
+    __shared__ uint8_t k_chunk[KV_CHUNK][HEAD_DIM_2];
+    __shared__ uint8_t v_chunk[KV_CHUNK][HEAD_DIM_2];
     __shared__ float sq_chunk[BLOCK_Q][SCALE_DIM];
     __shared__ float sk_chunk[KV_CHUNK][SCALE_DIM];
     __shared__ float sv_chunk[KV_CHUNK][SCALE_DIM];
@@ -171,12 +152,12 @@ __global__ void int8_attention_kernel_mma_qk(
         running_acc[q_i] = 0.0f;
     }
 
-    for (int idx = tid; idx < BLOCK_Q * HEAD_DIM; idx += blockDim.x) {
-        const int q_i = idx / HEAD_DIM;
-        const int d = idx % HEAD_DIM;
+    for (int idx = tid; idx < BLOCK_Q * HEAD_DIM_2; idx += blockDim.x) {
+        const int q_i = idx / HEAD_DIM_2;
+        const int d = idx % HEAD_DIM_2;
         const int q_token = q_block_start + q_i;
         if (q_token < q_len) {
-            const int src = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM + d;
+            const int src = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM_2 + d;
             q_chunk[q_i][d] = Q[src];
         } else {
             q_chunk[q_i][d] = 0;
@@ -204,12 +185,12 @@ __global__ void int8_attention_kernel_mma_qk(
             }
         }
 
-        for (int idx = tid; idx < KV_CHUNK * HEAD_DIM; idx += blockDim.x) {
-            const int local_token = idx / HEAD_DIM;
-            const int d = idx % HEAD_DIM;
+        for (int idx = tid; idx < KV_CHUNK * HEAD_DIM_2; idx += blockDim.x) {
+            const int local_token = idx / HEAD_DIM_2;
+            const int d = idx % HEAD_DIM_2;
             const int kv_token = kv_start + local_token;
             if (kv_token < kv_len) {
-                const int src = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * HEAD_DIM + d;
+                const int src = ((batch * kv_capacity + kv_token) * num_kv_heads + kv_head) * HEAD_DIM_2 + d;
                 k_chunk[local_token][d] = K[src];
                 v_chunk[local_token][d] = V[src];
             } else {
@@ -237,7 +218,7 @@ __global__ void int8_attention_kernel_mma_qk(
         if (tid < 32) {
             #pragma unroll
             for (int kv_tile = 0; kv_tile < KV_CHUNK; kv_tile += 8) {
-                compute_int8_scores_mma_tile<HEAD_DIM, SCALE_DIM, BLOCK_Q, KV_CHUNK>(
+                compute_int4_scores_mma_tile<HEAD_DIM, SCALE_DIM, KV_CHUNK>(
                     &q_chunk[0][0], &k_chunk[0][0], &sq_chunk[0][0], &sk_chunk[0][0],
                     &scores[0][0], kv_tile, q_block_start, q_len, kv_start, kv_len, CAUSAL);
             }
@@ -313,7 +294,8 @@ __global__ void int8_attention_kernel_mma_qk(
                         continue;
                     }
                     const float weight = expf(score - chunk_max);
-                    const float v_real = static_cast<float>(v_chunk[local_token][out_d]) * sv_chunk[local_token][v_group];
+                    const uint8_t packed_v = v_chunk[local_token][out_d / 2];
+                    const float v_real = static_cast<float>(unpack_s4(packed_v, out_d & 1)) * sv_chunk[local_token][v_group];
                     chunk_acc += weight * v_real;
                 }
             }
@@ -342,24 +324,24 @@ __global__ void int8_attention_kernel_mma_qk(
         const int q_token = q_block_start + q_i;
         const int o_offset = ((batch * q_len + q_token) * num_q_heads + q_head) * HEAD_DIM;
         if (q_token < q_len && has_output) {
-            O[o_offset + out_d] = int8_attention_from_float<T>(running_acc[q_i] / running_denom[q_i]);
+            O[o_offset + out_d] = int4_attention_from_float<T>(running_acc[q_i] / running_denom[q_i]);
         }
     }
 }
 
 template <typename T, bool CAUSAL, int HEAD_DIM>
-static void launch_int8_attention(
-    const int8_t *Q, const int8_t *K, const int8_t *V,
+static void launch_int4_attention(
+    const uint8_t *Q, const uint8_t *K, const uint8_t *V,
     const float *S_Q, const float *S_K, const float *S_V,
     T *O, int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads)
 {
-    constexpr int SCALE_DIM = HEAD_DIM / 32;
+    constexpr int SCALE_DIM = HEAD_DIM / 64;
     constexpr int BLOCK_Q = 16;
 
     const int q_blocks = ta_cdiv(q_len, BLOCK_Q);
     const int num_blocks = bs * num_q_heads * q_blocks;
-    auto kernel = int8_attention_kernel_mma_qk<T, CAUSAL, HEAD_DIM, SCALE_DIM, BLOCK_Q>;
+    auto kernel = int4_attention_kernel_mma_qk<T, CAUSAL, HEAD_DIM, SCALE_DIM, BLOCK_Q>;
 
     kernel<<<num_blocks, 128>>>(
         Q, K, V, S_Q, S_K, S_V, O,
@@ -367,10 +349,10 @@ static void launch_int8_attention(
 }
 
 template <typename T, bool CAUSAL>
-static void dispatch_int8_attention(
-    const int8_t *Q,
-    const int8_t *K,
-    const int8_t *V,
+static void dispatch_int4_attention(
+    const uint8_t *Q,
+    const uint8_t *K,
+    const uint8_t *V,
     const float *S_Q,
     const float *S_K,
     const float *S_V,
@@ -383,26 +365,21 @@ static void dispatch_int8_attention(
     int num_kv_heads,
     int head_dim)
 {
-    if (head_dim == 64)
-    {
-        launch_int8_attention<T, CAUSAL, 64>(
+    if (head_dim == 64) {
+        launch_int4_attention<T, CAUSAL, 64>(
             Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
             kv_capacity, num_q_heads, num_kv_heads);
-    }
-    else if (head_dim == 128)
-    {
-        launch_int8_attention<T, CAUSAL, 128>(
+    } else if (head_dim == 128) {
+        launch_int4_attention<T, CAUSAL, 128>(
             Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
             kv_capacity, num_q_heads, num_kv_heads);
-    }
-    else
-    {
-        fprintf(stderr, "int8_attention: unsupported head_dim=%d\n", head_dim);
+    } else {
+        fprintf(stderr, "int4_attention: unsupported head_dim=%d\n", head_dim);
     }
 }
 
 template <typename T, bool CAUSAL>
-static void int8_attention_typed(
+static void int4_attention_typed(
     const void *Q_raw,
     const void *K_raw,
     const void *V_raw,
@@ -418,20 +395,20 @@ static void int8_attention_typed(
     int num_kv_heads,
     int head_dim)
 {
-    auto Q = reinterpret_cast<const int8_t *>(Q_raw);
-    auto K = reinterpret_cast<const int8_t *>(K_raw);
-    auto V = reinterpret_cast<const int8_t *>(V_raw);
+    auto Q = reinterpret_cast<const uint8_t *>(Q_raw);
+    auto K = reinterpret_cast<const uint8_t *>(K_raw);
+    auto V = reinterpret_cast<const uint8_t *>(V_raw);
     auto S_Q = reinterpret_cast<const float*>(S_Q_raw);
     auto S_K = reinterpret_cast<const float*>(S_K_raw);
     auto S_V = reinterpret_cast<const float*>(S_V_raw);
     auto O = reinterpret_cast<T*>(O_raw);
 
-    dispatch_int8_attention<T, CAUSAL>(
+    dispatch_int4_attention<T, CAUSAL>(
         Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
         kv_capacity, num_q_heads, num_kv_heads, head_dim);
 }
 
-void int8_attention_noncausal(
+void int4_attention_noncausal(
     const void *Q_raw,
     const void *K_raw,
     const void *V_raw,
@@ -448,21 +425,18 @@ void int8_attention_noncausal(
     int head_dim,
     bool is_bf16)
 {
-    if (is_bf16)
-    {
-        int8_attention_typed<__nv_bfloat16, false>(
+    if (is_bf16) {
+        int4_attention_typed<__nv_bfloat16, false>(
             Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
             bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
-    }
-    else
-    {
-        int8_attention_typed<half, false>(
+    } else {
+        int4_attention_typed<half, false>(
             Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
             bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
     }
 }
 
-void int8_attention_causal(
+void int4_attention_causal(
     const void *Q_raw,
     const void *K_raw,
     const void *V_raw,
@@ -479,15 +453,12 @@ void int8_attention_causal(
     int head_dim,
     bool is_bf16)
 {
-    if (is_bf16)
-    {
-        int8_attention_typed<__nv_bfloat16, true>(
+    if (is_bf16) {
+        int4_attention_typed<__nv_bfloat16, true>(
             Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
             bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
-    }
-    else
-    {
-        int8_attention_typed<half, true>(
+    } else {
+        int4_attention_typed<half, true>(
             Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
             bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
     }

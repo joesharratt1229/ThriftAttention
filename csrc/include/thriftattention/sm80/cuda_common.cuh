@@ -26,6 +26,22 @@ __device__ inline void ta_mma_m16n8k32_s8(
           "r"(b[0]), "r"(b[1]));
 }
 
+
+__device__ inline void ta_mma_m16n8k64_s4(
+    const uint32_t (&a)[4],
+    const uint32_t (&b)[2],
+    int32_t (&acc)[4]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%0, %1, %2, %3};"
+        : "+r"(acc[0]), "+r"(acc[1]), "+r"(acc[2]), "+r"(acc[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]));
+}
+
 __host__ __device__ inline int ta_sage_perm32(int x) {
     return (x / 8) * 2 + ((x % 8) / 2) * 8 + (x % 2);
 }
