@@ -64,7 +64,7 @@ CUDA_ARCHITECTURES = {
         )
     )
 }
-DEFAULT_CUDA_ARCHITECTURE = "sm80"
+DEFAULT_CUDA_ARCHITECTURE = "sm120"
 
 
 def _parse_version(value: str, components: int) -> tuple[int, ...]:
