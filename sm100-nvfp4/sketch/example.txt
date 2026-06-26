@@ -1,0 +1,42 @@
+MMA
+
+Q_STAGES = 2 (number of issuing threads)
+
+//mbar addresses defined externally
+producer_q[Q_STAGES]; //count 1
+release_q[Q_STAGES]; // count 1
+producer_kv[NUM_SLOTS]; //count 1
+release_kv[NUM_SLOTS]; //count 1
+s_full[Q_STAGES] // count 1
+p_o_ready[Q_STAGES] // count 256
+o_full[Q_STAGES] // count 1
+
+
+//mma loop/warp
+tcgen.try_wait(producer_q, phase ^ 1)
+
+
+For (iter = 0; iter < total_kv_iters; iter ++)
+	//elect sync
+
+	tcgen.try_wait(producer_kv, phase) //obtain k
+	for stage in Q_STAGES
+		// implement Q @ K.t mma 
+		tcgen.commit(s_full)
+	
+	tcgen.commit(release_kv) //release k
+	tcgen.try_wait(V, phase) // load v
+	
+	for stage in Q_STAGES
+		tcgen.try_wait(p_o_ready, phase)
+		// implement P @ V
+
+       tcgen.commit(release_kv) //release k
+
+For (stage in Q_STAGES):
+	 tcgen.commit(o_full)
+		
+
+
+
+
