@@ -139,13 +139,9 @@ def test_tiled_nvfp4_hd256_noncausal_matches_sdpa(dtype: torch.dtype, kv_len: in
 	k = (torch.randn(batch, kv_heads, seq_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
 	v = (torch.randn(batch, kv_heads, seq_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
 
-	# Non-causal: K is quantized without sequence permutation (permute_k=False), matching
-	# what the noncausal kernel expects — the permuted variant is only used for causal prefill.
 	packed = _nvfp4_quantize_qkv(q, k, v, is_bf16=is_bf16, permute_k=False)
 	fp4_out = _C.fp4_attention_noncausal_nvfp4_packed(*packed, is_bf16)
 
-	# ThriftAttention noncausal: pass every KV block as selected so the output equals
-	# a full-attention noncausal run, giving us a meaningful correctness check.
 	num_q_blocks = seq_len // 128
 	num_kv_blocks = seq_len // 128
 	selected = (
@@ -268,3 +264,40 @@ def test_tiled_mxfp4_hd256_matches_sdpa(dtype: torch.dtype, kv_len: int) -> None
 	assert _cosine(fp4_out, ref) > 0.95
 	assert _cosine(thrift_out, ref) > 0.95
 
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("kv_len", CONTEXT_LENGTHS)
+def test_tiled_mxfp4_hd256_noncausal_matches_sdpa(dtype: torch.dtype, kv_len: int) -> None:
+	_requires_sm120_cuda()
+	torch.manual_seed(21)
+	device = torch.device("cuda")
+	is_bf16 = dtype == torch.bfloat16
+	batch, q_heads, kv_heads, seq_len, head_dim = 1, 2, 1, kv_len, 256
+	groups = q_heads // kv_heads
+
+	q = (torch.randn(batch, q_heads, seq_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
+	k = (torch.randn(batch, kv_heads, seq_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
+	v = (torch.randn(batch, kv_heads, seq_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
+
+	packed = _mxfp4_quantize_qkv(q, k, v, is_bf16=is_bf16, permute_k=False)
+	fp4_out = _C.fp4_attention_noncausal_mxfp4_packed(*packed, is_bf16)
+
+	num_q_blocks = seq_len // 128
+	num_kv_blocks = seq_len // 128
+	selected = (
+		torch.arange(num_kv_blocks, device=device, dtype=torch.int32)
+		.view(1, 1, num_kv_blocks)
+		.expand(batch * q_heads, num_q_blocks, num_kv_blocks)
+		.contiguous()
+	)
+	thrift_out = _C.thrift_attention_noncausal_mxfp4_packed(q, k, v, selected, *packed, is_bf16)
+
+	k_ref = k.repeat_interleave(groups, dim=1)
+	v_ref = v.repeat_interleave(groups, dim=1)
+	ref = F.scaled_dot_product_attention(q.float(), k_ref.float(), v_ref.float(), is_causal=False)
+
+	torch.cuda.synchronize()
+	assert fp4_out.dtype == dtype
+	assert thrift_out.dtype == dtype
+	assert _cosine(fp4_out, ref) > 0.95, f"fp4_noncausal cosine={_cosine(fp4_out, ref):.4f}"
+	assert _cosine(thrift_out, ref) > 0.925, f"thrift_noncausal cosine={_cosine(thrift_out, ref):.4f}"

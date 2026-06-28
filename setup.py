@@ -126,7 +126,6 @@ def cuda_extension() -> CUDAExtension:
                 "-O3",
                 "-use_fast_math",
                 "--ptxas-options=--gpu-name=sm_120a",
-                "-lineinfo",
             ],
         },
     )
