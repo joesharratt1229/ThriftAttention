@@ -29,8 +29,8 @@ class Sm120Nvfp4Backend:
         is_bf16: bool,
     ) -> torch.Tensor:
         check_qkv(q, k, v)
-        if config.block_size != 64:
-            raise NotImplementedError("the current SM120 attention kernels use 64-token KV blocks")
+        if config.block_size not in (64, 128):
+            raise NotImplementedError("the current SM120 attention kernels use 64 or 128-token KV blocks")
         if quant_format.name not in ("nvfp4", "mxfp4"):
             raise NotImplementedError(f"SM120 backend does not support quant format {quant_format.name!r}")
 
@@ -93,8 +93,10 @@ class Sm120Nvfp4Backend:
         config: AttentionConfig,
         is_bf16: bool,
     ) -> torch.Tensor:
-        require_block_aligned("q", q.shape[2], 64)
-        require_block_aligned("k", k.shape[2], config.block_size)
+        block_q = 128 if q.shape[3] == 256 else 64
+        block_kv = 128 if q.shape[3] == 256 else config.block_size
+        require_block_aligned("q", q.shape[2], block_q)
+        require_block_aligned("k", k.shape[2], block_kv)
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()

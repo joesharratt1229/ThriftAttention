@@ -62,6 +62,17 @@ void fp4_attention_noncausal_nvfp4(
     const void* S_Q, const void* S_K, const void* S_V,
     void* O, int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
+// Implemented in csrc/cuda/sm120/nvfp4/hd256_fp4_attention.cu.
+void fp4_attention_causal_nvfp4_hd256(
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
+void fp4_attention_noncausal_nvfp4_hd256(
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
 // Implemented in csrc/cuda/sm120/mxfp4/fp4_attention.cu.
 void fp4_attention_causal_mxfp4(
     const void* Q, const void* K, const void* V,
@@ -73,6 +84,17 @@ void fp4_attention_noncausal_mxfp4(
     const void* S_Q, const void* S_K, const void* S_V,
     void* O, int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
+// Implemented in csrc/cuda/sm120/mxfp4/hd256_fp4_attention.cu.
+void fp4_attention_causal_mxfp4_hd256(
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
+void fp4_attention_noncausal_mxfp4_hd256(
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
 // Implemented in csrc/cuda/sm120/nvfp4/single_query_fp4_attention.cu.
 void fp4_attention_single_query_nvfp4(
     const void* Q, const void* K, const void* V,
@@ -80,8 +102,22 @@ void fp4_attention_single_query_nvfp4(
     void* O, void* workspace,
     int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
+// Implemented in csrc/cuda/sm120/nvfp4/hd256_single_query_fp4_attention.cu.
+void fp4_attention_single_query_nvfp4_hd256(
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, void* workspace,
+    int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
 // Implemented in csrc/cuda/sm120/mxfp4/single_query_fp4_attention.cu.
 void fp4_attention_single_query_mxfp4(
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, void* workspace,
+    int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
+// Implemented in csrc/cuda/sm120/mxfp4/hd256_single_query_fp4_attention.cu.
+void fp4_attention_single_query_mxfp4_hd256(
     const void* Q, const void* K, const void* V,
     const void* S_Q, const void* S_K, const void* S_V,
     void* O, void* workspace,
@@ -99,6 +135,25 @@ void thrift_attention_causal_nvfp4(
     int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
 void thrift_attention_noncausal_nvfp4(
+    const void* Q_fp16, const void* K_fp16, const void* V_fp16,
+    const void* selected_blocks, int topk_count,
+    const void* topk_mask, int topk_word_count,
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, void* rowmax_state, void* rowsum_state,
+    int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
+// Implemented in csrc/cuda/sm120/nvfp4/hd256_thrift_attention.cu.
+void thrift_attention_causal_nvfp4_hd256(
+    const void* Q_fp16, const void* K_fp16, const void* V_fp16,
+    const void* selected_blocks, int topk_count,
+    const void* topk_mask, int topk_word_count,
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, void* rowmax_state, void* rowsum_state,
+    int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
+void thrift_attention_noncausal_nvfp4_hd256(
     const void* Q_fp16, const void* K_fp16, const void* V_fp16,
     const void* selected_blocks, int topk_count,
     const void* topk_mask, int topk_word_count,
@@ -126,6 +181,25 @@ void thrift_attention_noncausal_mxfp4(
     void* O, void* rowmax_state, void* rowsum_state,
     int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
+// Implemented in csrc/cuda/sm120/mxfp4/hd256_thrift_attention.cu.
+void thrift_attention_causal_mxfp4_hd256(
+    const void* Q_fp16, const void* K_fp16, const void* V_fp16,
+    const void* selected_blocks, int topk_count,
+    const void* topk_mask, int topk_word_count,
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, void* rowmax_state, void* rowsum_state,
+    int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
+void thrift_attention_noncausal_mxfp4_hd256(
+    const void* Q_fp16, const void* K_fp16, const void* V_fp16,
+    const void* selected_blocks, int topk_count,
+    const void* topk_mask, int topk_word_count,
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, void* rowmax_state, void* rowsum_state,
+    int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
 // Implemented in csrc/cuda/sm120/nvfp4/single_query_attention.cu.
 void thrift_attention_single_query_nvfp4(
     const void* Q_fp16, const void* K_fp16, const void* V_fp16,
@@ -135,8 +209,26 @@ void thrift_attention_single_query_nvfp4(
     void* O, void* workspace,
     int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
+// Implemented in csrc/cuda/sm120/nvfp4/hd256_single_query_attention.cu.
+void thrift_attention_single_query_nvfp4_hd256(
+    const void* Q_fp16, const void* K_fp16, const void* V_fp16,
+    const int32_t* selected_blocks, int topk_count,
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, void* workspace,
+    int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
 // Implemented in csrc/cuda/sm120/mxfp4/single_query_attention.cu.
 void thrift_attention_single_query_mxfp4(
+    const void* Q_fp16, const void* K_fp16, const void* V_fp16,
+    const int32_t* selected_blocks, int topk_count,
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    void* O, void* workspace,
+    int bs, int q_len, int kv_len, int kv_capacity,
+    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
+// Implemented in csrc/cuda/sm120/mxfp4/hd256_single_query_attention.cu.
+void thrift_attention_single_query_mxfp4_hd256(
     const void* Q_fp16, const void* K_fp16, const void* V_fp16,
     const int32_t* selected_blocks, int topk_count,
     const void* Q, const void* K, const void* V,
@@ -256,13 +348,19 @@ static at::Tensor fp4_attention_nvfp4_packed(
         at::TensorOptions().dtype(out_dtype).device(q_packed.device()));
 
     if (causal) {
-        fp4_attention_causal_nvfp4(
+        auto kernel = (head_dim == 256)
+            ? fp4_attention_causal_nvfp4_hd256
+            : fp4_attention_causal_nvfp4;
+        kernel(
             q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
             q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
             out.data_ptr(), flat_q_heads, q_len, kv_len, kv_capacity,
             num_q_heads, num_kv_heads, head_dim, is_bf16);
     } else {
-        fp4_attention_noncausal_nvfp4(
+        auto kernel = (head_dim == 256)
+            ? fp4_attention_noncausal_nvfp4_hd256
+            : fp4_attention_noncausal_nvfp4;
+        kernel(
             q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
             q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
             out.data_ptr(), flat_q_heads, q_len, kv_len, kv_capacity,
@@ -321,13 +419,19 @@ static at::Tensor fp4_attention_mxfp4_packed(
         at::TensorOptions().dtype(out_dtype).device(q_packed.device()));
 
     if (causal) {
-        fp4_attention_causal_mxfp4(
+        auto kernel = (head_dim == 256)
+            ? fp4_attention_causal_mxfp4_hd256
+            : fp4_attention_causal_mxfp4;
+        kernel(
             q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
             q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
             out.data_ptr(), flat_q_heads, q_len, kv_len, kv_capacity,
             num_q_heads, num_kv_heads, head_dim, is_bf16);
     } else {
-        fp4_attention_noncausal_mxfp4(
+        auto kernel = (head_dim == 256)
+            ? fp4_attention_noncausal_mxfp4_hd256
+            : fp4_attention_noncausal_mxfp4;
+        kernel(
             q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
             q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
             out.data_ptr(), flat_q_heads, q_len, kv_len, kv_capacity,
@@ -392,12 +496,21 @@ static at::Tensor fp4_attention_single_query_nvfp4_packed(
     const bool use_split = total_kv_blocks >= 128;
 
     auto dispatch = [&](void* workspace) {
-        fp4_attention_single_query_nvfp4(
-            q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
-            q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
-            out.data_ptr(), workspace,
-            flat_q_heads, q_len, kv_len, kv_capacity,
-            num_q_heads, num_kv_heads, head_dim, is_bf16);
+        if (head_dim == 256) {
+            fp4_attention_single_query_nvfp4_hd256(
+                q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+                q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+                out.data_ptr(), workspace,
+                flat_q_heads, q_len, kv_len, kv_capacity,
+                num_q_heads, num_kv_heads, head_dim, is_bf16);
+        } else {
+            fp4_attention_single_query_nvfp4(
+                q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+                q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+                out.data_ptr(), workspace,
+                flat_q_heads, q_len, kv_len, kv_capacity,
+                num_q_heads, num_kv_heads, head_dim, is_bf16);
+        }
     };
 
     if (!use_split) {
@@ -446,12 +559,21 @@ static at::Tensor fp4_attention_single_query_mxfp4_packed(
     const bool use_split = total_kv_blocks >= 128;
 
     auto dispatch = [&](void* workspace) {
-        fp4_attention_single_query_mxfp4(
-            q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
-            q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
-            out.data_ptr(), workspace,
-            flat_q_heads, q_len, kv_len, kv_capacity,
-            num_q_heads, num_kv_heads, head_dim, is_bf16);
+        if (head_dim == 256) {
+            fp4_attention_single_query_mxfp4_hd256(
+                q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+                q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+                out.data_ptr(), workspace,
+                flat_q_heads, q_len, kv_len, kv_capacity,
+                num_q_heads, num_kv_heads, head_dim, is_bf16);
+        } else {
+            fp4_attention_single_query_mxfp4(
+                q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+                q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+                out.data_ptr(), workspace,
+                flat_q_heads, q_len, kv_len, kv_capacity,
+                num_q_heads, num_kv_heads, head_dim, is_bf16);
+        }
     };
 
     if (!use_split) {
@@ -497,7 +619,7 @@ static at::Tensor thrift_attention_nvfp4_packed(
     const int q_len = q_packed.size(2);
     const int kv_len = k_packed.size(2);
     const int head_dim = q_packed.size(3) * 2;
-    constexpr int block_q = 64;
+    const int block_q = (head_dim == 256) ? 128 : 64;
     const int num_q_blocks = (q_len + block_q - 1) / block_q;
     const int topk_count = selected_blocks.size(2);
     const int kv_capacity = static_cast<int>(k_packed.stride(1)) / (head_dim / 2);
@@ -533,7 +655,10 @@ static at::Tensor thrift_attention_nvfp4_packed(
     at::Tensor rowsum_state = at::empty({batch, num_q_heads, q_len}, state_opts);
 
     if (causal) {
-        thrift_attention_causal_nvfp4(
+        auto kernel = (head_dim == 256)
+            ? thrift_attention_causal_nvfp4_hd256
+            : thrift_attention_causal_nvfp4;
+        kernel(
             q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
             selected_blocks.data_ptr(), topk_count,
             topk_mask.data_ptr(), topk_word_count,
@@ -543,7 +668,10 @@ static at::Tensor thrift_attention_nvfp4_packed(
             flat_q_heads, q_len, kv_len, kv_capacity,
             num_q_heads, num_kv_heads, head_dim, is_bf16);
     } else {
-        thrift_attention_noncausal_nvfp4(
+        auto kernel = (head_dim == 256)
+            ? thrift_attention_noncausal_nvfp4_hd256
+            : thrift_attention_noncausal_nvfp4;
+        kernel(
             q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
             selected_blocks.data_ptr(), topk_count,
             topk_mask.data_ptr(), topk_word_count,
@@ -619,7 +747,7 @@ static at::Tensor thrift_attention_mxfp4_packed(
     const int q_len = q_packed.size(2);
     const int kv_len = k_packed.size(2);
     const int head_dim = q_packed.size(3) * 2;
-    constexpr int block_q = 64;
+    const int block_q = (head_dim == 256) ? 128 : 64;
     const int num_q_blocks = (q_len + block_q - 1) / block_q;
     const int topk_count = selected_blocks.size(2);
     const int kv_capacity = static_cast<int>(k_packed.stride(1)) / (head_dim / 2);
@@ -655,7 +783,10 @@ static at::Tensor thrift_attention_mxfp4_packed(
     at::Tensor rowsum_state = at::empty({batch, num_q_heads, q_len}, state_opts);
 
     if (causal) {
-        thrift_attention_causal_mxfp4(
+        auto kernel = (head_dim == 256)
+            ? thrift_attention_causal_mxfp4_hd256
+            : thrift_attention_causal_mxfp4;
+        kernel(
             q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
             selected_blocks.data_ptr(), topk_count,
             topk_mask.data_ptr(), topk_word_count,
@@ -665,7 +796,10 @@ static at::Tensor thrift_attention_mxfp4_packed(
             flat_q_heads, q_len, kv_len, kv_capacity,
             num_q_heads, num_kv_heads, head_dim, is_bf16);
     } else {
-        thrift_attention_noncausal_mxfp4(
+        auto kernel = (head_dim == 256)
+            ? thrift_attention_noncausal_mxfp4_hd256
+            : thrift_attention_noncausal_mxfp4;
+        kernel(
             q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
             selected_blocks.data_ptr(), topk_count,
             topk_mask.data_ptr(), topk_word_count,
@@ -767,14 +901,27 @@ static at::Tensor thrift_attention_single_query_nvfp4_packed(
     const bool use_split = total_kv_blocks >= 64;
 
     auto dispatch = [&](void* workspace) {
-        thrift_attention_single_query_nvfp4(
-            q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
-            static_cast<const int32_t*>(selected_blocks.data_ptr()), topk_count,
-            q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
-            q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
-            out.data_ptr(), workspace,
-            flat_q_heads, q_len, kv_len, kv_capacity,
-            num_q_heads, num_kv_heads, head_dim, is_bf16);
+        if (head_dim == 256) {
+            thrift_attention_single_query_nvfp4_hd256(
+                q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
+                static_cast<const int32_t*>(selected_blocks.data_ptr()),
+                topk_count,
+                q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+                q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+                out.data_ptr(), workspace,
+                flat_q_heads, q_len, kv_len, kv_capacity,
+                num_q_heads, num_kv_heads, head_dim, is_bf16);
+        } else {
+            thrift_attention_single_query_nvfp4(
+                q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
+                static_cast<const int32_t*>(selected_blocks.data_ptr()),
+                topk_count,
+                q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+                q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+                out.data_ptr(), workspace,
+                flat_q_heads, q_len, kv_len, kv_capacity,
+                num_q_heads, num_kv_heads, head_dim, is_bf16);
+        }
     };
 
     if (!use_split) {
@@ -848,14 +995,25 @@ static at::Tensor thrift_attention_single_query_mxfp4_packed(
     const bool use_split = total_kv_blocks >= 64;
 
     auto dispatch = [&](void* workspace) {
-        thrift_attention_single_query_mxfp4(
-            q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
-            static_cast<const int32_t*>(selected_blocks.data_ptr()), topk_count,
-            q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
-            q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
-            out.data_ptr(), workspace,
-            flat_q_heads, q_len, kv_len, kv_capacity,
-            num_q_heads, num_kv_heads, head_dim, is_bf16);
+        if (head_dim == 256) {
+            thrift_attention_single_query_mxfp4_hd256(
+                q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
+                static_cast<const int32_t*>(selected_blocks.data_ptr()), topk_count,
+                q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+                q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+                out.data_ptr(), workspace,
+                flat_q_heads, q_len, kv_len, kv_capacity,
+                num_q_heads, num_kv_heads, head_dim, is_bf16);
+        } else {
+            thrift_attention_single_query_mxfp4(
+                q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
+                static_cast<const int32_t*>(selected_blocks.data_ptr()), topk_count,
+                q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+                q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+                out.data_ptr(), workspace,
+                flat_q_heads, q_len, kv_len, kv_capacity,
+                num_q_heads, num_kv_heads, head_dim, is_bf16);
+        }
     };
 
     if (!use_split) {
@@ -884,8 +1042,8 @@ static std::vector<at::Tensor> nvfp4_quantize(const at::Tensor& x, bool is_bf16 
     const int heads = x.size(1);
     const int seq_len = x.size(2);
     const int head_dim = x.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
 
     auto opts_u8 = at::TensorOptions().dtype(at::kByte).device(x.device());
     auto opts_f8 = at::TensorOptions().dtype(at::kFloat8_e4m3fn).device(x.device());
@@ -908,8 +1066,8 @@ static std::vector<at::Tensor> nvfp4_quantize_permuted(const at::Tensor& x, bool
     const int heads = x.size(1);
     const int seq_len = x.size(2);
     const int head_dim = x.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
 
     auto opts_u8 = at::TensorOptions().dtype(at::kByte).device(x.device());
     auto opts_f8 = at::TensorOptions().dtype(at::kFloat8_e4m3fn).device(x.device());
@@ -932,8 +1090,8 @@ static std::vector<at::Tensor> nvfp4_quantize_transposed(const at::Tensor& x, bo
     const int heads = x.size(1);
     const int seq_len = x.size(2);
     const int head_dim = x.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
 
     constexpr int seq_block = 128;
     const int padded_seq = ((seq_len + seq_block - 1) / seq_block) * seq_block;
@@ -958,8 +1116,8 @@ static std::vector<at::Tensor> nvfp4_quantize_transposed_permuted(const at::Tens
     const int heads = x.size(1);
     const int seq_len = x.size(2);
     const int head_dim = x.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
 
     constexpr int seq_block = 128;
     const int padded_seq = ((seq_len + seq_block - 1) / seq_block) * seq_block;
@@ -984,8 +1142,8 @@ static std::vector<at::Tensor> mxfp4_quantize(const at::Tensor& x, bool is_bf16 
     const int heads = x.size(1);
     const int seq_len = x.size(2);
     const int head_dim = x.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
 
     auto opts_u8 = at::TensorOptions().dtype(at::kByte).device(x.device());
     auto opts_e8m0 = at::TensorOptions().dtype(at::kFloat8_e8m0fnu).device(x.device());
@@ -1008,8 +1166,8 @@ static std::vector<at::Tensor> mxfp4_quantize_permuted(const at::Tensor& x, bool
     const int heads = x.size(1);
     const int seq_len = x.size(2);
     const int head_dim = x.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
 
     auto opts_u8 = at::TensorOptions().dtype(at::kByte).device(x.device());
     auto opts_e8m0 = at::TensorOptions().dtype(at::kFloat8_e8m0fnu).device(x.device());
@@ -1032,8 +1190,8 @@ static std::vector<at::Tensor> mxfp4_quantize_transposed(const at::Tensor& x, bo
     const int heads = x.size(1);
     const int seq_len = x.size(2);
     const int head_dim = x.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
 
     constexpr int seq_block = 128;
     const int padded_seq = ((seq_len + seq_block - 1) / seq_block) * seq_block;
@@ -1058,8 +1216,8 @@ static std::vector<at::Tensor> mxfp4_quantize_transposed_permuted(const at::Tens
     const int heads = x.size(1);
     const int seq_len = x.size(2);
     const int head_dim = x.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
 
     constexpr int seq_block = 128;
     const int padded_seq = ((seq_len + seq_block - 1) / seq_block) * seq_block;
@@ -1100,8 +1258,8 @@ static at::Tensor block_mean_topk_impl(
     const int num_q_blocks = q_mean.size(2);
     const int num_kv_blocks = k_mean.size(2);
     const int head_dim = q_mean.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
     TORCH_CHECK(num_kv_blocks <= 2048,
                 "block selector supports <= 2048 KV blocks, got ", num_kv_blocks);
     TORCH_CHECK(topk_count >= 0 && topk_count <= num_kv_blocks,
@@ -1148,8 +1306,8 @@ static at::Tensor quest_block_topk_impl(
     const int num_q_blocks = q_mean.size(2);
     const int num_kv_blocks = k_min.size(2);
     const int head_dim = q_mean.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
     TORCH_CHECK(num_kv_blocks <= 2048,
                 "QUEST block selector supports <= 2048 KV blocks, got ", num_kv_blocks);
     TORCH_CHECK(topk_count >= 0 && topk_count <= num_kv_blocks,
@@ -1195,8 +1353,8 @@ static at::Tensor single_query_key_mean_topk_impl(
     const int k_mean_capacity_blocks = k_mean.size(2);
     TORCH_CHECK(groups >= 1 && groups <= 16,
                 "grouped single-query selector expects groups in [1, 16], got ", groups);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
     TORCH_CHECK(num_kv_blocks >= 0 && num_kv_blocks <= k_mean_capacity_blocks,
                 "num_kv_blocks must be in [0, k_mean capacity]");
     TORCH_CHECK(num_kv_blocks <= 2048,
@@ -1266,8 +1424,8 @@ static at::Tensor single_query_quest_topk_impl(
     const int k_stat_capacity_blocks = k_min.size(2);
     TORCH_CHECK(groups >= 1 && groups <= 16,
                 "grouped single-query selector expects groups in [1, 16], got ", groups);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
     TORCH_CHECK(num_kv_blocks >= 0 && num_kv_blocks <= k_stat_capacity_blocks,
                 "num_kv_blocks must be in [0, key stat capacity]");
     TORCH_CHECK(num_kv_blocks <= 2048,
@@ -1334,8 +1492,8 @@ static at::Tensor single_query_key_mean_topk_into_impl(
                 "done_counts must be shaped [batch * kv_heads]");
     TORCH_CHECK(groups >= 1 && groups <= 16,
                 "grouped single-query selector expects groups in [1, 16], got ", groups);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
     TORCH_CHECK(num_kv_blocks >= 0 && num_kv_blocks <= k_mean_capacity_blocks,
                 "num_kv_blocks must be in [0, k_mean capacity]");
     TORCH_CHECK(num_kv_blocks <= 2048,

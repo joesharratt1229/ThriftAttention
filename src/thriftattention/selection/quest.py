@@ -80,7 +80,7 @@ def select_quest_block_pairs(
     k_min = _expand_kv_heads(q, k_min)
     k_max = _expand_kv_heads(q, k_max)
 
-    if q.is_cuda and num_kv_blocks <= 2048 and q.shape[3] in (64, 128):
+    if q.is_cuda and num_kv_blocks <= 2048 and q.shape[3] in (64, 128, 256):
         return get_extension().quest_block_topk(q_mean, k_min, k_max, selected_count, causal, is_bf16)
 
     scores = _quest_scores(q_mean, k_min, k_max)
@@ -135,7 +135,7 @@ def select_quest_key_blocks(
     q_grouped = q.reshape(batch, kv_heads, groups, head_dim).contiguous()
     k_min, k_max = block_minmax(k, block_size=block_size, is_bf16=is_bf16)
 
-    if q.is_cuda and num_kv_blocks <= 2048 and head_dim in (64, 128):
+    if q.is_cuda and num_kv_blocks <= 2048 and head_dim in (64, 128, 256):
         return get_extension().single_query_quest_topk(
             q_grouped,
             k_min,
