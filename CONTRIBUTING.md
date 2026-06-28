@@ -6,8 +6,8 @@ Thank you for your interest in contributing to Thrift Attention! This document p
 
 Prerequisites:
 
-- GPU with SM_120 compute capability e.g. RTX 5090, RTX 6000, RTX 4500. Ampere
-  SM_80 is registered as a backend target, but its kernels are not implemented yet.
+- GPU with SM120 compute capability for the full FP4/selective mixed-precision
+  backend, or an SM80/SM86 GPU for the experimental dense INT8/INT4 kernels
 - Python >=3.10
 - CUDA toolkit >=12.8
 - PyTorch >=2.8.0 built with CUDA >=12.8
@@ -20,11 +20,15 @@ git clone https://github.com/joesharratt1229/ThriftAttention.git
 cd ThriftAttention
 ```
 
-2. Install the package in editable mode
+2. Install the package in editable mode for the target architecture
 ```bash
 python -m pip install 'torch>=2.8.0'
-python -m pip install -e . --no-build-isolation
+THRIFTATTENTION_CUDA_ARCH=sm80 python -m pip install -e . --no-build-isolation
+# Or use THRIFTATTENTION_CUDA_ARCH=sm120 on Blackwell.
 ```
+
+See the installation and verification sections in `README.md` for automatic
+architecture selection and architecture-specific tests.
 
 
 3. Running the examples 

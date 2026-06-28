@@ -4,6 +4,17 @@ import torch
 
 from thriftattention._extension import get_extension
 
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    from torch.nn.functional import scaled_dot_product_attention
+
+    flash_attn_func = None
+    FLASH_ATTN_LABEL = "PyTorch FlashAttention SDPA"
+else:
+    FLASH_ATTN_LABEL = "FlashAttention 2"
+
 
 def quantize_int8_per_32(x):
     grouped = x.float().reshape(*x.shape[:-1], x.shape[-1] // 32, 32)
@@ -41,6 +52,27 @@ def print_stats(label, stats):
     )
 
 
+def print_relative_speed(label, candidate, baseline):
+    ratio = baseline["median"] / candidate["median"]
+    relation = "faster" if ratio >= 1.0 else "slower"
+    factor = ratio if ratio >= 1.0 else 1.0 / ratio
+    print(f"  {label}: {factor:.2f}x {relation} than {FLASH_ATTN_LABEL}")
+
+
+def run_flash_attention(q, k, v, causal):
+    if flash_attn_func is not None:
+        return flash_attn_func(q, k, v, causal=causal)
+
+    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+        return scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=causal,
+            enable_gqa=q.shape[1] != k.shape[1],
+        )
+
+
 def make_inputs(bs, q_len, kv_len, q_heads, kv_heads, head_dim):
     q = torch.randn(bs, q_len, q_heads, head_dim, device="cuda", dtype=torch.float16)
     k = torch.randn(bs, kv_len, kv_heads, head_dim, device="cuda", dtype=torch.float16)
@@ -62,25 +94,49 @@ def run_case(bs, q_len, kv_len, q_heads, kv_heads, head_dim):
 
     prefix = f"bs={bs} q={q_len} kv={kv_len} heads={q_heads}/{kv_heads} dim={head_dim}"
 
-    print_stats(
-        f"{prefix} int8 noncausal",
-        benchmark(lambda: ext.sm80_int8_attention_noncausal(q_i8, k_i8, v_i8, s_q8, s_k8, s_v8, False)),
+    int8_noncausal = benchmark(
+        lambda: ext.sm80_int8_attention_noncausal(q_i8, k_i8, v_i8, s_q8, s_k8, s_v8, False)
     )
-    print_stats(
-        f"{prefix} int8 causal",
-        benchmark(lambda: ext.sm80_int8_attention_causal(q_i8, k_i8, v_i8, s_q8, s_k8, s_v8, False)),
+    int8_causal = benchmark(
+        lambda: ext.sm80_int8_attention_causal(q_i8, k_i8, v_i8, s_q8, s_k8, s_v8, False)
     )
-    print_stats(
-        f"{prefix} int4 noncausal",
-        benchmark(lambda: ext.sm80_int4_attention_noncausal(q_i4, k_i4, v_i4, s_q4, s_k4, s_v4, False)),
+    int4_noncausal = benchmark(
+        lambda: ext.sm80_int4_attention_noncausal(q_i4, k_i4, v_i4, s_q4, s_k4, s_v4, False)
     )
-    print_stats(
-        f"{prefix} int4 causal",
-        benchmark(lambda: ext.sm80_int4_attention_causal(q_i4, k_i4, v_i4, s_q4, s_k4, s_v4, False)),
+    int4_causal = benchmark(
+        lambda: ext.sm80_int4_attention_causal(q_i4, k_i4, v_i4, s_q4, s_k4, s_v4, False)
     )
+
+    print_stats(f"{prefix} int8 noncausal", int8_noncausal)
+    print_stats(f"{prefix} int8 causal", int8_causal)
+    print_stats(f"{prefix} int4 noncausal", int4_noncausal)
+    print_stats(f"{prefix} int4 causal", int4_causal)
+
+    if flash_attn_func is None:
+        q_flash = q.transpose(1, 2)
+        k_flash = k.transpose(1, 2)
+        v_flash = v.transpose(1, 2)
+    else:
+        q_flash, k_flash, v_flash = q, k, v
+
+    flash_noncausal = benchmark(
+        lambda: run_flash_attention(q_flash, k_flash, v_flash, causal=False)
+    )
+    flash_causal = benchmark(
+        lambda: run_flash_attention(q_flash, k_flash, v_flash, causal=True)
+    )
+    print_stats(f"{prefix} {FLASH_ATTN_LABEL} noncausal", flash_noncausal)
+    print_stats(f"{prefix} {FLASH_ATTN_LABEL} causal", flash_causal)
+    print_relative_speed("int8 noncausal", int8_noncausal, flash_noncausal)
+    print_relative_speed("int8 causal", int8_causal, flash_causal)
+    print_relative_speed("int4 noncausal", int4_noncausal, flash_noncausal)
+    print_relative_speed("int4 causal", int4_causal, flash_causal)
 
 
 if __name__ == "__main__":
+    if flash_attn_func is None:
+        print("External FlashAttention 2 is unavailable; using PyTorch's forced FlashAttention backend.\n")
+
     torch.manual_seed(1234)
     run_case(1, 64, 64, 1, 1, 64)
     run_case(1, 128, 128, 1, 1, 128)

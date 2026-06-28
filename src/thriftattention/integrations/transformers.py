@@ -53,7 +53,7 @@ class TransformersAttentionConfig:
             top_k=_validate_top_k(self.top_k),
             block_size=_validate_block_size(self.block_size),
             quant_format=_validate_choice("quant_format", self.quant_format, ("nvfp4",)),
-            backend=_validate_choice("backend", self.backend, ("auto", "sm80", "sm120")),
+            backend=_validate_choice("backend", self.backend, ("auto", "sm120")),
             implementation=_validate_choice(
                 "implementation",
                 self.implementation,
