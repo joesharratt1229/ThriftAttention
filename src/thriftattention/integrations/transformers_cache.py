@@ -685,14 +685,31 @@ def select_cached_decode_blocks(
     layer: ThriftAttentionCacheLayer,
     config: AttentionConfig,
 ) -> torch.Tensor:
-    if config.selection != "local":
-        return layer.select_key_blocks(
-            q_grouped,
-            top_k=config.top_k,
-            fraction=config.fraction,
-            block_size=config.block_size,
-        )
+    if config.selection == "block_mean":
+        return select_topk_key_blocks(q_grouped, layer, config)
+    if config.selection == "local":
+        return select_local_key_blocks(q_grouped, layer, config)
+    raise ValueError(f"unsupported cached decode selection {config.selection!r}")
 
+
+def select_topk_key_blocks(
+    q_grouped: torch.Tensor,
+    layer: ThriftAttentionCacheLayer,
+    config: AttentionConfig,
+) -> torch.Tensor:
+    return layer.select_key_blocks(
+        q_grouped,
+        top_k=config.top_k,
+        fraction=config.fraction,
+        block_size=config.block_size,
+    )
+
+
+def select_local_key_blocks(
+    q_grouped: torch.Tensor,
+    layer: ThriftAttentionCacheLayer,
+    config: AttentionConfig,
+) -> torch.Tensor:
     complete_blocks = layer.seq_len // config.block_size
     selected_count = resolve_top_k(
         complete_blocks,
@@ -714,6 +731,14 @@ def select_cached_prefill_blocks(
     real_q_len: int | None = None,
     is_bf16: bool = False,
 ) -> torch.Tensor:
+    if config.selection == "block_mean":
+        return _select_block_pairs_from_cached_means(
+            q,
+            layer,
+            config,
+            real_q_len=real_q_len,
+            is_bf16=is_bf16,
+        )
     if config.selection == "local":
         return select_local_block_pairs(
             q,
@@ -724,13 +749,7 @@ def select_cached_prefill_blocks(
             block_size=config.block_size,
             is_bf16=is_bf16,
         )
-    return _select_block_pairs_from_cached_means(
-        q,
-        layer,
-        config,
-        real_q_len=real_q_len,
-        is_bf16=is_bf16,
-    )
+    raise ValueError(f"unsupported cached prefill selection {config.selection!r}")
 
 
 def _select_block_pairs_from_cached_means(
