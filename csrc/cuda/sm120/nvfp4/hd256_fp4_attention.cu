@@ -64,8 +64,6 @@ void fp4_attention_kernel_hd256(
     extern __shared__ uint8_t smem[];
     const uint32_t Q_smem = __cvta_generic_to_shared(smem);
     const uint32_t Q_sf_smem = Q_smem + BLOCK_Q * HEAD_DIM_2 * sizeof(__nv_fp4x2_e2m1);
-    const uint32_t V_smem = Q_sf_smem + BLOCK_Q * SCALE_DIM * sizeof(__nv_fp8_e4m3);
-    const uint32_t V_sf_smem = V_smem + BLOCK_KV * HEAD_DIM_2 * sizeof(__nv_fp4x2_e2m1);
 
     uint32_t Q_rmem[WARP_Q / MMA_M][HEAD_DIM / MMA_K][4];
     uint32_t K_rmem[BLOCK_KV / MMA_N][HEAD_DIM / MMA_K][2];
@@ -129,22 +127,28 @@ void fp4_attention_kernel_hd256(
 
     // ---- KV loop ----
     __syncthreads();
-    const uint32_t K_smem = __cvta_generic_to_shared(smem);
-    const uint32_t K_sf_smem = K_smem + BLOCK_KV * HEAD_DIM_2 * sizeof(__nv_fp4x2_e2m1);
+
+    constexpr int K_BUF_BYTES = BLOCK_KV * HEAD_DIM_2 * (int)sizeof(__nv_fp4x2_e2m1)
+                               + BLOCK_KV * SCALE_DIM  * (int)sizeof(__nv_fp8_e4m3);
+    constexpr int V_BUF_BYTES = HEAD_DIM * (BLOCK_KV / 2)  * (int)sizeof(__nv_fp4x2_e2m1)
+                               + HEAD_DIM * (BLOCK_KV / 16) * (int)sizeof(__nv_fp8_e4m3);
+    constexpr int KV_BUF_BYTES = K_BUF_BYTES + V_BUF_BYTES;
+
+    const uint32_t smem_base = __cvta_generic_to_shared(smem);
+
+    // Pre-compute base address for K ldmatrix (buffer 0).
+    const int row_off = lane_id % 8;
+    const int col_off = (lane_id / 8) * 16;
+    const uint32_t K_ld_base_0 = ta_swizzle<HEAD_DIM_2>(
+        smem_base + row_off * HEAD_DIM_2 + col_off);
+
+    uint32_t cur_buf_off = 0;  // toggles between 0 and KV_BUF_BYTES
 
     const int total_kv_iters = ta_cdiv(kv_len, BLOCK_KV);
     const int max_kv_pos = q_block_id * BLOCK_Q + BLOCK_Q - 1;
     const int num_kv_iters = CAUSAL
         ? min(max_kv_pos / BLOCK_KV + 1, total_kv_iters)
         : total_kv_iters;
-
-    // Pre-compute base address for K ldmatrix.
-    uint32_t K_ld_base;
-    {
-        const int row_off = lane_id % 8;
-        const int col_off = (lane_id / 8) * 16;
-        K_ld_base = ta_swizzle<HEAD_DIM_2>(K_smem + row_off * HEAD_DIM_2 + col_off);
-    }
 
     // Precompute per-thread query row offsets within the block.
     const int q_block_start = q_block_id * BLOCK_Q;
@@ -154,6 +158,25 @@ void fp4_attention_kernel_hd256(
     const int q_row_lower_global = q_block_start + q_row_lower;
     const int k_col_base = (lane_id % 4) * 2;                        // base key col within MMA_N tile
 
+    auto start_kv_load = [&](uint32_t buf_off, int iter) {
+        const uint32_t K_buf    = smem_base + buf_off;
+        const uint32_t K_sf_buf = K_buf    + BLOCK_KV * HEAD_DIM_2 * sizeof(__nv_fp4x2_e2m1);
+        const uint32_t V_buf    = K_sf_buf + BLOCK_KV * SCALE_DIM   * sizeof(__nv_fp8_e4m3);
+        const uint32_t V_sf_buf = V_buf    + HEAD_DIM * (BLOCK_KV / 2) * sizeof(__nv_fp4x2_e2m1);
+        const auto* Kp  = K   + static_cast<int64_t>(iter) * BLOCK_KV * HEAD_DIM_2;
+        const auto* SKp = S_K + static_cast<int64_t>(iter) * BLOCK_KV * SCALE_DIM;
+        const auto* Vp  = V   + static_cast<int64_t>(iter) * BLOCK_KV / 2;
+        const auto* SVp = S_V + static_cast<int64_t>(iter) * BLOCK_KV / 16;
+        ta_gmem_to_smem<BLOCK_KV, HEAD_DIM_2, TB_SIZE, __nv_fp4x2_e2m1>(K_buf,    Kp,  tid, HEAD_DIM_2);
+        ta_load_scales<BLOCK_KV, SCALE_DIM, TB_SIZE, __nv_fp8_e4m3>    (K_sf_buf, SKp, SCALE_DIM, tid);
+        ta_gmem_to_smem<HEAD_DIM, BLOCK_KV / 2, TB_SIZE, __nv_fp4x2_e2m1>(V_buf,  Vp,  tid, v_kv / 2);
+        ta_load_scales<HEAD_DIM, BLOCK_KV / 16, TB_SIZE, __nv_fp8_e4m3>  (V_sf_buf, SVp, v_kv / 16, tid);
+        asm volatile("cp.async.commit_group;");
+    };
+
+    if (num_kv_iters > 0)
+        start_kv_load(0, 0);
+
     for (int kv_iter = 0; kv_iter < num_kv_iters; kv_iter++) {
         float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
         uint32_t S_fp4_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_K][4];
@@ -162,27 +185,33 @@ void fp4_attention_kernel_hd256(
         const int k_block_start = kv_iter * BLOCK_KV;
         const bool needs_causal_mask = CAUSAL && ((k_block_start + BLOCK_KV - 1) > q_block_start);
 
-        // Load K first; issue V in a second async group so QK can overlap
-        // with the V transfer.
-        ta_gmem_to_smem<BLOCK_KV, HEAD_DIM_2, TB_SIZE, __nv_fp4x2_e2m1>(K_smem, K, tid, HEAD_DIM_2);;
-        ta_load_scales<BLOCK_KV, SCALE_DIM, TB_SIZE, __nv_fp8_e4m3>(K_sf_smem, S_K, SCALE_DIM, tid);
-        asm volatile("cp.async.commit_group;");
-        ta_gmem_to_smem<HEAD_DIM, BLOCK_KV / 2, TB_SIZE, __nv_fp4x2_e2m1>(V_smem, V, tid, v_kv / 2);
-        ta_load_scales<HEAD_DIM, BLOCK_KV / 16, TB_SIZE, __nv_fp8_e4m3>(V_sf_smem, S_V, v_kv / 16, tid);
-        asm volatile("cp.async.commit_group;");
-        asm volatile("cp.async.wait_group 1;");
+        const uint32_t nxt_buf_off = KV_BUF_BYTES - cur_buf_off;
+        if (kv_iter + 1 < num_kv_iters)
+            start_kv_load(nxt_buf_off, kv_iter + 1);
+
+        if (kv_iter + 1 < num_kv_iters) {
+            asm volatile("cp.async.wait_group 1;");
+        } else {
+            asm volatile("cp.async.wait_all;");
+        }
         __syncthreads();
+
+        const uint32_t cur_K_ld = K_ld_base_0 + cur_buf_off;
+        const uint32_t cur_K_sf = smem_base + cur_buf_off
+                                + BLOCK_KV * HEAD_DIM_2 * sizeof(__nv_fp4x2_e2m1);
+        const uint32_t cur_V    = cur_K_sf + BLOCK_KV * SCALE_DIM * sizeof(__nv_fp8_e4m3);
+        const uint32_t cur_V_sf = cur_V    + HEAD_DIM * (BLOCK_KV / 2) * sizeof(__nv_fp4x2_e2m1);
 
         if constexpr (HEAD_DIM / MMA_K >= 2) {
             // ldmatrix_x4: lanes 0-15 cover mma_id_d=0, lanes 16-31 cover mma_id_d=1
             for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
-                uint32_t addr = K_ld_base + mma_id_kv * MMA_N * HEAD_DIM_2;
+                uint32_t addr = cur_K_ld + mma_id_kv * MMA_N * HEAD_DIM_2;
                 ta_ldmatrix_x4(K_rmem[mma_id_kv][0], addr);
             }
         } else {
             for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
                 for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_K; mma_id_d++) {
-                    uint32_t addr = K_ld_base;
+                    uint32_t addr = cur_K_ld;
                     addr += mma_id_kv * MMA_N * HEAD_DIM_2;
                     addr ^= mma_id_d * (MMA_K / 2);
                     ta_ldmatrix_x2(K_rmem[mma_id_kv][mma_id_d], addr);
@@ -196,7 +225,7 @@ void fp4_attention_kernel_hd256(
                 const uint32_t offset = (row * SCALE_DIM + mma_id_d * 4) * (uint32_t)sizeof(__nv_fp8_e4m3);
                 asm volatile("ld.shared.u32 %0, [%1];"
                     : "=r"(sfK_rmem[mma_id_kv][mma_id_d])
-                    : "r"(K_sf_smem + offset));
+                    : "r"(cur_K_sf + offset));
             }
         }
 
@@ -350,15 +379,12 @@ void fp4_attention_kernel_hd256(
 
         // V layout in smem: [HEAD_DIM, BLOCK_KV/2], stride = BLOCK_KV/2 bytes.
         // ldmatrix_x4: lanes 0-15 address tile mma_id_d, lanes 16-31 address tile mma_id_d+1.
-        asm volatile("cp.async.wait_group 0;");
-        __syncthreads();
-
         for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++) {
             for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d += 2) {
                 const int n_idx = mma_id_d * MMA_N + (lane_id / 16) * MMA_N + (lane_id % 8);
                 const int k_byte_offset = mma_id_kv * 32 + ((lane_id % 16) / 8) * 16;
                 uint32_t addr = ta_swizzle<BLOCK_KV / 2>(
-                    V_smem + n_idx * (BLOCK_KV / 2) + k_byte_offset);
+                    cur_V + n_idx * (BLOCK_KV / 2) + k_byte_offset);
 
                 ta_ldmatrix_x4(V_rmem[mma_id_kv][mma_id_d], addr);
             }
@@ -372,7 +398,7 @@ void fp4_attention_kernel_hd256(
                 const uint32_t offset = (hd_col * V_SF_STRIDE + mma_id_kv * 4) * (uint32_t)sizeof(__nv_fp8_e4m3);
                 asm volatile("ld.shared.u32 %0, [%1];"
                     : "=r"(sfV_rmem[mma_id_kv][mma_id_d])
-                    : "r"(V_sf_smem + offset));
+                    : "r"(cur_V_sf + offset));
             }
 
         // MMA O += P @ V
@@ -386,35 +412,43 @@ void fp4_attention_kernel_hd256(
                         sfV_rmem[mma_id_kv][mma_id_d],
                         O_rmem[mma_id_q][mma_id_d]);
 
-        K += BLOCK_KV * HEAD_DIM_2;
-        S_K += BLOCK_KV * SCALE_DIM;
-
-        V  += BLOCK_KV / 2;
-        S_V += BLOCK_KV / 16;
+        cur_buf_off = KV_BUF_BYTES - cur_buf_off;
     }
 
     constexpr float FP4_RANGE_INV = 1.0f / (448.0f * 6.0f);
 
-    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
+    // ---- write output via smem transposition for coalesced stores ----
+    constexpr int O_PAD = 8;                         // avoids smem bank conflicts
+    constexpr int O_ROW_STRIDE = HEAD_DIM + O_PAD;
+
+    __syncthreads();
+    T* O_stg = reinterpret_cast<T*>(smem);
+
+    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+        const float norm0 = FP4_RANGE_INV / rowsum[mma_id_q][0];
+        const float norm1 = FP4_RANGE_INV / rowsum[mma_id_q][1];
+        const int base_row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
         for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
-            const int row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
             const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
-
-            float *regs = O_rmem[mma_id_q][mma_id_d];
-
-            float norm0 = FP4_RANGE_INV / rowsum[mma_id_q][0];
-            float norm1 = FP4_RANGE_INV / rowsum[mma_id_q][1];
-
-            regs[0] *= norm0;
-            regs[1] *= norm0;
-            regs[2] *= norm1;
-            regs[3] *= norm1;
-
-            reinterpret_cast<typename Traits::vec2*>(O + (row + 0) * HEAD_DIM + col)[0] =
-                Traits::pack2(regs[0], regs[1]);
-            reinterpret_cast<typename Traits::vec2*>(O + (row + 8) * HEAD_DIM + col)[0] =
-                Traits::pack2(regs[2], regs[3]);
+            const float *regs = O_rmem[mma_id_q][mma_id_d];
+            reinterpret_cast<typename Traits::vec2*>(
+                &O_stg[(base_row + 0) * O_ROW_STRIDE + col])[0] =
+                Traits::pack2(regs[0] * norm0, regs[1] * norm0);
+            reinterpret_cast<typename Traits::vec2*>(
+                &O_stg[(base_row + 8) * O_ROW_STRIDE + col])[0] =
+                Traits::pack2(regs[2] * norm1, regs[3] * norm1);
         }
+    }
+
+    __syncthreads();
+
+    for (int i = tid; i < BLOCK_Q * HEAD_DIM / 2; i += TB_SIZE) {
+        const int row_i = (i * 2) / HEAD_DIM;
+        const int col_i = (i * 2) % HEAD_DIM;
+        reinterpret_cast<typename Traits::vec2*>(O + row_i * HEAD_DIM + col_i)[0] =
+            reinterpret_cast<typename Traits::vec2*>(
+                O_stg + row_i * O_ROW_STRIDE + col_i)[0];
+    }
 }
 
 template<typename T, bool CAUSAL, int HEAD_DIM>
@@ -434,14 +468,17 @@ static void launch_fp4_attention_hd256(
 
     const int num_blocks = bs * ta_cdiv(q_len, BLOCK_Q);
 
-    constexpr int q_phase_smem = BLOCK_Q * HEAD_DIM_2 * sizeof(__nv_fp4x2_e2m1)
-                               + BLOCK_Q * SCALE_DIM * sizeof(__nv_fp8_e4m3);
-    constexpr int v_phase_smem = HEAD_DIM * (BLOCK_KV / 2) * sizeof(__nv_fp4x2_e2m1)
-                                + HEAD_DIM * (BLOCK_KV / 16) * sizeof(__nv_fp8_e4m3);
-    constexpr int k_phase_smem = BLOCK_KV * HEAD_DIM_2 * sizeof(__nv_fp4x2_e2m1)
-                                + BLOCK_KV * SCALE_DIM * sizeof(__nv_fp8_e4m3);
-    constexpr int smem_size = q_phase_smem + v_phase_smem > k_phase_smem
-                            ? q_phase_smem + v_phase_smem : k_phase_smem;
+    constexpr int q_phase_smem = BLOCK_Q * HEAD_DIM_2 * (int)sizeof(__nv_fp4x2_e2m1)
+                               + BLOCK_Q * SCALE_DIM  * (int)sizeof(__nv_fp8_e4m3);
+    constexpr int k_buf_bytes = BLOCK_KV * HEAD_DIM_2 * (int)sizeof(__nv_fp4x2_e2m1)
+                              + BLOCK_KV * SCALE_DIM  * (int)sizeof(__nv_fp8_e4m3);
+    constexpr int v_buf_bytes = HEAD_DIM * (BLOCK_KV / 2)  * (int)sizeof(__nv_fp4x2_e2m1)
+                              + HEAD_DIM * (BLOCK_KV / 16) * (int)sizeof(__nv_fp8_e4m3);
+    constexpr int kv_double_buf_smem = 2 * (k_buf_bytes + v_buf_bytes);
+    constexpr int o_stg_smem = BLOCK_Q * (HEAD_DIM + 8) * static_cast<int>(sizeof(T));
+    constexpr int smem_size_01 = q_phase_smem > kv_double_buf_smem
+                               ? q_phase_smem : kv_double_buf_smem;
+    constexpr int smem_size = smem_size_01 > o_stg_smem ? smem_size_01 : o_stg_smem;
 
     auto kernel = fp4_attention_kernel_hd256<T, CAUSAL, BLOCK_Q, BLOCK_KV, HEAD_DIM,
                                        HEAD_DIM_2, SCALE_DIM,
