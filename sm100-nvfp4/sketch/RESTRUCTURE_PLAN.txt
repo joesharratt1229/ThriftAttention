@@ -186,3 +186,27 @@ after the tile loop) is already fully hidden behind the softmax
 epilogue's tmem-read/smem-write window; hoisting it before the last PV
 pair only delays the OFull -> epilogue -> OEmpty chain.  Do not retry
 without changing the epilogue overlap structure.
+
+V LAYOUT UNIFIED (2026-07-03): 64B swizzle, single 8KB TMA per V tile,
+K-style chunk descriptors (desc + chunk*32).  ~1-1.5% (8k 0.353->0.351,
+16k 1.545->1.522).  The 32B/2-box form was a KV64-era leftover.
+Ops note: killed torch-extension builds leave .torch_extensions/*/lock;
+every later build then blocks forever in the file baton -- delete the
+lock file, don't chase kernel hangs first.
+
+2-CTA CLUSTER MMA: DESIGN SKELETON (in progress)
+------------------------------------------------
+Strategy: build as a SECOND kernel variant (compile-time CTA_GROUP
+branch), host dispatch on num_tiles vs SM count -- 2-CTA coarsens
+scheduling to 74 cluster-slots and 256-row effective tiles, so it should
+lose at <=4k and win at >=8-16k; keep the 1-CTA path for small shapes
+and tune the crossover empirically (FA4-table style).
+Per-CTA structure PRESERVED: each CTA of the pair keeps its own 128 Q
+rows, softmax pairs, S buffers, O accumulator + row sums, epilogue.
+What changes: QK/PV become one cta_group::2 M=256 instruction issued by
+the leader CTA; K/V held once per pair (split/multicast per the
+mechanics report); MMA-completion and P-ready barriers become
+cluster-scoped.  Mechanics extraction from FA4 + CuTe DSL sources is
+running; key unknowns: B-operand sourcing across the pair, SFA/SFB
+placement for block-scaled 2-CTA MMA, commit multicast form, remote
+mbarrier arrivals.
