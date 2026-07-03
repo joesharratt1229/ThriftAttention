@@ -210,3 +210,135 @@ cluster-scoped.  Mechanics extraction from FA4 + CuTe DSL sources is
 running; key unknowns: B-operand sourcing across the pair, SFA/SFB
 placement for block-scaled 2-CTA MMA, commit multicast form, remote
 mbarrier arrivals.
+
+================================================================
+2-CTA CLUSTER MMA: DETAILED IMPLEMENTATION + DISPATCH PLAN
+(written at session end 2026-07-03; next session starts here)
+================================================================
+Baseline to beat (interleaved, sustained, H=16, vs FA4):
+  4k 0.112ms/1.19x | 8k 0.351ms/1.46x | 16k 1.522ms/1.21x | 32k ~6.6ms/~1.5x
+Cost structure at 8k: shell 53% (MMA+TMA+mbarrier chains), conversion 37%
+(partially hidden by split-P), S-loads 9%.  2-CTA attacks the shell: one
+M=256 QK/PV per cluster instead of two M=128s, and K/V held once per pair.
+
+A. DISPATCH ARCHITECTURE
+------------------------
+1. Two kernel variants from one source: template/ifdef on FA4_CTA_PAIR
+   (0 = current 1-CTA persistent kernel, UNTOUCHED; 1 = cluster variant).
+   Compile both into the extension; nvfp4_sm100_attention_launch picks.
+2. Host heuristic: num_tiles = batch*heads*(q_len/128).
+   - num_tiles < DISPATCH_MIN_TILES  -> 1-CTA variant (tail-sensitive).
+   - else                            -> 2-CTA variant.
+   Initial DISPATCH_MIN_TILES ~ 8*sm_count (i.e. >= ~8 waves of cluster
+   slots); tune empirically at 4k/8k/16k after the variant works.  Expect
+   2-CTA to LOSE at <=4k (74 cluster slots, 256-row effective tiles double
+   the wave-quantization tail) and win at >=8-16k.
+3. 2-CTA launch: cudaLaunchKernelEx with cudaLaunchAttributeClusterDimension
+   = (2,1,1) (or __cluster_dims__(2,1,1) on the kernel); grid.x = even,
+   = min(2*ceil(num_tiles/2)... , 2*floor(sm_count/2)); persistent tile
+   loop assigns one 256-row SUPER-TILE (two adjacent 128-row q-blocks of
+   the same head) per cluster: super_tiles = batch*heads*(q_len/256);
+   CTA rank r takes rows 128*r of the super-tile.  q_len%256 fallback:
+   dispatch odd-q shapes to the 1-CTA variant (keep it simple).
+
+B. WHAT IS PRESERVED PER CTA (deliberately)
+-------------------------------------------
+Each CTA of the pair keeps, exactly as in the current kernel: its own 128
+Q rows (Q TMA + SFQ), softmax owner/partner pairs + named barriers + lazy
+rescale, both S buffers, its own O accumulator + OSUM + ones-MMA rowsum,
+epilogue + OEpi/OEmpty/OStore chain, drain-free persistence counters (gi).
+The D/A operands of a cta_group::2 MMA span the pair's tmem halves, so
+softmax/epilogue code does not change: each CTA reads its own tmem lanes.
+
+C. WHAT CHANGES
+---------------
+1. MMA issue: only the LEADER CTA (cluster rank 0) elected thread runs
+   mma_loop; instructions become tcgen05.mma.cta_group::2 (idesc M field
+   = 256>>7).  The follower's warp 12 parks (but see barriers below --
+   it may need to relay arrivals).
+2. K/V: held ONCE per pair.  Two candidate schemes (mechanics report was
+   not finished -- verify against FA4 source, see F):
+   (a) split: each CTA's load warp TMAs half of each K/V tile into its
+       own smem; the 2-CTA MMA's B descriptor sources both halves via
+       DSMEM.  This HALVES KV smem per CTA -> either double prefetch
+       depth or reclaim ~72KB smem.
+   (b) multicast: cp.async.bulk.tensor with cluster multicast mask loads
+       the full tile into both CTAs (no smem saving, still halves DRAM/L2
+       traffic).  Simpler barriers; try (b) first if (a)'s descriptor
+       semantics are unclear.
+3. Barriers that become cluster-scoped:
+   - KVFull: leader must observe both CTAs' TMA completions (remote mbar
+     arrival via shared::cluster addressing / TMA to leader's mbar).
+   - SFull-equivalent: leader's commit must wake softmax in BOTH CTAs:
+     tcgen05.commit.cta_group::2 has an mbarrier multicast form (FA4 uses
+     it via PipelineUmmaAsync) -- find exact PTX in cutlass tcgen05/mma.py.
+   - P0Ready/P1Ready: both CTAs' softmax must signal the leader: remote
+     arrive on the leader's mbar (mapa.shared::cluster + mbarrier.arrive
+     .shared::cluster), counts double (256/512).
+   - OFull per CTA (each CTA's epilogue) from the leader's commit multicast.
+   - fence.mbarrier_init.release.cluster already in place; add
+     cluster.sync() (barrier.cluster.arrive/wait) at kernel start before
+     any cross-CTA mbar use, and before tmem dealloc at the end.
+4. tmem: verify whether alloc must be tcgen05.alloc.cta_group::2 (likely
+   both CTAs execute it) and whether TMEM_COLS accounting changes.
+5. Scale factors (CRITICAL, block-scaled mxf4nvf4): where do SFA and SFB
+   live for cta_group::2?  Likely SFA per-CTA (each CTA's tmem holds sf
+   for its 128 A rows -- our SFQ/SFP layout already per-CTA) and SFB
+   duplicated in both CTAs' tmem (our SFK/SFV cps run in both).  VERIFY
+   in cutlass tcgen05 mma.py (kind mxf4nvf4, cta_group=2) before coding.
+
+D. IMPLEMENTATION ORDER (each step builds + validates before the next)
+----------------------------------------------------------------------
+1. Scaffold: FA4_CTA_PAIR compile branch, cluster launch, rank/leader
+   helpers, cluster.sync at start/end, dispatch in launcher, 1-CTA path
+   regression-checked (bit-exact vs today).
+2. KV multicast (scheme b) with MMA still cta_group::1 per CTA: proves
+   cluster TMA + barriers without touching MMA semantics.  Perf may dip
+   (no win yet); correctness gate only.
+3. Switch QK to cta_group::2 M=256 (leader-issued), commit-multicast to
+   both CTAs' SFull.  Softmax unchanged.  Validate vs SDPA + vs 1-CTA
+   output (bit-exact expected: same math).
+4. Switch PV (+ ones-MMA rowsum: also M=256, D spans both CTAs' OSUM).
+5. P0/P1 remote arrivals, remove follower's mma warp entirely.
+6. If scheme (a) split-KV-smem is understood by then: halve KV smem,
+   double prefetch depth (8 -> 16 pairs), re-measure.
+7. Tune DISPATCH_MIN_TILES on the 4k/8k/16k/32k sweep.
+
+E. VALIDATION PROTOCOL (the one that caught everything today)
+-------------------------------------------------------------
+- cos vs fp32 SDPA ~0.9558-0.9564 at 4k/8k (validate.py in scratchpad;
+  recreate: quantise_and_attention then compare, seeds fixed).
+- bit-compare 2-CTA vs 1-CTA variant outputs on same quantised inputs.
+- hang matrix: default x5, kv=384 (odd iters), q=2048 H=16 kv=1152
+  (multi-tile + odd), q=2048 kv=128 (kv_iters=1 multi-tile), 128x128 min,
+  GQA 8:2.  Deterministic twice.
+- bench interleaved (bench_attention.py does A/B chunks); never trust
+  back-to-back sweeps at 32k+ (throttle).  If a hang appears: heartbeat
+  dbg_mark instrumentation + host watchdog (pattern in HANG_FIX_NOTES.txt).
+
+F. WHERE THE UNKNOWN MECHANICS LIVE (extraction agent was stopped;
+   partial transcript may exist under the session tasks dir)
+------------------------------------------------------------------
+- helpers/flash_fwd_sm100.py: use_2cta_instrs config (line ~84), cta_group
+  = tcgen05.CtaGroup.TWO (~536), cluster shape (~183), is_leader_cta MMA
+  issue (~1760), KV smem partitioning smem_size_kv_per_stage //
+  cta_group_size (~391), cluster consumer groups (~971-981).
+- /usr/local/lib/python3.12/dist-packages/cutlass/.../tcgen05/mma.py +
+  copy.py: exact PTX for cta_group::2 mma, commit multicast, SF handling.
+- /usr/local/lib/python3.12/dist-packages/flash_attn/cute/pipeline.py:
+  PipelineTmaUmmaAsync / PipelineUmmaAsync remote-arrival patterns.
+Questions to answer before coding steps 3-5: B-operand sourcing across
+the pair (split along which dim?), SFB placement, commit multicast PTX,
+remote mbarrier arrive form, tmem alloc form under cta_group::2.
+
+G. STANDING TRAPS (all bitten once today -- do not re-learn)
+------------------------------------------------------------
+- setmaxnreg regions: every warpgroup >= 80 or ptxas C7600s kernel-wide.
+- mbarrier parity: producer-start trick only on genuinely fresh barriers;
+  waiter must never be 2 phases behind (alias) or 1 early (spurious pass).
+- tcgen05 sub-partition rule: warp k touches tmem lanes 32*(k%4) only.
+- Same-thread tcgen05 ops execute in issue order (pipe) -- cross-thread
+  needs commit/fence chains.
+- Killed builds leave .torch_extensions/*/lock -> all later builds hang.
+- max.f32x2 does not exist; fma/mul.f32x2 do.
+- 32B-swizzle TMA boxes cap inner extent at 32B (V now uses 64B).
