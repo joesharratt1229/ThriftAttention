@@ -83,7 +83,7 @@ void check_qkv(const torch::Tensor& q, const torch::Tensor& k, const torch::Tens
     TORCH_CHECK(k.size(1) == v.size(1), "k/v head count mismatch");
     TORCH_CHECK(k.size(2) == v.size(2), "k/v sequence length mismatch");
     TORCH_CHECK(q.size(3) == 128 && k.size(3) == 128 && v.size(3) == 128, "head_dim must be 128 for fp4_attention_sm100.cu");
-    TORCH_CHECK(q.size(2) % 256 == 0, "q_len must be a multiple of 256");
+    TORCH_CHECK(q.size(2) % 128 == 0, "q_len must be a multiple of 128");
     TORCH_CHECK(k.size(2) % 128 == 0, "kv_len must be a multiple of 128 for V transpose quantization and attention packing");
     TORCH_CHECK(q.size(1) % k.size(1) == 0, "num_q_heads must be divisible by num_kv_heads");
 }
@@ -127,7 +127,7 @@ pybind11::dict quantise_and_attention(
     check_cuda(cudaGetLastError(), "nvfp4 quantize launch");
 
     auto q_sf_atoms = torch::empty({batch, num_q_heads, q_len / 128, 2, 512}, byte_opts);
-    auto k_sf_atoms = torch::empty({batch, num_kv_heads, kv_len / 64, 2, 512}, byte_opts);
+    auto k_sf_atoms = torch::empty({batch, num_kv_heads, kv_len / 128, 2, 512}, byte_opts);
     auto v_sf_atoms = torch::empty({batch, num_kv_heads, kv_len / 64, 1, 512}, byte_opts);
 
     check_cuda(nvfp4_sm100_pack_q_sf_atoms(

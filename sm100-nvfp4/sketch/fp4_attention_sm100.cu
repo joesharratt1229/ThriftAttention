@@ -27,16 +27,18 @@ constexpr float P_SCALE_RANGE = 448.0f / 16.0f;
 constexpr int FA4_NUM_WARPS = 16;
 constexpr int FA4_THREADS = FA4_NUM_WARPS * WARP_SIZE;
 constexpr int FA4_HEAD_DIM = 128;
-constexpr int FA4_Q_STAGES = 2;
+constexpr int FA4_Q_STAGES = 1;
 constexpr int FA4_Q_STAGE_ROWS = 128;
 constexpr int FA4_Q_TILE_ROWS = FA4_Q_STAGES * FA4_Q_STAGE_ROWS;
-constexpr int FA4_KV_TILE = 64;
+constexpr int FA4_KV_TILE = 128;
+constexpr int FA4_KV_CHUNKS = FA4_KV_TILE / 64;
 constexpr int FA4_MMA_M = 128;
 constexpr int FA4_MMA_K = 64;
-constexpr int FA4_QK_N = 64;
+constexpr int FA4_QK_N = 128;
 constexpr int FA4_PV_N = 128;
 constexpr int FA4_QK_K_ITERS = FA4_HEAD_DIM / FA4_MMA_K;
-constexpr int FA4_PV_K_ITERS = 1;
+constexpr int FA4_PV_K_ITERS = FA4_KV_CHUNKS;
+constexpr int FA4_S_BUFS = 2;
 constexpr int FA4_NUM_SLOTS = 16;
 constexpr int FA4_NUM_KV_PAIRS = FA4_NUM_SLOTS / 2;
 
@@ -44,56 +46,52 @@ constexpr int SF_ATOM_BYTES = 512;
 constexpr int Q_DATA_BYTES = FA4_Q_STAGE_ROWS * (FA4_HEAD_DIM / 2);
 constexpr int Q_SF_BYTES = FA4_QK_K_ITERS * SF_ATOM_BYTES;
 constexpr int KV_DATA_BYTES = FA4_KV_TILE * (FA4_HEAD_DIM / 2);
+constexpr int KV_CHUNK_BYTES = KV_DATA_BYTES / FA4_KV_CHUNKS;
 constexpr int K_SF_BYTES = FA4_QK_K_ITERS * SF_ATOM_BYTES;
 constexpr int V_SF_BYTES = FA4_PV_K_ITERS * SF_ATOM_BYTES;
 constexpr int KV_SF_SLOT_BYTES = 1024;
 constexpr int KV_SLOT_BYTES = KV_DATA_BYTES + KV_SF_SLOT_BYTES;
 constexpr int O_STAGE_BYTES = FA4_Q_STAGE_ROWS * FA4_HEAD_DIM * sizeof(__nv_bfloat16);
-constexpr int STATS_ROWS = FA4_Q_STAGES * FA4_Q_STAGE_ROWS;
-constexpr int STATS_BYTES = STATS_ROWS * sizeof(float);
+// Pairwise softmax handoff: partner half-row maxima + lazily updated row max.
+constexpr int STATS_BYTES = 2 * FA4_Q_STAGE_ROWS * sizeof(float);
 
 constexpr int SMEM_Q = 0;
-constexpr int SMEM_SF_Q = SMEM_Q + FA4_Q_STAGES * Q_DATA_BYTES;
-constexpr int SMEM_KV = SMEM_SF_Q + FA4_Q_STAGES * Q_SF_BYTES;
+constexpr int SMEM_SF_Q = SMEM_Q + Q_DATA_BYTES;
+constexpr int SMEM_KV = SMEM_SF_Q + Q_SF_BYTES;
 constexpr int SMEM_O = SMEM_KV + FA4_NUM_SLOTS * KV_SLOT_BYTES;
-constexpr int SMEM_STATS = SMEM_O + FA4_Q_STAGES * O_STAGE_BYTES;
-// Constant fp4 ones matrix (B operand of the row-sum MMA) and its e4m3=1.0
-// scale atom.  Both are constant bytes, so the swizzled layout is irrelevant.
+constexpr int SMEM_STATS = SMEM_O + O_STAGE_BYTES;
 constexpr int SMEM_ONES = SMEM_STATS + STATS_BYTES;
 constexpr int SMEM_ONES_SF = SMEM_ONES + 512;
 constexpr int SMEM_BYTES = SMEM_ONES_SF + 512;
 
-constexpr int TMEM_O0 = 0;
-constexpr int TMEM_O1 = 128;
-constexpr int TMEM_S0 = 256;
-constexpr int TMEM_S1 = 320;
-constexpr int TMEM_P0 = 384;
-constexpr int TMEM_P1 = 392;
-constexpr int TMEM_SFP0 = 400;
-constexpr int TMEM_SFP1 = 404;
-constexpr int TMEM_SFQ0 = 408;
-constexpr int TMEM_SFQ1 = 416;
-constexpr int TMEM_SFK0 = 424;
-constexpr int TMEM_SFK1 = 432;
-constexpr int TMEM_SFV0 = 440;
-constexpr int TMEM_SFV1 = 444;
-constexpr int TMEM_OSUM0 = 448;
-constexpr int TMEM_OSUM1 = 456;
-constexpr int TMEM_SFONES = 464;
+// tmem: O accumulator, two full-width S buffers (ping-pong across KV
+// iterations), row-sum accumulator, and the scale-factor planes.  P and
+// sf_p for chunk c live INSIDE the consumed S buffer at cols c*64 + 0..11.
+constexpr int TMEM_O = 0;
+constexpr int TMEM_S_A = 128;
+constexpr int TMEM_S_B = 256;
+constexpr int TMEM_OSUM = 384;
+constexpr int TMEM_SFQ = 392;
+constexpr int TMEM_SFK0 = 400;
+constexpr int TMEM_SFK1 = 408;
+constexpr int TMEM_SFV0 = 416;
+constexpr int TMEM_SFV1 = 424;
+constexpr int TMEM_SFONES = 432;
 constexpr int TMEM_COLS = 512;
 constexpr int FA4_SUM_N = 8;
 
 enum class MbarId : int {
     QFull = 0,
-    QEmpty = QFull + FA4_Q_STAGES,
-    KVFull = QEmpty + FA4_Q_STAGES,
+    QEmpty = QFull + 1,
+    KVFull = QEmpty + 1,
     KVEmpty = KVFull + FA4_NUM_SLOTS,
     SFull = KVEmpty + FA4_NUM_SLOTS,
-    PO = SFull + FA4_Q_STAGES,
-    StatsFull = PO + FA4_Q_STAGES,
-    OFull = StatsFull + FA4_Q_STAGES,
-    OEpi = OFull + FA4_Q_STAGES,
-    TmemDealloc = OEpi + FA4_Q_STAGES,
+    SEmpty = SFull + FA4_S_BUFS,
+    P0Ready = SEmpty + FA4_S_BUFS,
+    P1Ready = P0Ready + FA4_S_BUFS,
+    OFull = P1Ready + FA4_S_BUFS,
+    OEpi = OFull + 1,
+    TmemDealloc = OEpi + 1,
     Count = TmemDealloc + 1
 };
 
@@ -395,6 +393,12 @@ void tcgen05_ld_32x32bx64(float* dst, uint32_t taddr)
 }
 
 __device__ __forceinline__
+void named_barrier_sync(int id, int count)
+{
+    asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(count));
+}
+
+__device__ __forceinline__
 void tcgen05_ld_32x32bx1(float* dst, uint32_t taddr)
 {
     asm volatile(
@@ -635,17 +639,24 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
     const int kv_head = q_head / q_per_kv;
     const int kv_iters = kv_len / FA4_KV_TILE;
 
+    // wg0: softmax owners (chunk 0, cols 0-63, stats + rescale + epilogue);
+    // wg1: softmax partners (chunk 1, cols 64-127) -- warps w and w+4 share
+    // tmem sub-partition w%4, so both can serve the same 32 rows;
+    // wg2: unused (exits); wg3: mma / epilogue-store / load.
     if (warp_id < 8) {
-        setmaxnreg_inc<152>();
+        setmaxnreg_inc<176>();
     } else if (warp_id < 12) {
-        setmaxnreg_dec<96>();
+        setmaxnreg_dec<80>();
     } else {
         setmaxnreg_dec<80>();
     }
 
     extern __shared__ __align__(1024) char smem_storage[];
     const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_storage));
-    float* stats_acc_scale = reinterpret_cast<float*>(smem_storage + SMEM_STATS);
+    // Pairwise handoff: partner's half-row max in, owner's lazily updated
+    // row max out.  Indexed by row (0..127).
+    float* hmax1 = reinterpret_cast<float*>(smem_storage + SMEM_STATS);
+    float* hm_used = hmax1 + FA4_Q_STAGE_ROWS;
 
     #pragma nv_diag_suppress static_var_with_dynamic_init
     __shared__ uint64_t mbars[static_cast<int>(MbarId::Count)];
@@ -655,19 +666,22 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
     const uint32_t tmem_addr_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&tmem_addr_storage));
 
     if (warp_id == 0 && elect_sync()) {
-        for (int i = 0; i < FA4_Q_STAGES; i++) {
-            mbarrier_init(mbar_base + mbar_offset(MbarId::QFull, i), 1);
-            mbarrier_init(mbar_base + mbar_offset(MbarId::QEmpty, i), 1);
-            mbarrier_init(mbar_base + mbar_offset(MbarId::SFull, i), 1);
-            mbarrier_init(mbar_base + mbar_offset(MbarId::PO, i), 2 * FA4_Q_STAGE_ROWS);
-            mbarrier_init(mbar_base + mbar_offset(MbarId::StatsFull, i), FA4_Q_STAGE_ROWS);
-            mbarrier_init(mbar_base + mbar_offset(MbarId::OFull, i), 1);
-            mbarrier_init(mbar_base + mbar_offset(MbarId::OEpi, i), FA4_Q_STAGE_ROWS);
-        }
+        mbarrier_init(mbar_base + mbar_offset(MbarId::QFull), 1);
+        mbarrier_init(mbar_base + mbar_offset(MbarId::QEmpty), 1);
         for (int i = 0; i < FA4_NUM_SLOTS; i++) {
             mbarrier_init(mbar_base + mbar_offset(MbarId::KVFull, i), 1);
             mbarrier_init(mbar_base + mbar_offset(MbarId::KVEmpty, i), 1);
         }
+        for (int i = 0; i < FA4_S_BUFS; i++) {
+            mbarrier_init(mbar_base + mbar_offset(MbarId::SFull, i), 1);
+            mbarrier_init(mbar_base + mbar_offset(MbarId::SEmpty, i), 1);
+            // Owners: P chunk 0 stored and any O rescale finished.
+            mbarrier_init(mbar_base + mbar_offset(MbarId::P0Ready, i), FA4_Q_STAGE_ROWS);
+            // Partners' P chunk 1 plus the owners' rescale-done arrivals.
+            mbarrier_init(mbar_base + mbar_offset(MbarId::P1Ready, i), 2 * FA4_Q_STAGE_ROWS);
+        }
+        mbarrier_init(mbar_base + mbar_offset(MbarId::OFull), 1);
+        mbarrier_init(mbar_base + mbar_offset(MbarId::OEpi), FA4_Q_STAGE_ROWS);
         mbarrier_init(mbar_base + mbar_offset(MbarId::TmemDealloc), FA4_Q_STAGE_ROWS);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
@@ -684,14 +698,12 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
             ones_data[i] = 0x22222222u;  // fp4 e2m1 1.0 pairs
             ones_sf[i] = 0x38383838u;    // e4m3 1.0
         }
-        // Make the generic-proxy stores visible to the async proxy (MMA
-        // descriptor reads and tcgen05.cp).
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     }
 
     __syncthreads();
 
-    if (warp_id == 15) {
+    if (warp_id == 15 || (warp_id >= 8 && warp_id < 12)) {
         return;
     }
 
@@ -701,42 +713,35 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
     const int kv_global_row_base = (batch * num_kv_heads + kv_head) * kv_len;
     const int v_global_row_base = (batch * num_kv_heads + kv_head) * FA4_HEAD_DIM;
     const int q_blocks_128 = q_len / FA4_Q_STAGE_ROWS;
-    const int kv_blocks_64 = kv_len / FA4_KV_TILE;
+    const int kv_tiles = kv_len / FA4_KV_TILE;
+    const int kv_blocks_64 = kv_len / 64;
     const int q_sf_head_base = (batch * num_q_heads + q_head) * q_blocks_128;
-    const int kv_sf_head_base = (batch * num_kv_heads + kv_head) * kv_blocks_64;
+    const int k_sf_head_base = (batch * num_kv_heads + kv_head) * kv_tiles;
+    const int v_sf_head_base = (batch * num_kv_heads + kv_head) * kv_blocks_64;
 
-    auto q_smem = [&](int stage) -> uint32_t {
-        return smem + SMEM_Q + stage * Q_DATA_BYTES;
-    };
-    auto sf_q_smem = [&](int stage) -> uint32_t {
-        return smem + SMEM_SF_Q + stage * Q_SF_BYTES;
-    };
+    auto q_smem = [&]() -> uint32_t { return smem + SMEM_Q; };
+    auto sf_q_smem = [&]() -> uint32_t { return smem + SMEM_SF_Q; };
     auto kv_slot_smem = [&](int slot) -> uint32_t {
         return smem + SMEM_KV + slot * KV_SLOT_BYTES;
     };
     auto kv_slot_sf_smem = [&](int slot) -> uint32_t {
         return kv_slot_smem(slot) + KV_DATA_BYTES;
     };
-    auto o_stage_smem = [&](int stage) -> uint32_t {
-        return smem + SMEM_O + stage * O_STAGE_BYTES;
+    auto o_stage_smem = [&]() -> uint32_t { return smem + SMEM_O; };
+    auto o_stage_ptr = [&]() -> __nv_bfloat16* {
+        return reinterpret_cast<__nv_bfloat16*>(smem_storage + SMEM_O);
     };
-    auto o_stage_ptr = [&](int stage) -> __nv_bfloat16* {
-        return reinterpret_cast<__nv_bfloat16*>(smem_storage + SMEM_O + stage * O_STAGE_BYTES);
+    auto s_tmem = [&](int buf) -> uint32_t {
+        return tmem_base + (buf == 0 ? TMEM_S_A : TMEM_S_B);
     };
-    auto s_tmem = [&](int stage) -> uint32_t {
-        return tmem_base + (stage == 0 ? TMEM_S0 : TMEM_S1);
+    auto o_tmem = [&]() -> uint32_t { return tmem_base + TMEM_O; };
+    auto o_sum_tmem = [&]() -> uint32_t { return tmem_base + TMEM_OSUM; };
+    // P chunk c and its sf overwrite consumed columns of the live S buffer.
+    auto p_tmem = [&](int buf, int chunk) -> uint32_t {
+        return s_tmem(buf) + chunk * 64;
     };
-    auto o_tmem = [&](int stage) -> uint32_t {
-        return tmem_base + (stage == 0 ? TMEM_O0 : TMEM_O1);
-    };
-    auto p_tmem = [&](int stage) -> uint32_t {
-        return tmem_base + (stage == 0 ? TMEM_P0 : TMEM_P1);
-    };
-    auto sf_p_tmem = [&](int stage) -> uint32_t {
-        return tmem_base + (stage == 0 ? TMEM_SFP0 : TMEM_SFP1);
-    };
-    auto sf_q_tmem = [&](int stage) -> uint32_t {
-        return tmem_base + (stage == 0 ? TMEM_SFQ0 : TMEM_SFQ1);
+    auto sf_p_tmem = [&](int buf, int chunk) -> uint32_t {
+        return s_tmem(buf) + chunk * 64 + 8;
     };
     auto sf_k_tmem = [&](int buffer) -> uint32_t {
         return tmem_base + (buffer == 0 ? TMEM_SFK0 : TMEM_SFK1);
@@ -744,25 +749,20 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
     auto sf_v_tmem = [&](int buffer) -> uint32_t {
         return tmem_base + (buffer == 0 ? TMEM_SFV0 : TMEM_SFV1);
     };
-    auto o_sum_tmem = [&](int stage) -> uint32_t {
-        return tmem_base + (stage == 0 ? TMEM_OSUM0 : TMEM_OSUM1);
-    };
-    auto q_sf_src = [&](int stage) -> const uint8_t* {
-        const int q_stage_block = q_block * FA4_Q_STAGES + stage;
-        return sf_q_atoms + ((q_sf_head_base + q_stage_block) * FA4_QK_K_ITERS) * SF_ATOM_BYTES;
+    auto q_sf_src = [&]() -> const uint8_t* {
+        return sf_q_atoms + ((q_sf_head_base + q_block) * FA4_QK_K_ITERS) * SF_ATOM_BYTES;
     };
     auto k_sf_src = [&](int kv_iter) -> const uint8_t* {
-        return sf_k_atoms + ((kv_sf_head_base + kv_iter) * FA4_QK_K_ITERS) * SF_ATOM_BYTES;
+        return sf_k_atoms + ((k_sf_head_base + kv_iter) * FA4_QK_K_ITERS) * SF_ATOM_BYTES;
     };
     auto v_sf_src = [&](int kv_iter) -> const uint8_t* {
-        return sf_v_atoms + ((kv_sf_head_base + kv_iter) * FA4_PV_K_ITERS) * SF_ATOM_BYTES;
+        return sf_v_atoms + ((v_sf_head_base + kv_iter * FA4_PV_K_ITERS)) * SF_ATOM_BYTES;
     };
 
-    auto issue_q = [&](int stage) {
-        const uint32_t mbar = mbar_base + mbar_offset(MbarId::QFull, stage);
-        const int q_stage_row = q_global_row_base + stage * FA4_Q_STAGE_ROWS;
-        tma_2d_gmem2smem(q_smem(stage), &q_tmap, 0, q_stage_row, mbar);
-        tma_gmem2smem(sf_q_smem(stage), q_sf_src(stage), Q_SF_BYTES, mbar);
+    auto issue_q = [&]() {
+        const uint32_t mbar = mbar_base + mbar_offset(MbarId::QFull);
+        tma_2d_gmem2smem(q_smem(), &q_tmap, 0, q_global_row_base, mbar);
+        tma_gmem2smem(sf_q_smem(), q_sf_src(), Q_SF_BYTES, mbar);
         mbarrier_arrive_expect_tx(mbar, Q_DATA_BYTES + Q_SF_BYTES);
     };
 
@@ -782,17 +782,22 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         mbarrier_wait(mbar_base + mbar_offset(MbarId::KVEmpty, slot), full_phase ^ 1);
 
         const uint32_t mbar = mbar_base + mbar_offset(MbarId::KVFull, slot);
-        const int kv_col = kv_iter * FA4_KV_TILE;
-        tma_2d_gmem2smem(kv_slot_smem(slot), &v_tmap, kv_col, v_global_row_base, mbar);
+        // The 32B-swizzled V tmap box is one 64-kv-wide chunk; issue both.
+        #pragma unroll
+        for (int c = 0; c < FA4_KV_CHUNKS; c++) {
+            const int kv_col = kv_iter * FA4_KV_TILE + c * 64;
+            tma_2d_gmem2smem(kv_slot_smem(slot) + c * KV_CHUNK_BYTES, &v_tmap,
+                             kv_col, v_global_row_base, mbar);
+        }
         tma_gmem2smem(kv_slot_sf_smem(slot), v_sf_src(kv_iter), V_SF_BYTES, mbar);
         mbarrier_arrive_expect_tx(mbar, KV_DATA_BYTES + V_SF_BYTES);
     };
 
-    auto copy_sf_q_to_tmem = [&](int stage) {
-        const uint64_t sf_desc = make_desc_sf(sf_q_smem(stage));
+    auto copy_sf_q_to_tmem = [&]() {
+        const uint64_t sf_desc = make_desc_sf(sf_q_smem());
         #pragma unroll
         for (int d = 0; d < FA4_QK_K_ITERS; d++) {
-            tcgen05_cp(sf_q_tmem(stage) + d * 4, sf_desc + (uint64_t)d * (SF_ATOM_BYTES >> 4));
+            tcgen05_cp(tmem_base + TMEM_SFQ + d * 4, sf_desc + (uint64_t)d * (SF_ATOM_BYTES >> 4));
         }
     };
 
@@ -806,167 +811,178 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
 
     auto copy_sf_v_to_tmem = [&](int slot, int buffer) {
         const uint64_t sf_desc = make_desc_sf(kv_slot_sf_smem(slot));
-        tcgen05_cp(sf_v_tmem(buffer), sf_desc);
+        #pragma unroll
+        for (int c = 0; c < FA4_PV_K_ITERS; c++) {
+            tcgen05_cp(sf_v_tmem(buffer) + c * 4, sf_desc + (uint64_t)c * (SF_ATOM_BYTES >> 4));
+        }
     };
 
-    auto qk_gemm = [&](int stage, int k_slot, int sf_k_buffer) {
+    auto qk_gemm = [&](int buf, int k_slot, int sf_k_buffer) {
         #pragma unroll
         for (int d = 0; d < FA4_QK_K_ITERS; d++) {
-            const uint64_t q_desc = make_desc_data_64b(q_smem(stage) + d * 32);
+            const uint64_t q_desc = make_desc_data_64b(q_smem() + d * 32);
             const uint64_t k_desc = make_desc_data_64b(kv_slot_smem(k_slot) + d * 32);
             tcgen05_mma_nvfp4(
-                s_tmem(stage),
+                s_tmem(buf),
                 q_desc,
                 k_desc,
                 fa4_qk_idesc(),
-                sf_q_tmem(stage) + d * 4,
+                tmem_base + TMEM_SFQ + d * 4,
                 sf_k_tmem(sf_k_buffer) + d * 4,
                 d != 0);
         }
     };
 
-    auto pv_gemm = [&](int stage, int v_slot, int sf_v_buffer, bool accumulate) {
-        const uint64_t v_desc = make_desc_data_32b(kv_slot_smem(v_slot));
+    auto pv_gemm = [&](int buf, int chunk, int v_slot, int sf_v_buffer, bool accumulate) {
+        const uint64_t v_desc = make_desc_data_32b(kv_slot_smem(v_slot) + chunk * KV_CHUNK_BYTES);
         tcgen05_mma_nvfp4_pv(
-            o_tmem(stage),
-            p_tmem(stage),
+            o_tmem(),
+            p_tmem(buf, chunk),
             v_desc,
             fa4_pv_idesc(),
-            sf_p_tmem(stage),
-            sf_v_tmem(sf_v_buffer),
+            sf_p_tmem(buf, chunk),
+            sf_v_tmem(sf_v_buffer) + chunk * 4,
             accumulate ? 1 : 0);
-        // Row-sum ride-along: O_sum = P * ones accumulates sum(P * sf_p) per
-        // row in tmem, replacing the CUDA-core row_sum in the softmax warps.
+        // Row-sum ride-along.
         tcgen05_mma_nvfp4_pv(
-            o_sum_tmem(stage),
-            p_tmem(stage),
+            o_sum_tmem(),
+            p_tmem(buf, chunk),
             make_desc_data_32b(smem + SMEM_ONES),
             fa4_sum_idesc(),
-            sf_p_tmem(stage),
+            sf_p_tmem(buf, chunk),
             tmem_base + TMEM_SFONES,
             accumulate ? 1 : 0);
     };
 
-    auto softmax_tile = [&](int stage) {
-        const int warp_in_stage = warp_id & 3;
-        const int row = warp_in_stage * WARP_SIZE + lane_id;
-        const uint32_t row_tmem = static_cast<uint32_t>(warp_in_stage * WARP_SIZE) << 16;
-        const int stats_idx = stage * FA4_Q_STAGE_ROWS + row;
-        float row_max = TA_MAGIC_FLOOR;
-        int phase = 0;
-
-        for (int iter = 0; iter < kv_iters; iter++) {
-            float scores[FA4_KV_TILE];
-            float block_row_max[FA4_KV_TILE / 16];
-            uint32_t p_words[FA4_KV_TILE / 8];
-            float sf_p[FA4_KV_TILE / 16];
-
-            mbarrier_wait(mbar_base + mbar_offset(MbarId::SFull, stage), phase);
-            tcgen05_fence_after();
-            tcgen05_ld_32x32bx64(scores, s_tmem(stage) + row_tmem);
-
-            #pragma unroll
-            for (int block = 0; block < FA4_KV_TILE / 16; block++) {
-                const float local_max = ta_reduce_max_16(scores + block * 16);
-                const float snapped = fmaxf(fmaf(local_max, softmax_scale_log2, 0.5f) + TA_MAGIC, TA_MAGIC_FLOOR);
-                block_row_max[block] = snapped;
-            }
-            float tile_row_max = ta_fmax3(row_max, block_row_max[0], block_row_max[1]);
-            tile_row_max = ta_fmax3(tile_row_max, block_row_max[2], block_row_max[3]);
-
-            float acc_scale = 1.0f;
-            if (tile_row_max > row_max + LAZY_RESCALE_T) {
-                const float acc_delta = fmaxf((row_max - tile_row_max) + TA_MAGIC, TA_MAGIC_FLOOR);
-                acc_scale = ta_pow2_from_bits(__float_as_uint(acc_delta));
-                row_max = tile_row_max;
-            }
-            stats_acc_scale[stats_idx] = acc_scale;
-
-            // stats_full intentionally has no reverse barrier.  Softmax cannot
-            // overwrite iteration i+1 stats until s_full[i+1], and MMA cannot
-            // issue that until p_o[i], which requires correction to consume
-            // iteration i stats.
-            mbarrier_arrive(mbar_base + mbar_offset(MbarId::StatsFull, stage));
-
-            #pragma unroll
-            for (int block = 0; block < FA4_KV_TILE / 16; block++) {
-                const float block_max = block_row_max[block];
-                const float block_addend = TA_MAGIC_X2 - block_max;
-                const float sf_delta = fmaxf((block_max - row_max) + TA_MAGIC, TA_MAGIC_FLOOR);
-                const float sf_p_block = P_SCALE_RANGE * ta_pow2_from_bits(__float_as_uint(sf_delta));
-                sf_p[block] = sf_p_block;
-                const int col = block * 16;
-
-                {
-                    float p0, p1, p2, p3, p4, p5, p6, p7;
-                    ta_score_to_p2(p0, p1, scores[col + 0], scores[col + 1], softmax_scale_log2, block_addend);
-                    ta_score_to_p2(p2, p3, scores[col + 2], scores[col + 3], softmax_scale_log2, block_addend);
-                    ta_score_to_p2(p4, p5, scores[col + 4], scores[col + 5], softmax_scale_log2, block_addend);
-                    ta_score_to_p2(p6, p7, scores[col + 6], scores[col + 7], softmax_scale_log2, block_addend);
-                    p_words[block * 2] = ta_cvt_8xf32_to_e2m1_packed(
-                        p1, p0, p3, p2,
-                        p5, p4, p7, p6);
-                }
-                {
-                    float p8, p9, p10, p11, p12, p13, p14, p15;
-                    ta_score_to_p2(p8, p9, scores[col + 8], scores[col + 9], softmax_scale_log2, block_addend);
-                    ta_score_to_p2(p10, p11, scores[col + 10], scores[col + 11], softmax_scale_log2, block_addend);
-                    ta_score_to_p2(p12, p13, scores[col + 12], scores[col + 13], softmax_scale_log2, block_addend);
-                    ta_score_to_p2(p14, p15, scores[col + 14], scores[col + 15], softmax_scale_log2, block_addend);
-                    p_words[block * 2 + 1] = ta_cvt_8xf32_to_e2m1_packed(
-                        p9, p8, p11, p10,
-                        p13, p12, p15, p14);
-                }
-            }
-
-            const uint32_t sf_p_word = ta_cvt_4xf32_to_e4m3_packed(sf_p[1], sf_p[0], sf_p[3], sf_p[2]);
-            tcgen05_st_32x32bx8(p_tmem(stage) + row_tmem, p_words);
-            tcgen05_st_32x32bx1(sf_p_tmem(stage) + row_tmem + warp_in_stage, sf_p_word);
-            tcgen05_wait_st();
-            mbarrier_arrive(mbar_base + mbar_offset(MbarId::PO, stage));
-
-            phase ^= 1;
-        }
-    };
-
-    auto correction_rescale = [&](int stage, float scale) {
-        const int warp_in_group = warp_id - 8;
-        const uint32_t row_tmem = static_cast<uint32_t>(warp_in_group * WARP_SIZE) << 16;
+    auto rescale_o = [&](float scale) {
+        const uint32_t row_tmem = static_cast<uint32_t>(warp_id * WARP_SIZE) << 16;
         float vals[32];
         #pragma unroll
         for (int col = 0; col < FA4_HEAD_DIM; col += 32) {
-            tcgen05_ld_32x32bx32(vals, o_tmem(stage) + row_tmem + col);
+            tcgen05_ld_32x32bx32(vals, o_tmem() + row_tmem + col);
             #pragma unroll
             for (int i = 0; i < 32; i += 2) {
                 ta_mul2(vals[i], vals[i + 1], vals[i], vals[i + 1], scale);
             }
-            tcgen05_st_32x32bx32(o_tmem(stage) + row_tmem + col, vals);
+            tcgen05_st_32x32bx32(o_tmem() + row_tmem + col, vals);
         }
         float sums[FA4_SUM_N];
-        tcgen05_ld_32x32bx8(sums, o_sum_tmem(stage) + row_tmem);
+        tcgen05_ld_32x32bx8(sums, o_sum_tmem() + row_tmem);
         #pragma unroll
         for (int i = 0; i < FA4_SUM_N; i += 2) {
             ta_mul2(sums[i], sums[i + 1], sums[i], sums[i + 1], scale);
         }
-        tcgen05_st_32x32bx8(o_sum_tmem(stage) + row_tmem,
+        tcgen05_st_32x32bx8(o_sum_tmem() + row_tmem,
                             reinterpret_cast<const uint32_t*>(sums));
         tcgen05_wait_st();
     };
 
-    auto correction_epilogue = [&](int stage, int row) {
-        const int warp_in_group = warp_id - 8;
-        const uint32_t row_tmem = static_cast<uint32_t>(warp_in_group * WARP_SIZE) << 16;
-        __nv_bfloat16* out = o_stage_ptr(stage) + row * FA4_HEAD_DIM;
-        float vals[32];
+    auto reduce_blocks = [&](const float* scores, float* block_row_max) {
+        #pragma unroll
+        for (int block = 0; block < 4; block++) {
+            const float local_max = ta_reduce_max_16(scores + block * 16);
+            block_row_max[block] = fmaxf(fmaf(local_max, softmax_scale_log2, 0.5f) + TA_MAGIC, TA_MAGIC_FLOOR);
+        }
+    };
 
-        mbarrier_wait(mbar_base + mbar_offset(MbarId::OFull, stage), 0);
+    auto convert_p = [&](int buf, int chunk, const float* scores,
+                         const float* block_row_max, uint32_t row_tmem) {
+        uint32_t p_words[8];
+        #pragma unroll
+        for (int block = 0; block < 4; block++) {
+            const float block_addend = TA_MAGIC_X2 - block_row_max[block];
+            const int col = block * 16;
+            {
+                float p0, p1, p2, p3, p4, p5, p6, p7;
+                ta_score_to_p2(p0, p1, scores[col + 0], scores[col + 1], softmax_scale_log2, block_addend);
+                ta_score_to_p2(p2, p3, scores[col + 2], scores[col + 3], softmax_scale_log2, block_addend);
+                ta_score_to_p2(p4, p5, scores[col + 4], scores[col + 5], softmax_scale_log2, block_addend);
+                ta_score_to_p2(p6, p7, scores[col + 6], scores[col + 7], softmax_scale_log2, block_addend);
+                p_words[block * 2] = ta_cvt_8xf32_to_e2m1_packed(
+                    p1, p0, p3, p2,
+                    p5, p4, p7, p6);
+            }
+            {
+                float p8, p9, p10, p11, p12, p13, p14, p15;
+                ta_score_to_p2(p8, p9, scores[col + 8], scores[col + 9], softmax_scale_log2, block_addend);
+                ta_score_to_p2(p10, p11, scores[col + 10], scores[col + 11], softmax_scale_log2, block_addend);
+                ta_score_to_p2(p12, p13, scores[col + 12], scores[col + 13], softmax_scale_log2, block_addend);
+                ta_score_to_p2(p14, p15, scores[col + 14], scores[col + 15], softmax_scale_log2, block_addend);
+                p_words[block * 2 + 1] = ta_cvt_8xf32_to_e2m1_packed(
+                    p9, p8, p11, p10,
+                    p13, p12, p15, p14);
+            }
+        }
+        tcgen05_st_32x32bx8(p_tmem(buf, chunk) + row_tmem, p_words);
+    };
+
+    auto sf_word_of = [&](const float* bm, float m_used) -> uint32_t {
+        float sf_p[4];
+        #pragma unroll
+        for (int block = 0; block < 4; block++) {
+            const float sf_delta = fmaxf((bm[block] - m_used) + TA_MAGIC, TA_MAGIC_FLOOR);
+            sf_p[block] = P_SCALE_RANGE * ta_pow2_from_bits(__float_as_uint(sf_delta));
+        }
+        return ta_cvt_4xf32_to_e4m3_packed(sf_p[1], sf_p[0], sf_p[3], sf_p[2]);
+    };
+
+    // Owner warp w (0-3): chunk 0 of every tile for rows 32w..32w+31, plus
+    // the lazy row-max bookkeeping, O rescale, and the epilogue.
+    auto softmax_owner = [&]() {
+        const int row = warp_id * WARP_SIZE + lane_id;
+        const uint32_t row_tmem = static_cast<uint32_t>(warp_id * WARP_SIZE) << 16;
+        const int bar_id = 2 + warp_id;
+        float m_used = TA_MAGIC_FLOOR;
+
+        for (int iter = 0; iter < kv_iters; iter++) {
+            const int buf = iter & 1;
+            const int ph = (iter >> 1) & 1;
+            float scores[64];
+            float block_row_max[4];
+
+            mbarrier_wait(mbar_base + mbar_offset(MbarId::SFull, buf), ph);
+            tcgen05_fence_after();
+            tcgen05_ld_32x32bx64(scores, s_tmem(buf) + row_tmem);
+            reduce_blocks(scores, block_row_max);
+            float half_max = ta_fmax3(block_row_max[0], block_row_max[1], block_row_max[2]);
+            half_max = fmaxf(half_max, block_row_max[3]);
+
+            named_barrier_sync(bar_id, 2 * WARP_SIZE);  // partner posted its max
+            const float tile_max = fmaxf(half_max, hmax1[row]);
+            float acc_scale = 1.0f;
+            if (tile_max > m_used + LAZY_RESCALE_T) {
+                const float acc_delta = fmaxf((m_used - tile_max) + TA_MAGIC, TA_MAGIC_FLOOR);
+                acc_scale = ta_pow2_from_bits(__float_as_uint(acc_delta));
+                m_used = tile_max;
+            }
+            hm_used[row] = m_used;
+            named_barrier_sync(bar_id, 2 * WARP_SIZE);  // m_used visible
+
+            // SFull[iter] implies the previous tile's PV completed (commit
+            // chain), so the rare rescale is ordered exactly as before.
+            if (__any_sync(0xffffffffu, acc_scale != 1.0f)) {
+                tcgen05_fence_after();
+                rescale_o(acc_scale);
+            }
+
+            convert_p(buf, 0, scores, block_row_max, row_tmem);
+            tcgen05_st_32x32bx1(sf_p_tmem(buf, 0) + row_tmem + warp_id, sf_word_of(block_row_max, m_used));
+            tcgen05_wait_st();
+            mbarrier_arrive(mbar_base + mbar_offset(MbarId::P0Ready, buf));
+            mbarrier_arrive(mbar_base + mbar_offset(MbarId::P1Ready, buf));
+        }
+
+        // Epilogue: normalise by the tmem row sum and stage O in smem.
+        __nv_bfloat16* out = o_stage_ptr() + row * FA4_HEAD_DIM;
+        float vals[32];
+        mbarrier_wait(mbar_base + mbar_offset(MbarId::OFull), 0);
         tcgen05_fence_after();
         float rs;
-        tcgen05_ld_32x32bx1(&rs, o_sum_tmem(stage) + row_tmem);
+        tcgen05_ld_32x32bx1(&rs, o_sum_tmem() + row_tmem);
         const float norm = ((rs == 0.0f || rs != rs) ? 1.0f : (1.0f / rs)) * v_descale;
         #pragma unroll
         for (int col = 0; col < FA4_HEAD_DIM; col += 32) {
-            tcgen05_ld_32x32bx32(vals, o_tmem(stage) + row_tmem + col);
+            tcgen05_ld_32x32bx32(vals, o_tmem() + row_tmem + col);
             nv_bfloat162* out2 = reinterpret_cast<nv_bfloat162*>(out + col);
             #pragma unroll
             for (int i = 0; i < 16; i++) {
@@ -975,50 +991,45 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
             }
         }
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-        mbarrier_arrive(mbar_base + mbar_offset(MbarId::OEpi, stage));
-    };
-
-    auto correction_loop = [&]() {
-        const int row = (warp_id - 8) * WARP_SIZE + lane_id;
-        mbarrier_arrive(mbar_base + mbar_offset(MbarId::PO, 0));
-        mbarrier_arrive(mbar_base + mbar_offset(MbarId::PO, 1));
-
-        // Consume StatsFull phase 0 (softmax iter 0) so the first wait below
-        // (parity 1) cannot fall through on a fresh mbarrier: a fresh barrier
-        // is indistinguishable from "phase 1 complete" under parity waits.
-        mbarrier_wait(mbar_base + mbar_offset(MbarId::StatsFull, 0), 0);
-        mbarrier_wait(mbar_base + mbar_offset(MbarId::StatsFull, 1), 0);
-
-        int stats_phase = 1;
-        for (int iter = 1; iter < kv_iters; iter++) {
-            #pragma unroll
-            for (int stage = 0; stage < FA4_Q_STAGES; stage++) {
-                mbarrier_wait(mbar_base + mbar_offset(MbarId::StatsFull, stage), stats_phase);
-                const float scale = stats_acc_scale[stage * FA4_Q_STAGE_ROWS + row];
-                const bool should_rescale = __any_sync(0xffffffffu, scale != 1.0f);
-                if (should_rescale) {
-                    tcgen05_fence_after();
-                    correction_rescale(stage, scale);
-                }
-                mbarrier_arrive(mbar_base + mbar_offset(MbarId::PO, stage));
-            }
-            stats_phase ^= 1;
-        }
-
-        #pragma unroll
-        for (int stage = 0; stage < FA4_Q_STAGES; stage++) {
-            correction_epilogue(stage, row);
-        }
+        mbarrier_arrive(mbar_base + mbar_offset(MbarId::OEpi));
         mbarrier_arrive(mbar_base + mbar_offset(MbarId::TmemDealloc));
     };
 
-    auto epilogue_store = [&]() {
-        #pragma unroll
-        for (int stage = 0; stage < FA4_Q_STAGES; stage++) {
-            mbarrier_wait(mbar_base + mbar_offset(MbarId::OEpi, stage), 0);
-            tma_2d_smem2gmem(&o_tmap, 0, q_global_row_base + stage * FA4_Q_STAGE_ROWS, o_stage_smem(stage));
-            cp_async_bulk_commit_group();
+    // Partner warp w+4: chunk 1 (cols 64-127) for the same rows.
+    auto softmax_partner = [&]() {
+        const int w = warp_id - 4;
+        const int row = w * WARP_SIZE + lane_id;
+        const uint32_t row_tmem = static_cast<uint32_t>(w * WARP_SIZE) << 16;
+        const int bar_id = 2 + w;
+
+        for (int iter = 0; iter < kv_iters; iter++) {
+            const int buf = iter & 1;
+            const int ph = (iter >> 1) & 1;
+            float scores[64];
+            float block_row_max[4];
+
+            mbarrier_wait(mbar_base + mbar_offset(MbarId::SFull, buf), ph);
+            tcgen05_fence_after();
+            tcgen05_ld_32x32bx64(scores, s_tmem(buf) + row_tmem + 64);
+            reduce_blocks(scores, block_row_max);
+            float half_max = ta_fmax3(block_row_max[0], block_row_max[1], block_row_max[2]);
+            hmax1[row] = fmaxf(half_max, block_row_max[3]);
+
+            named_barrier_sync(bar_id, 2 * WARP_SIZE);  // max posted
+            named_barrier_sync(bar_id, 2 * WARP_SIZE);  // m_used ready
+            const float m_used = hm_used[row];
+
+            convert_p(buf, 1, scores, block_row_max, row_tmem);
+            tcgen05_st_32x32bx1(sf_p_tmem(buf, 1) + row_tmem + w, sf_word_of(block_row_max, m_used));
+            tcgen05_wait_st();
+            mbarrier_arrive(mbar_base + mbar_offset(MbarId::P1Ready, buf));
         }
+    };
+
+    auto epilogue_store = [&]() {
+        mbarrier_wait(mbar_base + mbar_offset(MbarId::OEpi), 0);
+        tma_2d_smem2gmem(&o_tmap, 0, q_global_row_base, o_stage_smem());
+        cp_async_bulk_commit_group();
         cp_async_bulk_wait_group_read_0();
     };
 
@@ -1027,8 +1038,7 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
             return;
         }
         issue_k(0, 0);
-        issue_q(0);
-        issue_q(1);
+        issue_q();
         issue_v(1, 0);
         for (int iter = 1; iter < kv_iters; iter++) {
             const int k_slot = 2 * (iter % FA4_NUM_KV_PAIRS);
@@ -1043,82 +1053,62 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         if (elected) {
             tcgen05_cp(tmem_base + TMEM_SFONES, make_desc_sf(smem + SMEM_ONES_SF));
 
-            #pragma unroll
-            for (int stage = 0; stage < FA4_Q_STAGES; stage++) {
-                mbarrier_wait(mbar_base + mbar_offset(MbarId::QFull, stage), 0);
-                tcgen05_fence_after();
-                copy_sf_q_to_tmem(stage);
-            }
-
-            constexpr int first_k_slot = 0;
-            mbarrier_wait(mbar_base + mbar_offset(MbarId::KVFull, first_k_slot), 0);
+            mbarrier_wait(mbar_base + mbar_offset(MbarId::QFull), 0);
             tcgen05_fence_after();
-            copy_sf_k_to_tmem(first_k_slot, 0);
-            #pragma unroll
-            for (int stage = 0; stage < FA4_Q_STAGES; stage++) {
-                qk_gemm(stage, first_k_slot, 0);
-                tcgen05_commit(mbar_base + mbar_offset(MbarId::SFull, stage));
-            }
-            tcgen05_commit(mbar_base + mbar_offset(MbarId::KVEmpty, first_k_slot));
+            copy_sf_q_to_tmem();
 
-            bool o_accumulate[FA4_Q_STAGES] = {false, false};
-            int p_phase = 0;
+            mbarrier_wait(mbar_base + mbar_offset(MbarId::KVFull, 0), 0);
+            tcgen05_fence_after();
+            copy_sf_k_to_tmem(0, 0);
+            qk_gemm(0, 0, 0);
+            tcgen05_commit(mbar_base + mbar_offset(MbarId::SFull, 0));
+            tcgen05_commit(mbar_base + mbar_offset(MbarId::KVEmpty, 0));
 
-            for (int iter = 0; iter < kv_iters - 1; iter++) {
-                const int k_slot = 2 * (iter % FA4_NUM_KV_PAIRS);
-                const int v_slot = k_slot + 1;
-                const int next_k_slot = 2 * ((iter + 1) % FA4_NUM_KV_PAIRS);
+            for (int iter = 0; iter < kv_iters; iter++) {
+                const int buf = iter & 1;
+                const int ph = (iter >> 1) & 1;
+                const int v_slot = 2 * (iter % FA4_NUM_KV_PAIRS) + 1;
                 const int v_phase = (iter / FA4_NUM_KV_PAIRS) & 1;
-                const int next_k_phase = ((iter + 1) / FA4_NUM_KV_PAIRS) & 1;
-                const int v_buffer = iter & 1;
-                const int next_k_buffer = (iter + 1) & 1;
+                const int vbuf = iter & 1;
+
+                // Prefetch the next tile's QK first so SFull(iter+1) fires
+                // while softmax is still converting this tile: the single
+                // softmax stream then never stalls on S readiness.
+                if (iter + 1 < kv_iters) {
+                    const int nbuf = (iter + 1) & 1;
+                    const int nk_slot = 2 * ((iter + 1) % FA4_NUM_KV_PAIRS);
+                    const int nk_phase = ((iter + 1) / FA4_NUM_KV_PAIRS) & 1;
+                    const int nuse = (iter + 1) >> 1;
+
+                    mbarrier_wait(mbar_base + mbar_offset(MbarId::KVFull, nk_slot), nk_phase);
+                    tcgen05_fence_after();
+                    copy_sf_k_to_tmem(nk_slot, nbuf);
+                    mbarrier_wait(mbar_base + mbar_offset(MbarId::SEmpty, nbuf), (nuse & 1) ^ 1);
+                    tcgen05_fence_after();
+                    qk_gemm(nbuf, nk_slot, nbuf);
+                    tcgen05_commit(mbar_base + mbar_offset(MbarId::SFull, nbuf));
+                    tcgen05_commit(mbar_base + mbar_offset(MbarId::KVEmpty, nk_slot));
+                }
 
                 mbarrier_wait(mbar_base + mbar_offset(MbarId::KVFull, v_slot), v_phase);
                 tcgen05_fence_after();
-                copy_sf_v_to_tmem(v_slot, v_buffer);
+                copy_sf_v_to_tmem(v_slot, vbuf);
 
-                #pragma unroll
-                for (int stage = 0; stage < FA4_Q_STAGES; stage++) {
-                    mbarrier_wait(mbar_base + mbar_offset(MbarId::PO, stage), p_phase);
-                    tcgen05_fence_after();
-                    pv_gemm(stage, v_slot, v_buffer, o_accumulate[stage]);
-                    o_accumulate[stage] = true;
-
-                    if (stage == 0) {
-                        mbarrier_wait(mbar_base + mbar_offset(MbarId::KVFull, next_k_slot), next_k_phase);
-                        tcgen05_fence_after();
-                        copy_sf_k_to_tmem(next_k_slot, next_k_buffer);
-                    }
-                    qk_gemm(stage, next_k_slot, next_k_buffer);
-                    tcgen05_commit(mbar_base + mbar_offset(MbarId::SFull, stage));
-                }
-
-                tcgen05_commit(mbar_base + mbar_offset(MbarId::KVEmpty, v_slot));
-                tcgen05_commit(mbar_base + mbar_offset(MbarId::KVEmpty, next_k_slot));
-                p_phase ^= 1;
-            }
-
-            #pragma unroll
-            for (int stage = 0; stage < FA4_Q_STAGES; stage++) {
-                tcgen05_commit(mbar_base + mbar_offset(MbarId::QEmpty, stage));
-            }
-
-            const int final_iter = kv_iters - 1;
-            const int final_v_slot = 2 * (final_iter % FA4_NUM_KV_PAIRS) + 1;
-            const int final_v_phase = (final_iter / FA4_NUM_KV_PAIRS) & 1;
-            const int final_v_buffer = final_iter & 1;
-            mbarrier_wait(mbar_base + mbar_offset(MbarId::KVFull, final_v_slot), final_v_phase);
-            tcgen05_fence_after();
-            copy_sf_v_to_tmem(final_v_slot, final_v_buffer);
-
-            #pragma unroll
-            for (int stage = 0; stage < FA4_Q_STAGES; stage++) {
-                mbarrier_wait(mbar_base + mbar_offset(MbarId::PO, stage), p_phase);
+                // Split-P: PV chunk 0 launches while the partners are still
+                // converting chunk 1.
+                mbarrier_wait(mbar_base + mbar_offset(MbarId::P0Ready, buf), ph);
                 tcgen05_fence_after();
-                pv_gemm(stage, final_v_slot, final_v_buffer, o_accumulate[stage]);
-                tcgen05_commit(mbar_base + mbar_offset(MbarId::OFull, stage));
+                pv_gemm(buf, 0, v_slot, vbuf, iter > 0);
+
+                mbarrier_wait(mbar_base + mbar_offset(MbarId::P1Ready, buf), ph);
+                tcgen05_fence_after();
+                pv_gemm(buf, 1, v_slot, vbuf, true);
+                tcgen05_commit(mbar_base + mbar_offset(MbarId::SEmpty, buf));
+                tcgen05_commit(mbar_base + mbar_offset(MbarId::KVEmpty, v_slot));
             }
-            tcgen05_commit(mbar_base + mbar_offset(MbarId::KVEmpty, final_v_slot));
+
+            tcgen05_commit(mbar_base + mbar_offset(MbarId::QEmpty));
+            tcgen05_commit(mbar_base + mbar_offset(MbarId::OFull));
 
             mbarrier_wait(mbar_base + mbar_offset(MbarId::TmemDealloc), 0);
         }
@@ -1128,11 +1118,9 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
     };
 
     if (warp_id < 4) {
-        softmax_tile(0);
+        softmax_owner();
     } else if (warp_id < 8) {
-        softmax_tile(1);
-    } else if (warp_id < 12) {
-        correction_loop();
+        softmax_partner();
     } else if (warp_id == 12) {
         mma_loop();
     } else if (warp_id == 13) {
@@ -1178,7 +1166,7 @@ void fa4_pack_v_sf_atoms_kernel(const uint8_t* __restrict__ sf_v_t,
                                 uint8_t* __restrict__ atoms,
                                 int kv_len)
 {
-    const int tiles = kv_len / FA4_KV_TILE;
+    const int tiles = kv_len / 64;  // sf atoms stay per-64-kv columns
     const int atom_id = blockIdx.x;
     const int tile = atom_id % tiles;
     const int group = atom_id / tiles;
@@ -1461,7 +1449,7 @@ cudaError_t nvfp4_sm100_attention_launch(const void* q,
         return err;
     }
     err = fa4_encode_fp4_tmap(&v_tmap, v_t, kv_len, total_v_rows,
-                              FA4_KV_TILE, FA4_HEAD_DIM,
+                              FA4_MMA_K, FA4_HEAD_DIM,
                               CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B);
     if (err != cudaSuccess) {
         return err;
