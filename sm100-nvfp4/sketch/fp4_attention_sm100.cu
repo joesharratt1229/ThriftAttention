@@ -91,7 +91,9 @@ enum class MbarId : int {
     P1Ready = P0Ready + FA4_S_BUFS,
     OFull = P1Ready + FA4_S_BUFS,
     OEpi = OFull + 1,
-    TmemDealloc = OEpi + 1,
+    OEmpty = OEpi + 1,
+    OStore = OEmpty + 1,
+    TmemDealloc = OStore + 1,
     Count = TmemDealloc + 1
 };
 
@@ -627,16 +629,13 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
                                   int num_q_heads,
                                   int num_kv_heads,
                                   float softmax_scale_log2,
-                                  float v_descale)
+                                  float v_descale,
+                                  int num_tiles)
 {
     const int tid = threadIdx.x;
     const int warp_id = tid / WARP_SIZE;
     const int lane_id = tid & (WARP_SIZE - 1);
-    const int q_block = blockIdx.x;
-    const int q_head = blockIdx.y;
-    const int batch = blockIdx.z;
     const int q_per_kv = num_q_heads / num_kv_heads;
-    const int kv_head = q_head / q_per_kv;
     const int kv_iters = kv_len / FA4_KV_TILE;
 
     // wg0: softmax owners (chunk 0, cols 0-63, stats + rescale + epilogue);
@@ -682,6 +681,8 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         }
         mbarrier_init(mbar_base + mbar_offset(MbarId::OFull), 1);
         mbarrier_init(mbar_base + mbar_offset(MbarId::OEpi), FA4_Q_STAGE_ROWS);
+        mbarrier_init(mbar_base + mbar_offset(MbarId::OEmpty), FA4_Q_STAGE_ROWS);
+        mbarrier_init(mbar_base + mbar_offset(MbarId::OStore), 1);
         mbarrier_init(mbar_base + mbar_offset(MbarId::TmemDealloc), FA4_Q_STAGE_ROWS);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
@@ -708,16 +709,29 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
     }
 
     const uint32_t tmem_base = tmem_addr_storage;
-    const int q_row_base = q_block * FA4_Q_TILE_ROWS;
-    const int q_global_row_base = (batch * num_q_heads + q_head) * q_len + q_row_base;
-    const int kv_global_row_base = (batch * num_kv_heads + kv_head) * kv_len;
-    const int v_global_row_base = (batch * num_kv_heads + kv_head) * FA4_HEAD_DIM;
     const int q_blocks_128 = q_len / FA4_Q_STAGE_ROWS;
     const int kv_tiles = kv_len / FA4_KV_TILE;
     const int kv_blocks_64 = kv_len / 64;
-    const int q_sf_head_base = (batch * num_q_heads + q_head) * q_blocks_128;
-    const int k_sf_head_base = (batch * num_kv_heads + kv_head) * kv_tiles;
-    const int v_sf_head_base = (batch * num_kv_heads + kv_head) * kv_blocks_64;
+
+    // Persistent CTAs: tile coordinates are per-role state (each warp holds
+    // its own copy in registers and re-derives them per tile as needed).
+    int q_block, q_head, batch, kv_head;
+    int q_row_base, q_global_row_base, kv_global_row_base, v_global_row_base;
+    int q_sf_head_base, k_sf_head_base, v_sf_head_base;
+    auto set_tile = [&](int gtile) {
+        q_block = gtile % q_blocks_128;
+        q_head = (gtile / q_blocks_128) % num_q_heads;
+        batch = gtile / (q_blocks_128 * num_q_heads);
+        kv_head = q_head / q_per_kv;
+        q_row_base = q_block * FA4_Q_TILE_ROWS;
+        q_global_row_base = (batch * num_q_heads + q_head) * q_len + q_row_base;
+        kv_global_row_base = (batch * num_kv_heads + kv_head) * kv_len;
+        v_global_row_base = (batch * num_kv_heads + kv_head) * FA4_HEAD_DIM;
+        q_sf_head_base = (batch * num_q_heads + q_head) * q_blocks_128;
+        k_sf_head_base = (batch * num_kv_heads + kv_head) * kv_tiles;
+        v_sf_head_base = (batch * num_kv_heads + kv_head) * kv_blocks_64;
+    };
+    set_tile(blockIdx.x);
 
     auto q_smem = [&]() -> uint32_t { return smem + SMEM_Q; };
     auto sf_q_smem = [&]() -> uint32_t { return smem + SMEM_SF_Q; };
@@ -766,8 +780,8 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         mbarrier_arrive_expect_tx(mbar, Q_DATA_BYTES + Q_SF_BYTES);
     };
 
-    auto issue_k = [&](int slot, int kv_iter) {
-        const int full_phase = (kv_iter / FA4_NUM_KV_PAIRS) & 1;
+    auto issue_k = [&](int slot, int g, int kv_iter) {
+        const int full_phase = (g / FA4_NUM_KV_PAIRS) & 1;
         mbarrier_wait(mbar_base + mbar_offset(MbarId::KVEmpty, slot), full_phase ^ 1);
 
         const uint32_t mbar = mbar_base + mbar_offset(MbarId::KVFull, slot);
@@ -777,8 +791,8 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         mbarrier_arrive_expect_tx(mbar, KV_DATA_BYTES + K_SF_BYTES);
     };
 
-    auto issue_v = [&](int slot, int kv_iter) {
-        const int full_phase = (kv_iter / FA4_NUM_KV_PAIRS) & 1;
+    auto issue_v = [&](int slot, int g, int kv_iter) {
+        const int full_phase = (g / FA4_NUM_KV_PAIRS) & 1;
         mbarrier_wait(mbar_base + mbar_offset(MbarId::KVEmpty, slot), full_phase ^ 1);
 
         const uint32_t mbar = mbar_base + mbar_offset(MbarId::KVFull, slot);
@@ -927,71 +941,87 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
     };
 
     // Owner warp w (0-3): chunk 0 of every tile for rows 32w..32w+31, plus
-    // the lazy row-max bookkeeping, O rescale, and the epilogue.
+    // the lazy row-max bookkeeping, O rescale, and the per-tile epilogue.
+    // All pipeline phases continue across tiles (drain-free persistence).
     auto softmax_owner = [&]() {
         const int row = warp_id * WARP_SIZE + lane_id;
         const uint32_t row_tmem = static_cast<uint32_t>(warp_id * WARP_SIZE) << 16;
         const int bar_id = 2 + warp_id;
-        float m_used = TA_MAGIC_FLOOR;
+        int gi = 0;
 
-        for (int iter = 0; iter < kv_iters; iter++) {
-            const int buf = iter & 1;
-            const int ph = (iter >> 1) & 1;
-            float scores[64];
-            float block_row_max[4];
+        for (int lt = 0, gtile = blockIdx.x; gtile < num_tiles;
+             lt++, gtile += static_cast<int>(gridDim.x)) {
+            float m_used = TA_MAGIC_FLOOR;
 
-            mbarrier_wait(mbar_base + mbar_offset(MbarId::SFull, buf), ph);
-            tcgen05_fence_after();
-            tcgen05_ld_32x32bx64(scores, s_tmem(buf) + row_tmem);
-            reduce_blocks(scores, block_row_max);
-            float half_max = ta_fmax3(block_row_max[0], block_row_max[1], block_row_max[2]);
-            half_max = fmaxf(half_max, block_row_max[3]);
+            for (int iter = 0; iter < kv_iters; iter++) {
+                const int g = gi + iter;
+                const int buf = g & 1;
+                const int ph = (g >> 1) & 1;
+                float scores[64];
+                float block_row_max[4];
 
-            named_barrier_sync(bar_id, 2 * WARP_SIZE);  // partner posted its max
-            const float tile_max = fmaxf(half_max, hmax1[row]);
-            float acc_scale = 1.0f;
-            if (tile_max > m_used + LAZY_RESCALE_T) {
-                const float acc_delta = fmaxf((m_used - tile_max) + TA_MAGIC, TA_MAGIC_FLOOR);
-                acc_scale = ta_pow2_from_bits(__float_as_uint(acc_delta));
-                m_used = tile_max;
-            }
-            hm_used[row] = m_used;
-            named_barrier_sync(bar_id, 2 * WARP_SIZE);  // m_used visible
-
-            // SFull[iter] implies the previous tile's PV completed (commit
-            // chain), so the rare rescale is ordered exactly as before.
-            if (__any_sync(0xffffffffu, acc_scale != 1.0f)) {
+                mbarrier_wait(mbar_base + mbar_offset(MbarId::SFull, buf), ph);
                 tcgen05_fence_after();
-                rescale_o(acc_scale);
+                tcgen05_ld_32x32bx64(scores, s_tmem(buf) + row_tmem);
+                reduce_blocks(scores, block_row_max);
+                float half_max = ta_fmax3(block_row_max[0], block_row_max[1], block_row_max[2]);
+                half_max = fmaxf(half_max, block_row_max[3]);
+
+                named_barrier_sync(bar_id, 2 * WARP_SIZE);  // partner posted its max
+                const float tile_max = fmaxf(half_max, hmax1[row]);
+                float acc_scale = 1.0f;
+                if (tile_max > m_used + LAZY_RESCALE_T) {
+                    const float acc_delta = fmaxf((m_used - tile_max) + TA_MAGIC, TA_MAGIC_FLOOR);
+                    acc_scale = ta_pow2_from_bits(__float_as_uint(acc_delta));
+                    m_used = tile_max;
+                }
+                hm_used[row] = m_used;
+                named_barrier_sync(bar_id, 2 * WARP_SIZE);  // m_used visible
+
+                // SFull implies the previous PV completed (commit chain), so
+                // the rare rescale is ordered; iter 0 rescale can't fire (the
+                // lazy threshold always trips into the acc path fresh, but O
+                // is overwritten by the first PV of the tile anyway).
+                if (iter > 0 && __any_sync(0xffffffffu, acc_scale != 1.0f)) {
+                    tcgen05_fence_after();
+                    rescale_o(acc_scale);
+                }
+
+                convert_p(buf, 0, scores, block_row_max, row_tmem);
+                tcgen05_st_32x32bx1(sf_p_tmem(buf, 0) + row_tmem + warp_id, sf_word_of(block_row_max, m_used));
+                tcgen05_wait_st();
+                mbarrier_arrive(mbar_base + mbar_offset(MbarId::P0Ready, buf));
+                mbarrier_arrive(mbar_base + mbar_offset(MbarId::P1Ready, buf));
             }
+            gi += kv_iters;
 
-            convert_p(buf, 0, scores, block_row_max, row_tmem);
-            tcgen05_st_32x32bx1(sf_p_tmem(buf, 0) + row_tmem + warp_id, sf_word_of(block_row_max, m_used));
-            tcgen05_wait_st();
-            mbarrier_arrive(mbar_base + mbar_offset(MbarId::P0Ready, buf));
-            mbarrier_arrive(mbar_base + mbar_offset(MbarId::P1Ready, buf));
-        }
-
-        // Epilogue: normalise by the tmem row sum and stage O in smem.
-        __nv_bfloat16* out = o_stage_ptr() + row * FA4_HEAD_DIM;
-        float vals[32];
-        mbarrier_wait(mbar_base + mbar_offset(MbarId::OFull), 0);
-        tcgen05_fence_after();
-        float rs;
-        tcgen05_ld_32x32bx1(&rs, o_sum_tmem() + row_tmem);
-        const float norm = ((rs == 0.0f || rs != rs) ? 1.0f : (1.0f / rs)) * v_descale;
-        #pragma unroll
-        for (int col = 0; col < FA4_HEAD_DIM; col += 32) {
-            tcgen05_ld_32x32bx32(vals, o_tmem() + row_tmem + col);
-            nv_bfloat162* out2 = reinterpret_cast<nv_bfloat162*>(out + col);
+            // Per-tile epilogue: normalise by the tmem row sum, stage O in
+            // smem, then release the O accumulator for the next tile.
+            __nv_bfloat16* out = o_stage_ptr() + row * FA4_HEAD_DIM;
+            float vals[32];
+            mbarrier_wait(mbar_base + mbar_offset(MbarId::OFull), lt & 1);
+            tcgen05_fence_after();
+            float rs;
+            tcgen05_ld_32x32bx1(&rs, o_sum_tmem() + row_tmem);
+            const float norm = ((rs == 0.0f || rs != rs) ? 1.0f : (1.0f / rs)) * v_descale;
+            // The store warp must have finished reading the previous tile's
+            // staged O out of smem.
+            mbarrier_wait(mbar_base + mbar_offset(MbarId::OStore), (lt & 1) ^ 1);
             #pragma unroll
-            for (int i = 0; i < 16; i++) {
-                ta_mul2(vals[2 * i], vals[2 * i + 1], vals[2 * i], vals[2 * i + 1], norm);
-                out2[i] = __float22bfloat162_rn({vals[2 * i], vals[2 * i + 1]});
+            for (int col = 0; col < FA4_HEAD_DIM; col += 32) {
+                tcgen05_ld_32x32bx32(vals, o_tmem() + row_tmem + col);
+                nv_bfloat162* out2 = reinterpret_cast<nv_bfloat162*>(out + col);
+                #pragma unroll
+                for (int i = 0; i < 16; i++) {
+                    ta_mul2(vals[2 * i], vals[2 * i + 1], vals[2 * i], vals[2 * i + 1], norm);
+                    out2[i] = __float22bfloat162_rn({vals[2 * i], vals[2 * i + 1]});
+                }
             }
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            mbarrier_arrive(mbar_base + mbar_offset(MbarId::OEpi));
+            mbarrier_arrive(mbar_base + mbar_offset(MbarId::OEmpty));
         }
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-        mbarrier_arrive(mbar_base + mbar_offset(MbarId::OEpi));
+
         mbarrier_arrive(mbar_base + mbar_offset(MbarId::TmemDealloc));
     };
 
@@ -1001,49 +1031,65 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         const int row = w * WARP_SIZE + lane_id;
         const uint32_t row_tmem = static_cast<uint32_t>(w * WARP_SIZE) << 16;
         const int bar_id = 2 + w;
+        int gi = 0;
 
-        for (int iter = 0; iter < kv_iters; iter++) {
-            const int buf = iter & 1;
-            const int ph = (iter >> 1) & 1;
-            float scores[64];
-            float block_row_max[4];
+        for (int gtile = blockIdx.x; gtile < num_tiles; gtile += static_cast<int>(gridDim.x)) {
+            for (int iter = 0; iter < kv_iters; iter++) {
+                const int g = gi + iter;
+                const int buf = g & 1;
+                const int ph = (g >> 1) & 1;
+                float scores[64];
+                float block_row_max[4];
 
-            mbarrier_wait(mbar_base + mbar_offset(MbarId::SFull, buf), ph);
-            tcgen05_fence_after();
-            tcgen05_ld_32x32bx64(scores, s_tmem(buf) + row_tmem + 64);
-            reduce_blocks(scores, block_row_max);
-            float half_max = ta_fmax3(block_row_max[0], block_row_max[1], block_row_max[2]);
-            hmax1[row] = fmaxf(half_max, block_row_max[3]);
+                mbarrier_wait(mbar_base + mbar_offset(MbarId::SFull, buf), ph);
+                tcgen05_fence_after();
+                tcgen05_ld_32x32bx64(scores, s_tmem(buf) + row_tmem + 64);
+                reduce_blocks(scores, block_row_max);
+                float half_max = ta_fmax3(block_row_max[0], block_row_max[1], block_row_max[2]);
+                hmax1[row] = fmaxf(half_max, block_row_max[3]);
 
-            named_barrier_sync(bar_id, 2 * WARP_SIZE);  // max posted
-            named_barrier_sync(bar_id, 2 * WARP_SIZE);  // m_used ready
-            const float m_used = hm_used[row];
+                named_barrier_sync(bar_id, 2 * WARP_SIZE);  // max posted
+                named_barrier_sync(bar_id, 2 * WARP_SIZE);  // m_used ready
+                const float m_used = hm_used[row];
 
-            convert_p(buf, 1, scores, block_row_max, row_tmem);
-            tcgen05_st_32x32bx1(sf_p_tmem(buf, 1) + row_tmem + w, sf_word_of(block_row_max, m_used));
-            tcgen05_wait_st();
-            mbarrier_arrive(mbar_base + mbar_offset(MbarId::P1Ready, buf));
+                convert_p(buf, 1, scores, block_row_max, row_tmem);
+                tcgen05_st_32x32bx1(sf_p_tmem(buf, 1) + row_tmem + w, sf_word_of(block_row_max, m_used));
+                tcgen05_wait_st();
+                mbarrier_arrive(mbar_base + mbar_offset(MbarId::P1Ready, buf));
+            }
+            gi += kv_iters;
         }
     };
 
     auto epilogue_store = [&]() {
-        mbarrier_wait(mbar_base + mbar_offset(MbarId::OEpi), 0);
-        tma_2d_smem2gmem(&o_tmap, 0, q_global_row_base, o_stage_smem());
-        cp_async_bulk_commit_group();
-        cp_async_bulk_wait_group_read_0();
+        for (int lt = 0, gtile = blockIdx.x; gtile < num_tiles;
+             lt++, gtile += static_cast<int>(gridDim.x)) {
+            set_tile(gtile);
+            mbarrier_wait(mbar_base + mbar_offset(MbarId::OEpi), lt & 1);
+            tma_2d_smem2gmem(&o_tmap, 0, q_global_row_base, o_stage_smem());
+            cp_async_bulk_commit_group();
+            cp_async_bulk_wait_group_read_0();
+            mbarrier_arrive(mbar_base + mbar_offset(MbarId::OStore));
+        }
     };
 
     auto load_loop = [&]() {
         if (!elect_sync()) {
             return;
         }
-        issue_k(0, 0);
-        issue_q();
-        issue_v(1, 0);
-        for (int iter = 1; iter < kv_iters; iter++) {
-            const int k_slot = 2 * (iter % FA4_NUM_KV_PAIRS);
-            issue_k(k_slot, iter);
-            issue_v(k_slot + 1, iter);
+        int gi = 0;
+        for (int lt = 0, gtile = blockIdx.x; gtile < num_tiles;
+             lt++, gtile += static_cast<int>(gridDim.x)) {
+            set_tile(gtile);
+            mbarrier_wait(mbar_base + mbar_offset(MbarId::QEmpty), (lt & 1) ^ 1);
+            issue_q();
+            for (int iter = 0; iter < kv_iters; iter++) {
+                const int g = gi + iter;
+                const int k_slot = 2 * (g % FA4_NUM_KV_PAIRS);
+                issue_k(k_slot, g, iter);
+                issue_v(k_slot + 1, g, iter);
+            }
+            gi += kv_iters;
         }
     };
 
@@ -1053,62 +1099,79 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         if (elected) {
             tcgen05_cp(tmem_base + TMEM_SFONES, make_desc_sf(smem + SMEM_ONES_SF));
 
-            mbarrier_wait(mbar_base + mbar_offset(MbarId::QFull), 0);
-            tcgen05_fence_after();
-            copy_sf_q_to_tmem();
+            int gi = 0;
+            for (int lt = 0, gtile = blockIdx.x; gtile < num_tiles;
+                 lt++, gtile += static_cast<int>(gridDim.x)) {
+                mbarrier_wait(mbar_base + mbar_offset(MbarId::QFull), lt & 1);
+                tcgen05_fence_after();
+                copy_sf_q_to_tmem();
 
-            mbarrier_wait(mbar_base + mbar_offset(MbarId::KVFull, 0), 0);
-            tcgen05_fence_after();
-            copy_sf_k_to_tmem(0, 0);
-            qk_gemm(0, 0, 0);
-            tcgen05_commit(mbar_base + mbar_offset(MbarId::SFull, 0));
-            tcgen05_commit(mbar_base + mbar_offset(MbarId::KVEmpty, 0));
-
-            for (int iter = 0; iter < kv_iters; iter++) {
-                const int buf = iter & 1;
-                const int ph = (iter >> 1) & 1;
-                const int v_slot = 2 * (iter % FA4_NUM_KV_PAIRS) + 1;
-                const int v_phase = (iter / FA4_NUM_KV_PAIRS) & 1;
-                const int vbuf = iter & 1;
-
-                // Prefetch the next tile's QK first so SFull(iter+1) fires
-                // while softmax is still converting this tile: the single
-                // softmax stream then never stalls on S readiness.
-                if (iter + 1 < kv_iters) {
-                    const int nbuf = (iter + 1) & 1;
-                    const int nk_slot = 2 * ((iter + 1) % FA4_NUM_KV_PAIRS);
-                    const int nk_phase = ((iter + 1) / FA4_NUM_KV_PAIRS) & 1;
-                    const int nuse = (iter + 1) >> 1;
-
-                    mbarrier_wait(mbar_base + mbar_offset(MbarId::KVFull, nk_slot), nk_phase);
+                // First QK of the tile.
+                {
+                    const int g = gi;
+                    const int buf = g & 1;
+                    const int k_slot = 2 * (g % FA4_NUM_KV_PAIRS);
+                    const int k_phase = (g / FA4_NUM_KV_PAIRS) & 1;
+                    mbarrier_wait(mbar_base + mbar_offset(MbarId::KVFull, k_slot), k_phase);
                     tcgen05_fence_after();
-                    copy_sf_k_to_tmem(nk_slot, nbuf);
-                    mbarrier_wait(mbar_base + mbar_offset(MbarId::SEmpty, nbuf), (nuse & 1) ^ 1);
+                    copy_sf_k_to_tmem(k_slot, buf);
+                    mbarrier_wait(mbar_base + mbar_offset(MbarId::SEmpty, buf), (((g >> 1)) & 1) ^ 1);
                     tcgen05_fence_after();
-                    qk_gemm(nbuf, nk_slot, nbuf);
-                    tcgen05_commit(mbar_base + mbar_offset(MbarId::SFull, nbuf));
-                    tcgen05_commit(mbar_base + mbar_offset(MbarId::KVEmpty, nk_slot));
+                    qk_gemm(buf, k_slot, buf);
+                    tcgen05_commit(mbar_base + mbar_offset(MbarId::SFull, buf));
+                    tcgen05_commit(mbar_base + mbar_offset(MbarId::KVEmpty, k_slot));
                 }
 
-                mbarrier_wait(mbar_base + mbar_offset(MbarId::KVFull, v_slot), v_phase);
-                tcgen05_fence_after();
-                copy_sf_v_to_tmem(v_slot, vbuf);
+                for (int iter = 0; iter < kv_iters; iter++) {
+                    const int g = gi + iter;
+                    const int buf = g & 1;
+                    const int ph = (g >> 1) & 1;
+                    const int v_slot = 2 * (g % FA4_NUM_KV_PAIRS) + 1;
+                    const int v_phase = (g / FA4_NUM_KV_PAIRS) & 1;
+                    const int vbuf = g & 1;
 
-                // Split-P: PV chunk 0 launches while the partners are still
-                // converting chunk 1.
-                mbarrier_wait(mbar_base + mbar_offset(MbarId::P0Ready, buf), ph);
-                tcgen05_fence_after();
-                pv_gemm(buf, 0, v_slot, vbuf, iter > 0);
+                    // Prefetch the next tile's QK first so SFull(g+1) fires
+                    // while softmax is still converting this tile.
+                    if (iter + 1 < kv_iters) {
+                        const int ng = g + 1;
+                        const int nbuf = ng & 1;
+                        const int nk_slot = 2 * (ng % FA4_NUM_KV_PAIRS);
+                        const int nk_phase = (ng / FA4_NUM_KV_PAIRS) & 1;
 
-                mbarrier_wait(mbar_base + mbar_offset(MbarId::P1Ready, buf), ph);
-                tcgen05_fence_after();
-                pv_gemm(buf, 1, v_slot, vbuf, true);
-                tcgen05_commit(mbar_base + mbar_offset(MbarId::SEmpty, buf));
-                tcgen05_commit(mbar_base + mbar_offset(MbarId::KVEmpty, v_slot));
+                        mbarrier_wait(mbar_base + mbar_offset(MbarId::KVFull, nk_slot), nk_phase);
+                        tcgen05_fence_after();
+                        copy_sf_k_to_tmem(nk_slot, nbuf);
+                        mbarrier_wait(mbar_base + mbar_offset(MbarId::SEmpty, nbuf), ((ng >> 1) & 1) ^ 1);
+                        tcgen05_fence_after();
+                        qk_gemm(nbuf, nk_slot, nbuf);
+                        tcgen05_commit(mbar_base + mbar_offset(MbarId::SFull, nbuf));
+                        tcgen05_commit(mbar_base + mbar_offset(MbarId::KVEmpty, nk_slot));
+                    }
+
+                    mbarrier_wait(mbar_base + mbar_offset(MbarId::KVFull, v_slot), v_phase);
+                    tcgen05_fence_after();
+                    copy_sf_v_to_tmem(v_slot, vbuf);
+
+                    mbarrier_wait(mbar_base + mbar_offset(MbarId::P0Ready, buf), ph);
+                    tcgen05_fence_after();
+                    if (iter == 0) {
+                        // Previous tile's epilogue must have released O/O_sum.
+                        mbarrier_wait(mbar_base + mbar_offset(MbarId::OEmpty), (lt & 1) ^ 1);
+                        tcgen05_fence_after();
+                    }
+                    pv_gemm(buf, 0, v_slot, vbuf, iter > 0);
+
+                    mbarrier_wait(mbar_base + mbar_offset(MbarId::P1Ready, buf), ph);
+                    tcgen05_fence_after();
+                    pv_gemm(buf, 1, v_slot, vbuf, true);
+                    tcgen05_commit(mbar_base + mbar_offset(MbarId::SEmpty, buf));
+                    tcgen05_commit(mbar_base + mbar_offset(MbarId::KVEmpty, v_slot));
+                }
+                gi += kv_iters;
+
+                tcgen05_commit(mbar_base + mbar_offset(MbarId::QEmpty));
+                tcgen05_commit(mbar_base + mbar_offset(MbarId::OFull));
             }
-
-            tcgen05_commit(mbar_base + mbar_offset(MbarId::QEmpty));
-            tcgen05_commit(mbar_base + mbar_offset(MbarId::OFull));
 
             mbarrier_wait(mbar_base + mbar_offset(MbarId::TmemDealloc), 0);
         }
@@ -1476,7 +1539,16 @@ cudaError_t nvfp4_sm100_attention_launch(const void* q,
         return err;
     }
 
-    dim3 grid(q_len / FA4_Q_TILE_ROWS, num_q_heads, batch);
+    const int launch_q_blocks = q_len / FA4_Q_TILE_ROWS;
+    const int num_tiles = batch * num_q_heads * launch_q_blocks;
+    int device = 0;
+    cudaGetDevice(&device);
+    int sm_count = 0;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+    if (sm_count <= 0) {
+        sm_count = num_tiles;
+    }
+    dim3 grid(num_tiles < sm_count ? num_tiles : sm_count);
     kernel<<<grid, FA4_THREADS, SMEM_BYTES, stream>>>(
         q_tmap,
         k_tmap,
@@ -1490,7 +1562,8 @@ cudaError_t nvfp4_sm100_attention_launch(const void* q,
         num_q_heads,
         num_kv_heads,
         softmax_scale_log2,
-        v_descale);
+        v_descale,
+        num_tiles);
 
     return cudaGetLastError();
 }

@@ -134,3 +134,35 @@ cos vs SDPA 0.956 unchanged, deterministic, no hangs (default x5, minimum
 
 Remaining (unchanged): drain-free persistence, 2-CTA cluster, causal/
 split-KV, e2e quantise fusion.
+
+DRAIN-FREE PERSISTENCE LANDED (2026-07-03)
+------------------------------------------
+FA4-style persistent CTAs done right this time: grid = min(tiles, SMs),
+NO barrier re-init, NO tile-boundary syncthreads.  A CTA-local cumulative
+iteration counter g keys the whole KV/S pipeline (slot = 2*(g%8), phases
+(g/8)&1, buf = g&1, (g>>1)&1) so phases simply continue across tiles --
+this also handles odd kv_iters (buffer mapping shifts per tile) for free.
+Per-tile resources got two new mbarriers: OEmpty (owners release O/O_sum
+after the epilogue reads; mma waits before each tile's first PV, parity
+(lt&1)^1) and OStore (store warp releases the smem O staging buffer after
+its TMA read completes; owners wait before writing).  Q smem reuse rides
+QFull/QEmpty per tile (parity lt&1).  Only the load warp and the store
+warp re-derive tile addresses (set_tile); mma and softmax are address-free.
+Rescale is skipped at iter==0 of each tile (O is overwritten by the first
+PV; an iter-0 rescale would also touch the previous tile's O unprotected).
+
+Validated: default x5, odd kv_iters (kv=384), multi-tile+odd (q=2048 H=16
+kv=1152, 256 tiles > 148 SMs), min 128x128, GQA 8:2 -- no hangs,
+deterministic, cos unchanged.
+
+Results (interleaved, sustained, H=16, vs FA4):
+  4k:  0.112 -> 0.106 ms  1.25x      8k:  0.360 -> 0.355 ms  1549 TF/s  1.47x
+  16k: 1.532 -> 1.541 ms  1.19x (flat, tail already tiny at 13.8 waves)
+  32k: 6.617 -> 6.318 ms  ~1.5x
+Contrast with the FAILED KV64 persistence attempt (re-init + drain lost
+4-9%): the win is entirely in not draining -- phase continuation plus the
+OEmpty/OStore handoff overlaps tile t's epilogue with tile t+1's start.
+
+Remaining: 2-CTA cluster (halve KV traffic, M=256), causal masking /
+split-KV, e2e quantise+pack fusion, MUFU offload experiment (declined for
+now).
