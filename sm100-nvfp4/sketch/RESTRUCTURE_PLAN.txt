@@ -97,3 +97,40 @@ Conclusions / where the remaining headroom actually is:
     (144 costs ~1.5%); the EXP_APPROX bit-trick softmax needs no
     MUFU.EX2 or ex2-emu tables. Freed units are only useful if some
     future design needs a fatter warp group elsewhere.
+
+RETILE LANDED: KV_TILE=128, single Q stage, split-P (2026-07-03)
+----------------------------------------------------------------
+Shipped design: 128-row Q tile, KV=128 as two K=64 chunks, two full-width
+S buffers ping-ponged across iterations (tmem: O 128 + S 2x128 + OSUM/SFs
+= ~436/512), P + sf_p written into consumed S columns (chunk c at
+S + c*64 + 0..11).  Softmax pairs: warp w owns chunk 0 / rows 32w..+31
+(stats, lazy rescale, epilogue), warp w+4 converts chunk 1 for the same
+rows (legal: same tmem sub-partition), coordinated by two 64-thread named
+barriers per tile through smem (partner max in, m_used out).  PV chunk 0
+launches off P0Ready (count 128) while chunk 1 still converts; P1Ready
+(count 256) also carries the owners' rescale-done arrivals.  wg2 idles.
+V TMA is 2x64-wide boxes (32B-swizzle constraint); K sf atoms are per-128
+rows (extension k_sf_atoms is now [b,h,kv/128,2,512]); V sf atoms stay
+per-64 and are consumed two at a time.
+
+Make-or-break lessons:
+1. QK-prefetch hoist: issuing QK(iter+1) BEFORE the P0(iter) wait is the
+   difference between a regression and the win (0.490 -> 0.366 ms @8k).
+   With one softmax stream, SFull(iter+1) must fire while tile iter is
+   still converting or the whole S-load latency is exposed per tile.
+2. Register regions: parking idle wg2 at setmaxnreg_dec<24> makes ptxas
+   fail allocation kernel-wide (C7600 at any softmax target); keep every
+   warpgroup at >= 80.  Softmax runs at 176 (8*176 + 8*80 = 2048 exactly).
+3. Consolidating both sf words + both barriers onto the owner warp is
+   SLOWER (0.392 vs 0.360): the owner is the critical path; keep the
+   partner doing its own sf word behind the second barrier.
+
+Results (interleaved, sustained, H=16, vs FA4):
+  4k:  0.112 ms  1.19x     8k:  0.360 ms  1528 TF/s  1.43x
+  16k: 1.532 ms  1.21x     32k: 6.617 ms  ~1.25-1.5x (32k FA4 throttles)
+Previous best (KV=64): 0.119 / 0.442 / 1.704 / 6.7 ms.
+cos vs SDPA 0.956 unchanged, deterministic, no hangs (default x5, minimum
+128x128 shape, GQA 8:2).  KV64 snapshot: scratchpad fp4_attention_kv64_best.cu.
+
+Remaining (unchanged): drain-free persistence, 2-CTA cluster, causal/
+split-KV, e2e quantise fusion.
