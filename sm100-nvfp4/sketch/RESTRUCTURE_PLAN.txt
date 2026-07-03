@@ -36,6 +36,28 @@ Attempt log (all at S=8192, baseline 0.463-0.464 ms):
      ~60% of iters at 8k) rides the barrier chain instead of floating
      free on the PO count.
 
+Persistent CTAs: ALSO ATTEMPTED AND REVERTED (negative result)
+--------------------------------------------------------------
+Implementation: grid = min(num_tiles, SM count); each CTA strides over
+(batch, head, q_block) tiles; all mbarriers re-initialised per tile
+between __syncthreads() (safe: the epilogue chain guarantees every
+commit/TMA fired by end of tile); tmem allocated once, freed after the
+loop. Bit-exact vs baseline, deterministic, no hangs -- but SLOWER:
+8k 0.464 -> 0.506 ms, 16k 1.750 -> 1.891 ms (interleaved, sustained).
+
+Why it cannot win at this tile size: with equal-cost 256-row tiles the
+static stripe gives some CTAs ceil(T/148) tiles and some one fewer --
+exactly the same wave-quantization loss the hardware scheduler already
+has (loss = (ceil(T/S)*S - T)/(ceil(T/S)*S), e.g. 13.5% at T=512).
+Dynamic work-stealing via an atomic converges to the same distribution
+for uniform tiles. Meanwhile the software tile switch (2x syncthreads +
+47 mbarrier re-inits + full pipeline drain/refill) is more expensive
+than the hardware CTA switch it replaces. Net: pure overhead.
+The tail loss is only reducible by (a) smaller tiles -- the 128-row
+single-Q-stage retile quarters the quantization error at 16k+, or
+(b) split-KV partial-attention with a combine pass (flash-decoding
+style) for small batch*heads*q_blocks.
+
 Conclusions / where the remaining headroom actually is:
   - Post-rowsum ablation shape: conversion ALU ~35-40%, S tmem loads
     ~20%, rescale ~10%, MMA+TMA+barrier shell ~33%. The conversion can

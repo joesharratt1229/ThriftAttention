@@ -33,6 +33,33 @@ def time_fn(fn, warmup: int, iters: int) -> float:
     return start.elapsed_time(end) / iters
 
 
+def time_interleaved(fn_a, fn_b, warmup: int, iters: int, chunks: int = 10) -> tuple[float, float]:
+    """Time two kernels in alternating chunks so both see the same average
+    thermal/power state (back-to-back blocks bias against whichever runs
+    second once the GPU throttles under sustained load)."""
+    for _ in range(warmup):
+        fn_a()
+        fn_b()
+    chunk = max(1, iters // chunks)
+    total_a = total_b = 0.0
+    n = 0
+    for _ in range(chunks):
+        for fn, acc in ((fn_a, "a"), (fn_b, "b")):
+            s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+            torch.cuda.synchronize()
+            s.record()
+            for _ in range(chunk):
+                fn()
+            e.record()
+            torch.cuda.synchronize()
+            if acc == "a":
+                total_a += s.elapsed_time(e)
+            else:
+                total_b += s.elapsed_time(e)
+        n += chunk
+    return total_a / n, total_b / n
+
+
 def bench_shape(ext, batch: int, heads: int, q_len: int, kv_len: int,
                 warmup: int, iters: int) -> dict:
     device = torch.device("cuda")
@@ -48,13 +75,14 @@ def bench_shape(ext, batch: int, heads: int, q_len: int, kv_len: int,
     pre = ext.quantise_and_attention(q, k, v, scale)
     args = (pre["q_fp4"], pre["k_fp4"], pre["v_t_fp4"],
             pre["q_sf_atoms"], pre["k_sf_atoms"], pre["v_sf_atoms"])
-    nvfp4_ms = time_fn(lambda: ext.attention_only(*args, scale), warmup, iters)
 
     # FA4 wants (B, S, H, D).
     q4 = q.transpose(1, 2).contiguous()
     k4 = k.transpose(1, 2).contiguous()
     v4 = v.transpose(1, 2).contiguous()
-    fa4_ms = time_fn(
+
+    nvfp4_ms, fa4_ms = time_interleaved(
+        lambda: ext.attention_only(*args, scale),
         lambda: flash_attn_func(q4, k4, v4, softmax_scale=scale, causal=False),
         warmup, iters)
 
