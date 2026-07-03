@@ -58,6 +58,27 @@ single-Q-stage retile quarters the quantization error at 16k+, or
 (b) split-KV partial-attention with a combine pass (flash-decoding
 style) for small batch*heads*q_blocks.
 
+LANDED (from the FA4 source analysis): lazy rescale + packed f32x2
+------------------------------------------------------------------
+1. Lazy rescale (FA4 rescale_threshold, softmax.py:300-319 equivalent):
+   row_max only advances when a tile max exceeds it by LAZY_RESCALE_T=4
+   log2 units; acc_scale is exactly 1.0 otherwise so correction rarely
+   fires.  e4m3 headroom reserved via P_SCALE_RANGE = 448/16; the factor
+   cancels exactly in the row-sum normalisation (ones-MMA shares the sf).
+   The old fminf(block_max, row_max) was removed: P is block-relative
+   (it always was; the fmin was a no-op pre-lazy but WRONG post-lazy).
+2. Packed f32x2: ta_fma2/ta_mul2 (fma.rn.f32x2 / mul.f32x2) in the
+   score->P chain, O rescale, and epilogue normalise.  NOTE: max.f32x2
+   does not exist on sm100 (ptxas rejects); floors stay scalar FMNMX.
+   SASS shows ptxas already auto-packs many pairs (FMUL2 x808 vs our 64
+   FFMA2), which is why the manual win is modest.
+Results (interleaved, sustained, H=16): 4k 0.130->0.119 (1.12x vs FA4),
+8k 0.464->0.442 (1.15x), 16k 1.754->1.704 (1.06x), 32k ~6.7 (1.29x).
+Accuracy unchanged (cos 0.9564/0.9558), deterministic, no hangs.
+Rejected while here: dropping the fmaxf floor (~3% more) -- reopens the
+magic-number aliasing hazard (underflow aliases to satfinite 6.0) on
+adversarial inputs.
+
 Conclusions / where the remaining headroom actually is:
   - Post-rowsum ablation shape: conversion ALU ~35-40%, S tmem loads
     ~20%, rescale ~10%, MMA+TMA+barrier shell ~33%. The conversion can

@@ -15,7 +15,14 @@ constexpr uint64_t EVICT_NORMAL = 0x1000000000000000;
 constexpr float TA_MAGIC = 12582912.0f;
 constexpr float TA_MAGIC_FLOOR = TA_MAGIC - 126.0f;
 constexpr float TA_MAGIC_X2 = 25165824.0f;
-constexpr float P_SCALE_RANGE = 448.0f;
+// Lazy rescale (FA4-style rescale_threshold): the row max used for P/sf
+// normalisation only advances when a tile max exceeds it by more than
+// LAZY_RESCALE_T log2 units, so acc_scale is exactly 1.0 (no O rescale) on
+// almost every iteration.  sf_p headroom for the lag is reserved by shrinking
+// the sf range: (448 / 2^T) * 2^lag <= 448 stays exactly representable in
+// e4m3, and the constant factor cancels in the row-sum normalisation.
+constexpr float LAZY_RESCALE_T = 4.0f;
+constexpr float P_SCALE_RANGE = 448.0f / 16.0f;
 
 constexpr int FA4_NUM_WARPS = 16;
 constexpr int FA4_THREADS = FA4_NUM_WARPS * WARP_SIZE;
@@ -493,6 +500,49 @@ float ta_score_to_p(float score, float softmax_scale_log2, float block_addend)
     return ta_pow2x4_from_bits(__float_as_uint(rounded));
 }
 
+// Blackwell paired-lane fp32 ops: one instruction per two elements on the
+// FMA pipe.  Per-lane rounding is identical to the scalar ops.
+__device__ __forceinline__
+void ta_fma2(float& d0, float& d1, float a0, float a1, float b, float c)
+{
+    asm("{\n\t"
+        ".reg .b64 ra, rb, rc, rd;\n\t"
+        "mov.b64 ra, {%2, %3};\n\t"
+        "mov.b64 rb, {%4, %4};\n\t"
+        "mov.b64 rc, {%5, %5};\n\t"
+        "fma.rn.f32x2 rd, ra, rb, rc;\n\t"
+        "mov.b64 {%0, %1}, rd;\n\t"
+        "}"
+        : "=f"(d0), "=f"(d1)
+        : "f"(a0), "f"(a1), "f"(b), "f"(c));
+}
+
+__device__ __forceinline__
+void ta_mul2(float& d0, float& d1, float a0, float a1, float b)
+{
+    asm("{\n\t"
+        ".reg .b64 ra, rb, rd;\n\t"
+        "mov.b64 ra, {%2, %3};\n\t"
+        "mov.b64 rb, {%4, %4};\n\t"
+        "mul.f32x2 rd, ra, rb;\n\t"
+        "mov.b64 {%0, %1}, rd;\n\t"
+        "}"
+        : "=f"(d0), "=f"(d1)
+        : "f"(a0), "f"(a1), "f"(b));
+}
+
+__device__ __forceinline__
+void ta_score_to_p2(float& p0, float& p1, float s0, float s1,
+                    float softmax_scale_log2, float block_addend)
+{
+    float r0, r1;
+    ta_fma2(r0, r1, s0, s1, softmax_scale_log2, block_addend);
+    r0 = fmaxf(r0, TA_MAGIC_FLOOR);
+    r1 = fmaxf(r1, TA_MAGIC_FLOOR);
+    p0 = ta_pow2x4_from_bits(__float_as_uint(r0));
+    p1 = ta_pow2x4_from_bits(__float_as_uint(r1));
+}
+
 __device__ __forceinline__
 uint32_t ta_cvt_8xf32_to_e2m1_packed(float f0, float f1, float f2, float f3,
                                      float f4, float f5, float f6, float f7)
@@ -824,10 +874,12 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
             float tile_row_max = ta_fmax3(row_max, block_row_max[0], block_row_max[1]);
             tile_row_max = ta_fmax3(tile_row_max, block_row_max[2], block_row_max[3]);
 
-            const float old_row_max = row_max;
-            row_max = tile_row_max;
-            const float acc_delta = fmaxf((old_row_max - row_max) + TA_MAGIC, TA_MAGIC_FLOOR);
-            const float acc_scale = ta_pow2_from_bits(__float_as_uint(acc_delta));
+            float acc_scale = 1.0f;
+            if (tile_row_max > row_max + LAZY_RESCALE_T) {
+                const float acc_delta = fmaxf((row_max - tile_row_max) + TA_MAGIC, TA_MAGIC_FLOOR);
+                acc_scale = ta_pow2_from_bits(__float_as_uint(acc_delta));
+                row_max = tile_row_max;
+            }
             stats_acc_scale[stats_idx] = acc_scale;
 
             // stats_full intentionally has no reverse barrier.  Softmax cannot
@@ -838,35 +890,29 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
 
             #pragma unroll
             for (int block = 0; block < FA4_KV_TILE / 16; block++) {
-                const float block_max_scaled = fminf(block_row_max[block], row_max);
-                const float block_addend = TA_MAGIC_X2 - block_max_scaled;
-                const float sf_delta = fmaxf((block_max_scaled - row_max) + TA_MAGIC, TA_MAGIC_FLOOR);
+                const float block_max = block_row_max[block];
+                const float block_addend = TA_MAGIC_X2 - block_max;
+                const float sf_delta = fmaxf((block_max - row_max) + TA_MAGIC, TA_MAGIC_FLOOR);
                 const float sf_p_block = P_SCALE_RANGE * ta_pow2_from_bits(__float_as_uint(sf_delta));
                 sf_p[block] = sf_p_block;
                 const int col = block * 16;
 
                 {
-                    const float p0 = ta_score_to_p(scores[col + 0], softmax_scale_log2, block_addend);
-                    const float p1 = ta_score_to_p(scores[col + 1], softmax_scale_log2, block_addend);
-                    const float p2 = ta_score_to_p(scores[col + 2], softmax_scale_log2, block_addend);
-                    const float p3 = ta_score_to_p(scores[col + 3], softmax_scale_log2, block_addend);
-                    const float p4 = ta_score_to_p(scores[col + 4], softmax_scale_log2, block_addend);
-                    const float p5 = ta_score_to_p(scores[col + 5], softmax_scale_log2, block_addend);
-                    const float p6 = ta_score_to_p(scores[col + 6], softmax_scale_log2, block_addend);
-                    const float p7 = ta_score_to_p(scores[col + 7], softmax_scale_log2, block_addend);
+                    float p0, p1, p2, p3, p4, p5, p6, p7;
+                    ta_score_to_p2(p0, p1, scores[col + 0], scores[col + 1], softmax_scale_log2, block_addend);
+                    ta_score_to_p2(p2, p3, scores[col + 2], scores[col + 3], softmax_scale_log2, block_addend);
+                    ta_score_to_p2(p4, p5, scores[col + 4], scores[col + 5], softmax_scale_log2, block_addend);
+                    ta_score_to_p2(p6, p7, scores[col + 6], scores[col + 7], softmax_scale_log2, block_addend);
                     p_words[block * 2] = ta_cvt_8xf32_to_e2m1_packed(
                         p1, p0, p3, p2,
                         p5, p4, p7, p6);
                 }
                 {
-                    const float p8 = ta_score_to_p(scores[col + 8], softmax_scale_log2, block_addend);
-                    const float p9 = ta_score_to_p(scores[col + 9], softmax_scale_log2, block_addend);
-                    const float p10 = ta_score_to_p(scores[col + 10], softmax_scale_log2, block_addend);
-                    const float p11 = ta_score_to_p(scores[col + 11], softmax_scale_log2, block_addend);
-                    const float p12 = ta_score_to_p(scores[col + 12], softmax_scale_log2, block_addend);
-                    const float p13 = ta_score_to_p(scores[col + 13], softmax_scale_log2, block_addend);
-                    const float p14 = ta_score_to_p(scores[col + 14], softmax_scale_log2, block_addend);
-                    const float p15 = ta_score_to_p(scores[col + 15], softmax_scale_log2, block_addend);
+                    float p8, p9, p10, p11, p12, p13, p14, p15;
+                    ta_score_to_p2(p8, p9, scores[col + 8], scores[col + 9], softmax_scale_log2, block_addend);
+                    ta_score_to_p2(p10, p11, scores[col + 10], scores[col + 11], softmax_scale_log2, block_addend);
+                    ta_score_to_p2(p12, p13, scores[col + 12], scores[col + 13], softmax_scale_log2, block_addend);
+                    ta_score_to_p2(p14, p15, scores[col + 14], scores[col + 15], softmax_scale_log2, block_addend);
                     p_words[block * 2 + 1] = ta_cvt_8xf32_to_e2m1_packed(
                         p9, p8, p11, p10,
                         p13, p12, p15, p14);
@@ -891,16 +937,16 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         for (int col = 0; col < FA4_HEAD_DIM; col += 32) {
             tcgen05_ld_32x32bx32(vals, o_tmem(stage) + row_tmem + col);
             #pragma unroll
-            for (int i = 0; i < 32; i++) {
-                vals[i] *= scale;
+            for (int i = 0; i < 32; i += 2) {
+                ta_mul2(vals[i], vals[i + 1], vals[i], vals[i + 1], scale);
             }
             tcgen05_st_32x32bx32(o_tmem(stage) + row_tmem + col, vals);
         }
         float sums[FA4_SUM_N];
         tcgen05_ld_32x32bx8(sums, o_sum_tmem(stage) + row_tmem);
         #pragma unroll
-        for (int i = 0; i < FA4_SUM_N; i++) {
-            sums[i] *= scale;
+        for (int i = 0; i < FA4_SUM_N; i += 2) {
+            ta_mul2(sums[i], sums[i + 1], sums[i], sums[i + 1], scale);
         }
         tcgen05_st_32x32bx8(o_sum_tmem(stage) + row_tmem,
                             reinterpret_cast<const uint32_t*>(sums));
@@ -924,7 +970,8 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
             nv_bfloat162* out2 = reinterpret_cast<nv_bfloat162*>(out + col);
             #pragma unroll
             for (int i = 0; i < 16; i++) {
-                out2[i] = __float22bfloat162_rn({vals[2 * i] * norm, vals[2 * i + 1] * norm});
+                ta_mul2(vals[2 * i], vals[2 * i + 1], vals[2 * i], vals[2 * i + 1], norm);
+                out2[i] = __float22bfloat162_rn({vals[2 * i], vals[2 * i + 1]});
             }
         }
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
