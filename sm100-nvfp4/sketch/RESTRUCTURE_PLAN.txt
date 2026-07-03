@@ -1,0 +1,61 @@
+12-warp softmax restructure (merge correction warps into softmax duty)
+=======================================================================
+Status: in progress. Baseline to beat: 0.463 ms @ S=8192, 1.551 ms @ 16384
+(nvfp4 attention_only, B200, H=16). FA4: 0.504 / 1.974 ms.
+
+Motivation (measured): after the row-sum offload, score->P conversion is
+still the largest cost and the 4 correction warps are mostly idle. Merging
+them into softmax gives the conversion 1.5x lanes. Register experiment:
+softmax fits at 152 regs with zero perf change and bit-identical output
+(144 -> ~1.5% spill cost), so the budget closes.
+
+New warp layout (16 warps):
+  warps 0-3   stage-0 OWNERS   (152 regs) rows 0-127, one row per lane
+  warps 4-5   stage-0 HELPERS  ( 96 regs) two 32-row groups per warp
+  warps 6-9   stage-1 OWNERS   (152 regs)
+  warps 10-11 stage-1 HELPERS  ( 96 regs)
+  warp  12    mma (80), 13 epilogue-store (80), 14 load (80), 15 exit (80)
+Budget: 8*152 + 4*96 + 4*80 = 1920 warp-units <= 2048 (64K regs/SM). OK.
+
+Column split (block-aligned, slightly owner-heavy; rebalance later if
+warranted): owners handle score blocks 0-2 (cols 0-47), helpers block 3
+(cols 48-63) for 2 row-groups each. Total tmem S reads unchanged (64/row).
+
+Per-iteration flow, per stage group (6 warps, kv_iters loop in lockstep):
+  all 6: mbarrier_wait SFull[stage] (parity as today)
+  helper: tcgen05.ld cols 48-63 for its 2 row-groups; reduce block-3 max
+          per row; write to smem hmax3[stage][row]; bar.sync A (192)
+  owner:  tcgen05.ld cols 0-47; reduce blocks 0-2; bar.sync A; merge
+          hmax3 -> row_max (history in registers, no more smem stats);
+          compute acc_scale + 4 block addends + sf_p word; write
+          haddend3[stage][row] to smem; bar.sync B (192)
+  owner:  rescale O rows (own stage only) when __any_sync(scale != 1);
+          rescale includes the 8 O_sum cols; convert blocks 0-2, st P
+          words 0-5 + sf word; arrive PO[stage]
+  helper: bar.sync B; read haddend3; convert block 3 (x2 row groups), st
+          P words 6-7; arrive PO[stage]
+Named barriers: bar 2 = stage 0 group, bar 3 = stage 1 group, 192 threads.
+SFull[i] pass still implies pv[i-1] complete (commit chain), so the O
+rescale by owners is safe exactly as the old correction-loop ordering was.
+
+Barrier/protocol changes:
+  - StatsFull mbarrier: DELETED (stats live in owner registers now); the
+    fresh-parity seeding waits from the hang fix go away with it.
+  - stats_acc_scale smem: DELETED; replaced by hmax3/haddend3 arrays
+    (2 stages * 128 rows * 2 floats = 2 KB).
+  - PO[stage]: count 256 -> 192 (6 warps arrive once per iter); the
+    correction pre-arm arrivals are gone; mma p_phase sequence unchanged.
+  - Epilogue (OFull wait -> normalize by tmem row-sum -> smem -> OEpi):
+    done by owners for their own stage (128 lanes; halves the old serial
+    two-stage epilogue). OEpi count stays 128.
+  - TmemDealloc: count 128 -> 256 (owners of both stages arrive).
+  - correction_loop / correction_rescale / correction_epilogue lambdas
+    fold into the owner/helper paths.
+
+Validation checklist (all must pass before calling it done):
+  - repeated runs, multiple shapes: no hang (incl. S=4096 small-grid case)
+  - bit-determinism across runs
+  - cos vs fp32 SDPA ~0.956 at several shapes (quantisation-bound)
+  - bench vs FA4 at 4k/8k/16k/32k, watch for clock throttling between runs
+Expected: conversion path ~1.4x faster; S-ld/P-st tmem traffic unchanged;
+net estimate ~10-17% wall clock at S >= 8k.

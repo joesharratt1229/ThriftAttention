@@ -6,10 +6,126 @@
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-
-#include "thriftattention/sm120/cuda_common.cuh"
+#include <cuda_runtime.h>
 
 constexpr int ELEMENTS_PER_THREAD = 16;
+
+__host__ __device__ inline int ta_cdiv(int a, int b) {
+    return (a + b - 1) / b;
+}
+
+__host__ __device__ inline int ta_sage_perm32(int x) {
+    return (x / 8) * 2 + ((x % 8) / 2) * 8 + (x % 2);
+}
+
+__host__ __device__ inline int ta_sage_perm32_inv(int x) {
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        if (ta_sage_perm32(i) == x) {
+            return i;
+        }
+    }
+    return x;
+}
+
+__host__ __device__ inline int ta_sage_perm_seq(int x, bool inverse = false) {
+    const int base = (x / 32) * 32;
+    const int local = x & 31;
+    return base + (inverse ? ta_sage_perm32_inv(local) : ta_sage_perm32(local));
+}
+
+__device__ inline uint32_t ta_cvt_8xf32_to_e2m1_packed(
+    float f0, float f1, float f2, float f3,
+    float f4, float f5, float f6, float f7) {
+    uint32_t packed;
+    asm volatile(
+        "{\n\t"
+        ".reg .b8 a0, a1, a2, a3;\n\t"
+        ".reg .b16 lo, hi;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 a0, %1, %2;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 a1, %3, %4;\n\t"
+        "mov.b16 lo, {a0, a1};\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 a2, %5, %6;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 a3, %7, %8;\n\t"
+        "mov.b16 hi, {a2, a3};\n\t"
+        "mov.b32 %0, {lo, hi};\n\t"
+        "}"
+        : "=r"(packed)
+        : "f"(f0), "f"(f1), "f"(f2), "f"(f3),
+          "f"(f4), "f"(f5), "f"(f6), "f"(f7));
+    return packed;
+}
+
+template <typename T>
+struct PrecisionTraits;
+
+template <>
+struct PrecisionTraits<half> {
+    using scalar = half;
+    using vec2 = __half2;
+
+    static __device__ __forceinline__ float to_float(scalar x) {
+        return __half2float(x);
+    }
+
+    static __device__ __forceinline__ vec2 make_vec2(scalar a, scalar b) {
+        return __halves2half2(a, b);
+    }
+
+    static __device__ __forceinline__ vec2 abs2(vec2 x) {
+        return __habs2(x);
+    }
+
+    static __device__ __forceinline__ vec2 max2(vec2 a, vec2 b) {
+        return __hmax2(a, b);
+    }
+
+    static __device__ __forceinline__ scalar low(vec2 x) {
+        return __low2half(x);
+    }
+
+    static __device__ __forceinline__ scalar high(vec2 x) {
+        return __high2half(x);
+    }
+
+    static __device__ __forceinline__ float2 to_float2(vec2 x) {
+        return __half22float2(x);
+    }
+};
+
+template <>
+struct PrecisionTraits<__nv_bfloat16> {
+    using scalar = __nv_bfloat16;
+    using vec2 = __nv_bfloat162;
+
+    static __device__ __forceinline__ float to_float(scalar x) {
+        return __bfloat162float(x);
+    }
+
+    static __device__ __forceinline__ vec2 make_vec2(scalar a, scalar b) {
+        return __halves2bfloat162(a, b);
+    }
+
+    static __device__ __forceinline__ vec2 abs2(vec2 x) {
+        return __habs2(x);
+    }
+
+    static __device__ __forceinline__ vec2 max2(vec2 a, vec2 b) {
+        return __hmax2(a, b);
+    }
+
+    static __device__ __forceinline__ scalar low(vec2 x) {
+        return __low2bfloat16(x);
+    }
+
+    static __device__ __forceinline__ scalar high(vec2 x) {
+        return __high2bfloat16(x);
+    }
+
+    static __device__ __forceinline__ float2 to_float2(vec2 x) {
+        return __bfloat1622float2(x);
+    }
+};
 
 template<typename T, int SEQ_PER_BLOCK, int THREADS_PER_HEAD>
 __global__

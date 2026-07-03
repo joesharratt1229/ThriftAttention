@@ -43,14 +43,18 @@ constexpr int KV_SF_SLOT_BYTES = 1024;
 constexpr int KV_SLOT_BYTES = KV_DATA_BYTES + KV_SF_SLOT_BYTES;
 constexpr int O_STAGE_BYTES = FA4_Q_STAGE_ROWS * FA4_HEAD_DIM * sizeof(__nv_bfloat16);
 constexpr int STATS_ROWS = FA4_Q_STAGES * FA4_Q_STAGE_ROWS;
-constexpr int STATS_BYTES = STATS_ROWS * 2 * sizeof(float);
+constexpr int STATS_BYTES = STATS_ROWS * sizeof(float);
 
 constexpr int SMEM_Q = 0;
 constexpr int SMEM_SF_Q = SMEM_Q + FA4_Q_STAGES * Q_DATA_BYTES;
 constexpr int SMEM_KV = SMEM_SF_Q + FA4_Q_STAGES * Q_SF_BYTES;
 constexpr int SMEM_O = SMEM_KV + FA4_NUM_SLOTS * KV_SLOT_BYTES;
 constexpr int SMEM_STATS = SMEM_O + FA4_Q_STAGES * O_STAGE_BYTES;
-constexpr int SMEM_BYTES = SMEM_STATS + STATS_BYTES;
+// Constant fp4 ones matrix (B operand of the row-sum MMA) and its e4m3=1.0
+// scale atom.  Both are constant bytes, so the swizzled layout is irrelevant.
+constexpr int SMEM_ONES = SMEM_STATS + STATS_BYTES;
+constexpr int SMEM_ONES_SF = SMEM_ONES + 512;
+constexpr int SMEM_BYTES = SMEM_ONES_SF + 512;
 
 constexpr int TMEM_O0 = 0;
 constexpr int TMEM_O1 = 128;
@@ -66,7 +70,11 @@ constexpr int TMEM_SFK0 = 424;
 constexpr int TMEM_SFK1 = 432;
 constexpr int TMEM_SFV0 = 440;
 constexpr int TMEM_SFV1 = 444;
+constexpr int TMEM_OSUM0 = 448;
+constexpr int TMEM_OSUM1 = 456;
+constexpr int TMEM_SFONES = 464;
 constexpr int TMEM_COLS = 512;
+constexpr int FA4_SUM_N = 8;
 
 enum class MbarId : int {
     QFull = 0,
@@ -347,6 +355,61 @@ void tcgen05_ld_32x32bx32(float* dst, uint32_t taddr)
 }
 
 __device__ __forceinline__
+void tcgen05_ld_32x32bx64(float* dst, uint32_t taddr)
+{
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x64.b32 "
+        "{ %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
+        "  %8,  %9, %10, %11, %12, %13, %14, %15, "
+        " %16, %17, %18, %19, %20, %21, %22, %23, "
+        " %24, %25, %26, %27, %28, %29, %30, %31, "
+        " %32, %33, %34, %35, %36, %37, %38, %39, "
+        " %40, %41, %42, %43, %44, %45, %46, %47, "
+        " %48, %49, %50, %51, %52, %53, %54, %55, "
+        " %56, %57, %58, %59, %60, %61, %62, %63}, [%64];"
+        : "=f"(dst[0]),  "=f"(dst[1]),  "=f"(dst[2]),  "=f"(dst[3]),
+          "=f"(dst[4]),  "=f"(dst[5]),  "=f"(dst[6]),  "=f"(dst[7]),
+          "=f"(dst[8]),  "=f"(dst[9]),  "=f"(dst[10]), "=f"(dst[11]),
+          "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15]),
+          "=f"(dst[16]), "=f"(dst[17]), "=f"(dst[18]), "=f"(dst[19]),
+          "=f"(dst[20]), "=f"(dst[21]), "=f"(dst[22]), "=f"(dst[23]),
+          "=f"(dst[24]), "=f"(dst[25]), "=f"(dst[26]), "=f"(dst[27]),
+          "=f"(dst[28]), "=f"(dst[29]), "=f"(dst[30]), "=f"(dst[31]),
+          "=f"(dst[32]), "=f"(dst[33]), "=f"(dst[34]), "=f"(dst[35]),
+          "=f"(dst[36]), "=f"(dst[37]), "=f"(dst[38]), "=f"(dst[39]),
+          "=f"(dst[40]), "=f"(dst[41]), "=f"(dst[42]), "=f"(dst[43]),
+          "=f"(dst[44]), "=f"(dst[45]), "=f"(dst[46]), "=f"(dst[47]),
+          "=f"(dst[48]), "=f"(dst[49]), "=f"(dst[50]), "=f"(dst[51]),
+          "=f"(dst[52]), "=f"(dst[53]), "=f"(dst[54]), "=f"(dst[55]),
+          "=f"(dst[56]), "=f"(dst[57]), "=f"(dst[58]), "=f"(dst[59]),
+          "=f"(dst[60]), "=f"(dst[61]), "=f"(dst[62]), "=f"(dst[63])
+        : "r"(taddr));
+    asm volatile("tcgen05.wait::ld.sync.aligned;");
+}
+
+__device__ __forceinline__
+void tcgen05_ld_32x32bx1(float* dst, uint32_t taddr)
+{
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x1.b32 {%0}, [%1];"
+        : "=f"(dst[0])
+        : "r"(taddr));
+    asm volatile("tcgen05.wait::ld.sync.aligned;");
+}
+
+__device__ __forceinline__
+void tcgen05_ld_32x32bx8(float* dst, uint32_t taddr)
+{
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x8.b32 "
+        "{ %0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+        : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3]),
+          "=f"(dst[4]), "=f"(dst[5]), "=f"(dst[6]), "=f"(dst[7])
+        : "r"(taddr));
+    asm volatile("tcgen05.wait::ld.sync.aligned;");
+}
+
+__device__ __forceinline__
 void tcgen05_st_32x32bx1(uint32_t taddr, uint32_t src)
 {
     asm volatile(
@@ -487,6 +550,15 @@ uint32_t fa4_pv_idesc()
         |  ((uint32_t)FA4_MMA_M >> 7U << 27U);
 }
 
+__device__ __forceinline__
+uint32_t fa4_sum_idesc()
+{
+    return (1U << 7U)
+        |  (1U << 10U)
+        |  ((uint32_t)FA4_SUM_N >> 3U << 17U)
+        |  ((uint32_t)FA4_MMA_M >> 7U << 27U);
+}
+
 extern "C" __global__
 __launch_bounds__(FA4_THREADS, 1)
 void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
@@ -524,7 +596,6 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
     extern __shared__ __align__(1024) char smem_storage[];
     const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_storage));
     float* stats_acc_scale = reinterpret_cast<float*>(smem_storage + SMEM_STATS);
-    float* stats_row_sum = stats_acc_scale + STATS_ROWS;
 
     #pragma nv_diag_suppress static_var_with_dynamic_init
     __shared__ uint64_t mbars[static_cast<int>(MbarId::Count)];
@@ -554,6 +625,18 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
     if (warp_id == 12) {
         tcgen05_alloc(tmem_addr_smem, TMEM_COLS);
         tcgen05_relinquish_alloc_permit();
+    }
+
+    if (warp_id == 13) {
+        uint32_t* ones_data = reinterpret_cast<uint32_t*>(smem_storage + SMEM_ONES);
+        uint32_t* ones_sf = reinterpret_cast<uint32_t*>(smem_storage + SMEM_ONES_SF);
+        for (int i = lane_id; i < 128; i += WARP_SIZE) {
+            ones_data[i] = 0x22222222u;  // fp4 e2m1 1.0 pairs
+            ones_sf[i] = 0x38383838u;    // e4m3 1.0
+        }
+        // Make the generic-proxy stores visible to the async proxy (MMA
+        // descriptor reads and tcgen05.cp).
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     }
 
     __syncthreads();
@@ -610,6 +693,9 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
     };
     auto sf_v_tmem = [&](int buffer) -> uint32_t {
         return tmem_base + (buffer == 0 ? TMEM_SFV0 : TMEM_SFV1);
+    };
+    auto o_sum_tmem = [&](int stage) -> uint32_t {
+        return tmem_base + (stage == 0 ? TMEM_OSUM0 : TMEM_OSUM1);
     };
     auto q_sf_src = [&](int stage) -> const uint8_t* {
         const int q_stage_block = q_block * FA4_Q_STAGES + stage;
@@ -699,6 +785,16 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
             sf_p_tmem(stage),
             sf_v_tmem(sf_v_buffer),
             accumulate ? 1 : 0);
+        // Row-sum ride-along: O_sum = P * ones accumulates sum(P * sf_p) per
+        // row in tmem, replacing the CUDA-core row_sum in the softmax warps.
+        tcgen05_mma_nvfp4_pv(
+            o_sum_tmem(stage),
+            p_tmem(stage),
+            make_desc_data_32b(smem + SMEM_ONES),
+            fa4_sum_idesc(),
+            sf_p_tmem(stage),
+            tmem_base + TMEM_SFONES,
+            accumulate ? 1 : 0);
     };
 
     auto softmax_tile = [&](int stage) {
@@ -707,7 +803,6 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         const uint32_t row_tmem = static_cast<uint32_t>(warp_in_stage * WARP_SIZE) << 16;
         const int stats_idx = stage * FA4_Q_STAGE_ROWS + row;
         float row_max = TA_MAGIC_FLOOR;
-        float row_sum = 0.0f;
         int phase = 0;
 
         for (int iter = 0; iter < kv_iters; iter++) {
@@ -718,8 +813,7 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
 
             mbarrier_wait(mbar_base + mbar_offset(MbarId::SFull, stage), phase);
             tcgen05_fence_after();
-            tcgen05_ld_32x32bx32(scores, s_tmem(stage) + row_tmem);
-            tcgen05_ld_32x32bx32(scores + 32, s_tmem(stage) + row_tmem + 32);
+            tcgen05_ld_32x32bx64(scores, s_tmem(stage) + row_tmem);
 
             #pragma unroll
             for (int block = 0; block < FA4_KV_TILE / 16; block++) {
@@ -742,11 +836,6 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
             // iteration i stats.
             mbarrier_arrive(mbar_base + mbar_offset(MbarId::StatsFull, stage));
 
-            float row_sum_part0 = 0.0f;
-            float row_sum_part1 = 0.0f;
-            float row_sum_part2 = 0.0f;
-            float row_sum_part3 = 0.0f;
-
             #pragma unroll
             for (int block = 0; block < FA4_KV_TILE / 16; block++) {
                 const float block_max_scaled = fminf(block_row_max[block], row_max);
@@ -756,10 +845,6 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
                 sf_p[block] = sf_p_block;
                 const int col = block * 16;
 
-                float block_sum0 = 0.0f;
-                float block_sum1 = 0.0f;
-                float block_sum2 = 0.0f;
-                float block_sum3 = 0.0f;
                 {
                     const float p0 = ta_score_to_p(scores[col + 0], softmax_scale_log2, block_addend);
                     const float p1 = ta_score_to_p(scores[col + 1], softmax_scale_log2, block_addend);
@@ -772,10 +857,6 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
                     p_words[block * 2] = ta_cvt_8xf32_to_e2m1_packed(
                         p1, p0, p3, p2,
                         p5, p4, p7, p6);
-                    block_sum0 += p0 + p4;
-                    block_sum1 += p1 + p5;
-                    block_sum2 += p2 + p6;
-                    block_sum3 += p3 + p7;
                 }
                 {
                     const float p8 = ta_score_to_p(scores[col + 8], softmax_scale_log2, block_addend);
@@ -789,22 +870,7 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
                     p_words[block * 2 + 1] = ta_cvt_8xf32_to_e2m1_packed(
                         p9, p8, p11, p10,
                         p13, p12, p15, p14);
-                    block_sum0 += p8 + p12;
-                    block_sum1 += p9 + p13;
-                    block_sum2 += p10 + p14;
-                    block_sum3 += p11 + p15;
                 }
-                row_sum_part0 += block_sum0 * sf_p_block;
-                row_sum_part1 += block_sum1 * sf_p_block;
-                row_sum_part2 += block_sum2 * sf_p_block;
-                row_sum_part3 += block_sum3 * sf_p_block;
-            }
-
-            const float row_sum_tile = (row_sum_part0 + row_sum_part1) + (row_sum_part2 + row_sum_part3);
-            const float next_row_sum = row_sum * acc_scale + row_sum_tile;
-            if (iter + 1 == kv_iters) {
-                // Ordered through final p_o -> final pv -> o_full; no terminal stats phase.
-                stats_row_sum[stats_idx] = next_row_sum;
             }
 
             const uint32_t sf_p_word = ta_cvt_4xf32_to_e4m3_packed(sf_p[1], sf_p[0], sf_p[3], sf_p[2]);
@@ -813,7 +879,6 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
             tcgen05_wait_st();
             mbarrier_arrive(mbar_base + mbar_offset(MbarId::PO, stage));
 
-            row_sum = next_row_sum;
             phase ^= 1;
         }
     };
@@ -831,6 +896,14 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
             }
             tcgen05_st_32x32bx32(o_tmem(stage) + row_tmem + col, vals);
         }
+        float sums[FA4_SUM_N];
+        tcgen05_ld_32x32bx8(sums, o_sum_tmem(stage) + row_tmem);
+        #pragma unroll
+        for (int i = 0; i < FA4_SUM_N; i++) {
+            sums[i] *= scale;
+        }
+        tcgen05_st_32x32bx8(o_sum_tmem(stage) + row_tmem,
+                            reinterpret_cast<const uint32_t*>(sums));
         tcgen05_wait_st();
     };
 
@@ -842,8 +915,8 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
 
         mbarrier_wait(mbar_base + mbar_offset(MbarId::OFull, stage), 0);
         tcgen05_fence_after();
-        const int stats_idx = stage * FA4_Q_STAGE_ROWS + row;
-        const float rs = stats_row_sum[stats_idx];
+        float rs;
+        tcgen05_ld_32x32bx1(&rs, o_sum_tmem(stage) + row_tmem);
         const float norm = ((rs == 0.0f || rs != rs) ? 1.0f : (1.0f / rs)) * v_descale;
         #pragma unroll
         for (int col = 0; col < FA4_HEAD_DIM; col += 32) {
@@ -862,6 +935,12 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         const int row = (warp_id - 8) * WARP_SIZE + lane_id;
         mbarrier_arrive(mbar_base + mbar_offset(MbarId::PO, 0));
         mbarrier_arrive(mbar_base + mbar_offset(MbarId::PO, 1));
+
+        // Consume StatsFull phase 0 (softmax iter 0) so the first wait below
+        // (parity 1) cannot fall through on a fresh mbarrier: a fresh barrier
+        // is indistinguishable from "phase 1 complete" under parity waits.
+        mbarrier_wait(mbar_base + mbar_offset(MbarId::StatsFull, 0), 0);
+        mbarrier_wait(mbar_base + mbar_offset(MbarId::StatsFull, 1), 0);
 
         int stats_phase = 1;
         for (int iter = 1; iter < kv_iters; iter++) {
@@ -915,6 +994,8 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         const bool elected = elect_sync() != 0;
 
         if (elected) {
+            tcgen05_cp(tmem_base + TMEM_SFONES, make_desc_sf(smem + SMEM_ONES_SF));
+
             #pragma unroll
             for (int stage = 0; stage < FA4_Q_STAGES; stage++) {
                 mbarrier_wait(mbar_base + mbar_offset(MbarId::QFull, stage), 0);
