@@ -796,13 +796,8 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         mbarrier_wait(mbar_base + mbar_offset(MbarId::KVEmpty, slot), full_phase ^ 1);
 
         const uint32_t mbar = mbar_base + mbar_offset(MbarId::KVFull, slot);
-        // The 32B-swizzled V tmap box is one 64-kv-wide chunk; issue both.
-        #pragma unroll
-        for (int c = 0; c < FA4_KV_CHUNKS; c++) {
-            const int kv_col = kv_iter * FA4_KV_TILE + c * 64;
-            tma_2d_gmem2smem(kv_slot_smem(slot) + c * KV_CHUNK_BYTES, &v_tmap,
-                             kv_col, v_global_row_base, mbar);
-        }
+        tma_2d_gmem2smem(kv_slot_smem(slot), &v_tmap,
+                         kv_iter * FA4_KV_TILE, v_global_row_base, mbar);
         tma_gmem2smem(kv_slot_sf_smem(slot), v_sf_src(kv_iter), V_SF_BYTES, mbar);
         mbarrier_arrive_expect_tx(mbar, KV_DATA_BYTES + V_SF_BYTES);
     };
@@ -848,7 +843,7 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
     };
 
     auto pv_gemm = [&](int buf, int chunk, int v_slot, int sf_v_buffer, bool accumulate) {
-        const uint64_t v_desc = make_desc_data_32b(kv_slot_smem(v_slot) + chunk * KV_CHUNK_BYTES);
+        const uint64_t v_desc = make_desc_data_64b(kv_slot_smem(v_slot) + chunk * 32);
         tcgen05_mma_nvfp4_pv(
             o_tmem(),
             p_tmem(buf, chunk),
@@ -1512,8 +1507,8 @@ cudaError_t nvfp4_sm100_attention_launch(const void* q,
         return err;
     }
     err = fa4_encode_fp4_tmap(&v_tmap, v_t, kv_len, total_v_rows,
-                              FA4_MMA_K, FA4_HEAD_DIM,
-                              CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B);
+                              FA4_KV_TILE, FA4_HEAD_DIM,
+                              CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B);
     if (err != cudaSuccess) {
         return err;
     }
