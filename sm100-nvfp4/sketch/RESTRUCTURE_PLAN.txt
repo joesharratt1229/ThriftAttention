@@ -166,3 +166,23 @@ OEmpty/OStore handoff overlaps tile t's epilogue with tile t+1's start.
 Remaining: 2-CTA cluster (halve KV traffic, M=256), causal masking /
 split-KV, e2e quantise+pack fusion, MUFU offload experiment (declined for
 now).
+
+POST-PERSISTENCE ABLATION + CROSS-TILE QK PREFETCH (2026-07-03)
+---------------------------------------------------------------
+Fresh ablation at S=8192 on the retiled persistent kernel (0.345 ms):
+  score->P conversion 36.6% | S tmem loads 9.2% (was 17-21% pre-retile;
+  the in-loop QK prefetch hid it) | max-reduce ~1% | shell 53.4% (now the
+  majority: MMA + TMA + mbarrier chain + handshake latencies).
+=> The next double-digit lever is the shell: 2-CTA cluster MMA.  The
+conversion remainder is partially covered by split-P already; finer
+split granularity or MUFU offload are the only remaining conversion
+levers.
+
+Cross-tile QK prefetch (double-buffered Q smem, boundary iteration
+issues next tile's first QK): implemented, validated (incl. kv_iters=1
+multi-tile), measured NEUTRAL at 8k and ~2% WORSE at 16k -> reverted.
+Reason: under drain-free persistence the next tile's first QK (issued
+after the tile loop) is already fully hidden behind the softmax
+epilogue's tmem-read/smem-write window; hoisting it before the last PV
+pair only delays the OFull -> epilogue -> OEmpty chain.  Do not retry
+without changing the epilogue overlap structure.
