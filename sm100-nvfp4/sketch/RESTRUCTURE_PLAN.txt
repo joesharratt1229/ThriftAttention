@@ -1,61 +1,56 @@
-12-warp softmax restructure (merge correction warps into softmax duty)
-=======================================================================
-Status: in progress. Baseline to beat: 0.463 ms @ S=8192, 1.551 ms @ 16384
-(nvfp4 attention_only, B200, H=16). FA4: 0.504 / 1.974 ms.
+12-warp softmax restructure: ATTEMPTED AND REVERTED (negative result)
+======================================================================
+Outcome: the shipped kernel remains the 8-softmax + 4-correction design
+with the row-sum MMA offload and x64 S-load. Best measured (B200, H=16):
+  S=8192:  0.464 ms (1.08x vs FA4 0.503)   S=16384: 1.563 ms (1.25x vs 1.953)
+The 12-warp merge was implemented three ways, all bit-exact-validated,
+and all slower. Details below so this isn't re-attempted blindly.
 
-Motivation (measured): after the row-sum offload, score->P conversion is
-still the largest cost and the 4 correction warps are mostly idle. Merging
-them into softmax gives the conversion 1.5x lanes. Register experiment:
-softmax fits at 152 regs with zero perf change and bit-identical output
-(144 -> ~1.5% spill cost), so the budget closes.
+Hard constraint discovered (the crux):
+  tcgen05.ld/st only allow a warp to access tmem lanes of its own
+  sub-partition: warp k touches lanes [32*(k%4), 32*(k%4)+31] ONLY.
+  A "helper" warp therefore CANNOT read S or write P rows belonging to
+  another warp's sub-partition. Attempt 1 (helpers doing tmem ld/st for
+  two row-groups) produced exactly-localized garbage in every foreign
+  sub-partition access (rows 64-191 globally) -- correct rows matched
+  bit-for-bit. This is why the 4-owners-per-stage shape is forced.
 
-New warp layout (16 warps):
-  warps 0-3   stage-0 OWNERS   (152 regs) rows 0-127, one row per lane
-  warps 4-5   stage-0 HELPERS  ( 96 regs) two 32-row groups per warp
-  warps 6-9   stage-1 OWNERS   (152 regs)
-  warps 10-11 stage-1 HELPERS  ( 96 regs)
-  warp  12    mma (80), 13 epilogue-store (80), 14 load (80), 15 exit (80)
-Budget: 8*152 + 4*96 + 4*80 = 1920 warp-units <= 2048 (64K regs/SM). OK.
+Attempt log (all at S=8192, baseline 0.463-0.464 ms):
+  1. Helpers with direct tmem access, 2 row-groups each: ILLEGAL per
+     sub-partition rule -> nondeterministic wrong results.
+  2. Helpers as pure-ALU workers, owners keep all tmem I/O, block-3
+     scores relayed owner->helper via smem, packed fp4 words relayed
+     back; rescale moved into owner path; per-stage 192-thread named
+     barriers 2x/iter:
+       a. row-major smem relay [row][16]: 0.813 ms. 64B lane stride =
+          16-way bank conflicts on every relay access.
+       b. transposed [16][row] (conflict-free): 0.671 ms. Remaining loss
+          is the rescale serialized into the owner critical path (it
+          overlapped in separate warps in the baseline).
+  3. Helpers = old correction role (rescale + epilogue, legal because
+     warps 8-11 sit on sub-partitions 0-3) PLUS block-3 conversion via
+     the smem relay; one global 12-warp barrier pair per iter; PO back
+     to 256 (128 P-ready + 128 rescale-done): 0.587 ms. Still net loss:
+     the ~25% conversion offload (64->48 cols) is outweighed by relay
+     traffic + 2x 384-thread barriers per iteration, and rescale (fires
+     ~60% of iters at 8k) rides the barrier chain instead of floating
+     free on the PO count.
 
-Column split (block-aligned, slightly owner-heavy; rebalance later if
-warranted): owners handle score blocks 0-2 (cols 0-47), helpers block 3
-(cols 48-63) for 2 row-groups each. Total tmem S reads unchanged (64/row).
-
-Per-iteration flow, per stage group (6 warps, kv_iters loop in lockstep):
-  all 6: mbarrier_wait SFull[stage] (parity as today)
-  helper: tcgen05.ld cols 48-63 for its 2 row-groups; reduce block-3 max
-          per row; write to smem hmax3[stage][row]; bar.sync A (192)
-  owner:  tcgen05.ld cols 0-47; reduce blocks 0-2; bar.sync A; merge
-          hmax3 -> row_max (history in registers, no more smem stats);
-          compute acc_scale + 4 block addends + sf_p word; write
-          haddend3[stage][row] to smem; bar.sync B (192)
-  owner:  rescale O rows (own stage only) when __any_sync(scale != 1);
-          rescale includes the 8 O_sum cols; convert blocks 0-2, st P
-          words 0-5 + sf word; arrive PO[stage]
-  helper: bar.sync B; read haddend3; convert block 3 (x2 row groups), st
-          P words 6-7; arrive PO[stage]
-Named barriers: bar 2 = stage 0 group, bar 3 = stage 1 group, 192 threads.
-SFull[i] pass still implies pv[i-1] complete (commit chain), so the O
-rescale by owners is safe exactly as the old correction-loop ordering was.
-
-Barrier/protocol changes:
-  - StatsFull mbarrier: DELETED (stats live in owner registers now); the
-    fresh-parity seeding waits from the hang fix go away with it.
-  - stats_acc_scale smem: DELETED; replaced by hmax3/haddend3 arrays
-    (2 stages * 128 rows * 2 floats = 2 KB).
-  - PO[stage]: count 256 -> 192 (6 warps arrive once per iter); the
-    correction pre-arm arrivals are gone; mma p_phase sequence unchanged.
-  - Epilogue (OFull wait -> normalize by tmem row-sum -> smem -> OEpi):
-    done by owners for their own stage (128 lanes; halves the old serial
-    two-stage epilogue). OEpi count stays 128.
-  - TmemDealloc: count 128 -> 256 (owners of both stages arrive).
-  - correction_loop / correction_rescale / correction_epilogue lambdas
-    fold into the owner/helper paths.
-
-Validation checklist (all must pass before calling it done):
-  - repeated runs, multiple shapes: no hang (incl. S=4096 small-grid case)
-  - bit-determinism across runs
-  - cos vs fp32 SDPA ~0.956 at several shapes (quantisation-bound)
-  - bench vs FA4 at 4k/8k/16k/32k, watch for clock throttling between runs
-Expected: conversion path ~1.4x faster; S-ld/P-st tmem traffic unchanged;
-net estimate ~10-17% wall clock at S >= 8k.
+Conclusions / where the remaining headroom actually is:
+  - Post-rowsum ablation shape: conversion ALU ~35-40%, S tmem loads
+    ~20%, rescale ~10%, MMA+TMA+barrier shell ~33%. The conversion can
+    only be spread to more warps through smem, and the relay+barrier tax
+    eats the gain. Do not retry variants of this without changing the
+    data flow itself.
+  - Rescale frequency is the cheapest remaining target: a thresholded /
+    deferred correction (tolerate the row max lagging by <= 1 log2 step;
+    top-bucket P compresses 8->6 in e2m1) would cut ~60% of rescale
+    firings at the cost of a small, evaluable accuracy hit.
+  - Bigger steps require retiling: KV_TILE=128 with a single Q stage
+    (tmem cannot hold 2 stages of 128-col S), which halves per-tile
+    barrier/SF overhead and rescale frequency per element; or software-
+    pipelining the S load against the previous iteration's conversion.
+  - Register budget knowledge: softmax path is spill-free at 152 regs
+    (144 costs ~1.5%); the EXP_APPROX bit-trick softmax needs no
+    MUFU.EX2 or ex2-emu tables. Freed units are only useful if some
+    future design needs a fatter warp group elsewhere.

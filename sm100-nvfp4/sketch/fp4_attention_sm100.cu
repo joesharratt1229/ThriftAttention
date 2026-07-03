@@ -586,7 +586,7 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
     const int kv_iters = kv_len / FA4_KV_TILE;
 
     if (warp_id < 8) {
-        setmaxnreg_inc<168>();
+        setmaxnreg_inc<152>();
     } else if (warp_id < 12) {
         setmaxnreg_dec<96>();
     } else {
