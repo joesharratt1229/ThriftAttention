@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 from pathlib import Path
 
 import torch
@@ -249,7 +250,9 @@ def print_derived(summary: dict):
     print(f"    tile chain (QFull+OEmpty):          {tile * 100:5.1f}%")
 
 
-def run_instrumented(shapes, batch, heads, warmup, reps, iters, fine=False):
+def run_instrumented(shapes, batch, heads, warmup, reps, iters, fine=False, pair=False):
+    os.environ["FA4_FORCE_PAIR"] = "1" if pair else "0"
+    print(f"variant under profile: {'2-CTA cluster (FA4_FORCE_PAIR=1)' if pair else '1-CTA'}")
     print("building production extension (baseline)...")
     prod = build_variant("fp4_attention_sm100_ext")
     if fine:
@@ -288,7 +291,9 @@ def run_instrumented(shapes, batch, heads, warmup, reps, iters, fine=False):
         torch.cuda.empty_cache()
 
 
-def run_ablations(shapes, batch, heads, warmup, iters):
+def run_ablations(shapes, batch, heads, warmup, iters, pair=False):
+    os.environ["FA4_FORCE_PAIR"] = "1" if pair else "0"
+    print(f"ablations on: {'2-CTA cluster variant' if pair else '1-CTA variant'}")
     print("building production extension (baseline)...")
     prod = build_variant("fp4_attention_sm100_ext")
     variants = []
@@ -331,15 +336,18 @@ def main() -> None:
                     help="also run counterfactual ablation builds")
     ap.add_argument("--fine", action="store_true",
                     help="fine-grained softmax ticks (higher perturbation)")
+    ap.add_argument("--pair", action="store_true",
+                    help="profile the 2-CTA cluster variant (FA4_FORCE_PAIR=1)")
     args = ap.parse_args()
 
     assert torch.cuda.is_available()
     print(f"GPU: {torch.cuda.get_device_name()}")
     run_instrumented(args.seqlens, args.batch, args.heads,
-                     args.warmup, args.reps, args.iters, fine=args.fine)
+                     args.warmup, args.reps, args.iters, fine=args.fine,
+                     pair=args.pair)
     if args.ablate:
         run_ablations(args.seqlens, args.batch, args.heads,
-                      args.warmup, args.iters)
+                      args.warmup, args.iters, pair=args.pair)
 
 
 if __name__ == "__main__":

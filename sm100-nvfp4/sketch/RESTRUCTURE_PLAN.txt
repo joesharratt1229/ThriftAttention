@@ -362,6 +362,97 @@ to ~2 at 8k) from two latent races, both now fixed:
    PV1(g-1) -- before touching O.  Deterministic across 6 runs after; perf
    0.353/1.358 ms at 8k/16k, within noise of the pre-fix kernel.
 
+2-CTA CLUSTER MMA: BUILT, BIT-EXACT, 1.5-1.8x SLOWER -> REVERTED (2026-07-04)
+------------------------------------------------------------------------------
+The full plan (sections A-F) was implemented and validated, then reverted on
+performance.  Working kernel snapshot: fp4_attention_sm100_2cta_snapshot.cu
+(untracked); mechanics evidence in 2CTA_MECHANICS.md + smoke_2cta.cu (T1-T3).
+bench_attention.py (1cta|2cta|fa4 columns via FA4_FORCE_PAIR) and
+profile_breakdown.py --pair remain in the tree but are inert until the
+snapshot is restored (the shipped launcher ignores FA4_FORCE_PAIR).
+
+What was built (all device-validated):
+- template<CTA_PAIR> second kernel from the same source; cluster (2,1,1)
+  launch via cudaLaunchKernelEx; persistent 256-row super-tiles (two adjacent
+  q-blocks of one head), rank r keeps its own 128 rows so softmax/epilogue/
+  store code is untouched.
+- K/V SPLIT along N per the FA4 mechanics (multicast is incompatible with
+  M=256): each CTA TMAs its own 64-row half (halved tmap boxes), KV smem per
+  slot halves to 4KB+1KB sf.  sf atoms duplicated per CTA via 256B-row
+  TENSOR tmaps (box 256x4).
+- Leader-routed completions: all Q/K/V data+sf TMAs carry .cta_group::2 with
+  the mbar operand = mapa'd PAIR-LEADER barrier; leader alone expect_tx's the
+  pair totals (Q 2x9216; K/V 8192 data + 2x1024 sf).
+- Leader-only mma warp: tcgen05.cp/mma cta_group::2 (M=256 idesc), commit
+  multicast mask=3 for SFull/SEmpty/KVEmpty/QEmpty/OFull; P0/P1/OEmpty as
+  remote cluster arrives to the leader (counts 256/512/256); tmem dealloc
+  pair handshake (arrive peer's DeallocPair, wait own, dealloc ::2).
+Validation: bit-exact vs the 1-CTA kernel (torch.equal) on every ladder
+shape -- 512/512, 512/4k, kv=384 odd iters, 2k/2k multi-super-tile, GQA 8:2
+q2048/kv1152, 8k/8k -- deterministic, no hangs.
+
+Measured (interleaved 3-way, sustained, H=16):
+  seq    1cta ms   2cta ms   fa4 ms    2cta vs 1cta
+  2048   0.035     0.053     0.061     0.67x
+  4096   0.111     0.174     0.143     0.64x
+  8192   0.357     0.572     0.511     0.62x
+  16384  1.390     2.235     1.736     0.62x
+  32768  6.068     8.846     7.080     0.69x
+  65536  22.29     34.79     30.21     0.64x
+Uniform ~0.6x at every size => per-iteration cost, not scheduling/tail.
+
+Where the loss lives (profile_breakdown --pair at 8k):
+  softmax busy ballooned 305us -> 524us per warp (~1.7x) while the SHELL
+  mechanics actually IMPROVED (softmax wait-for-S 26% -> 13%; mma leader:
+  KVFull wait 23%, issue 17%).  The leader stalls 47% on P0Ready, i.e. on
+  its own softmax warps' slowed busy chain.  Per-lane remote arrives were
+  the first ~15% of the loss (fixed: fence + __syncwarp + one elected
+  count-32 cluster arrive per warp -- 0.56x -> 0.63x); the remaining ~1.6x
+  softmax slowdown is UNEXPLAINED but consistent with tmem/DSMEM bandwidth
+  contention: every pair MMA pulls half of B from the PEER CTA's smem across
+  the cluster fabric, and the morning ablation showed tmem read bandwidth is
+  THE critical resource (S-load removal alone was -46%).  Bisection of the
+  slowdown (sload/convert ablations under --pair) was not finished.
+
+Hard-won mechanics for any retry (all found the hard way, all on B200
+cuda 13.0 driver 580.126.09):
+  1. ptxas forbids MIXING cta_group::1 and ::2 tcgen05 ops in one kernel;
+     if constexpr-discarded branches are fine (that is why the template
+     builds).  tcgen05.ld/st/wait/fence are group-less and shared.
+  2. cta_group::2 MMA requires N >= 16 (step 16).  The N=8 ones/rowsum MMA
+     traps ILLEGAL INSTRUCTION -- and the trap surfaces at the mma warp's
+     NEXT mbarrier wait (async pipe), which cost hours of misattribution.
+     Fix: rowsum N=16, OSUM widened to 16 tmem cols (only col 0 is read).
+  3. mbarrier.try_wait.parity.acquire.CLUSTER: ptxas accepts, sm_100a traps
+     at runtime.  Use cta-scope waits; CUTLASS's own cluster pipelines do.
+  4. A cta_group::2 tensor-TMA's mbar operand must EXPLICITLY address the
+     pair leader in cluster space (mapa to even rank; FA4 does
+     `and addr, ~0x1000000`).  A plain local offset does NOT auto-route:
+     leader starves (T1 hang before the fix).
+  5. Plain non-tensor cp.async.bulk rejects .cta_group::2, and its
+     shared::cluster remote-mbar form does NOT deliver tx cross-CTA on this
+     part (T3 HANG).  Scale-factor atoms must ride tensor TMAs: 256B-row
+     tmap (TMA box caps at 256 elems/dim), box 256x4 = one tile's 2 atoms.
+  6. tcgen05.cp.cta_group::2 issued by the leader reads EACH CTA's OWN smem
+     at the descriptor offset and fills EACH CTA's OWN tmem; commit
+     multicast (mask 3) fires the local barrier in both CTAs (T2 PASS).
+     So the leader cps sf for the whole pair; no follower relay needed.
+  7. Per-lane remote cluster arrives are prohibitively slow; aggregate to
+     one count-32 arrive per warp (fence::before_thread_sync, __syncwarp,
+     elected lane arrives with count).
+  8. TMA tensor boxes cap each dim at 256 elements (a 512-wide sf box is
+     cudaErrorInvalidValue at encode time).
+
+Verdict: matches the same-day breakdown prediction -- the kernel is softmax-
+chain-bound, so halving shell issue/barrier count cannot pay (predicted
+ceiling ~15-20%; measured -40% because the pair fabric traffic additionally
+slows the softmax chain).  Do NOT retry 2-CTA until (a) the softmax busy
+chain (S-load bandwidth + convert) is structurally cheaper, and (b) the
+tmem/DSMEM contention hypothesis is confirmed or killed by finishing the
+--pair ablation bisection from the snapshot.  Note FA4's own bf16 fwd runs
+2-CTA at these shapes profitably because its balance point differs (no fp4
+convert chain in softmax; MUFU-based exp).
+
 WORK-BREAKDOWN VALIDATION 2026-07-04 (profile_breakdown.py)
 ------------------------------------------------------------
 Tooling: FA4_PROF=1 %clock instrumentation (smem accumulators, coarse
