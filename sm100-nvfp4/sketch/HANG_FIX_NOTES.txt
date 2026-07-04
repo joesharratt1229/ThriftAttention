@@ -147,8 +147,9 @@ Known remaining issues (not causes of this hang, not yet fixed)
    if the extension is ever called under a non-default CUDA stream
    (e.g. torch.cuda.Stream, CUDA graphs). The quantise launchers should
    take and use the same cudaStream_t.
-2. Softmax and correction warps do tcgen05.wait::st but no
-   tcgen05.fence::before_thread_sync before their mbarrier_arrive calls
-   (PO / OEpi). Consumers do have the matching fence::after_thread_sync.
-   Per the PTX memory model the "before" fence should be added ahead of
-   each arrive that publishes tmem stores to another warp.
+2. FIXED 2026-07-04: the missing tcgen05.fence::before_thread_sync ahead
+   of the P0Ready/P1Ready/OEpi/OEmpty arrives was one of TWO races that
+   made the retiled persistent kernel nondeterministic (0.65% of outputs
+   differed run-to-run at 8k).  The other was rescale-vs-PV(g-1) ordering
+   broken by the QK-prefetch hoist.  Both fixes + the validation story
+   are in RESTRUCTURE_PLAN.txt ("CORRECTNESS FIXES LANDED 2026-07-04").

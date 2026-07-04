@@ -336,9 +336,58 @@ G. STANDING TRAPS (all bitten once today -- do not re-learn)
 - setmaxnreg regions: every warpgroup >= 80 or ptxas C7600s kernel-wide.
 - mbarrier parity: producer-start trick only on genuinely fresh barriers;
   waiter must never be 2 phases behind (alias) or 1 early (spurious pass).
+  To BLOCK until commit(g): parity = phase BEFORE that commit; passing the
+  after-phase inverts the wait (falls through / aliases) -- bitten again
+  2026-07-04 in the rescale-order fix.
 - tcgen05 sub-partition rule: warp k touches tmem lanes 32*(k%4) only.
 - Same-thread tcgen05 ops execute in issue order (pipe) -- cross-thread
   needs commit/fence chains.
 - Killed builds leave .torch_extensions/*/lock -> all later builds hang.
 - max.f32x2 does not exist; fma/mul.f32x2 do.
 - 32B-swizzle TMA boxes cap inner extent at 32B (V now uses 64B).
+
+CORRECTNESS FIXES LANDED 2026-07-04 (pre-2-CTA), perf unchanged
+----------------------------------------------------------------
+The kernel was NONDETERMINISTIC run-to-run (0.65% of outputs, |diff| up
+to ~2 at 8k) from two latent races, both now fixed:
+1. Missing tcgen05.fence::before_thread_sync (HANG_FIX known-issue #2):
+   softmax P/sf tmem stores were published via P0Ready/P1Ready arrives,
+   and epilogue O tmem reads via OEpi/OEmpty, with wait::st/ld only.
+   Added tcgen05_fence_before() at all three arrive sites.
+2. Rescale-vs-PV race: the QK-prefetch hoist issues QK(g) BEFORE PV(g-1),
+   so SFull(g)'s commit no longer implies PV(g-1) completed (the old code
+   comment predated the hoist).  A lazy rescale at iter g could then RMW
+   O concurrently with PV(g-1)'s accumulation.  Fix: on the rare rescale
+   branch, wait SEmpty(buf(g-1)) parity (pg>>1)&1 -- committed right after
+   PV1(g-1) -- before touching O.  Deterministic across 6 runs after; perf
+   0.353/1.358 ms at 8k/16k, within noise of the pre-fix kernel.
+
+WORK-BREAKDOWN VALIDATION 2026-07-04 (profile_breakdown.py)
+------------------------------------------------------------
+Tooling: FA4_PROF=1 %clock instrumentation (smem accumulators, coarse
+softmax ticks; +7.6% wall, bit-exact) + FA4_ABLATE_* counterfactual
+builds interleave-timed vs production (unperturbed).  ncu is blocked in
+this container (ERR_NVGPUCTRPERM); this replaces it.
+Ablations at 8k (16k tracks within 2 points), STANDALONE deltas:
+  remove ALL softmax work -> 0.179 ms = 50.9% left  (the "53% shell" -- holds)
+  remove S tmem loads     -> 0.188 ms (-46.6%)  [zero-score caveat: also
+                             quiets rescale ~5%; true ~41%]
+  remove convert+P stores -> 0.212 ms (-39.8%)
+  remove max reduce       -> -6.6% | remove rescale -> -5.3%
+  remove K/V TMA data     -> -0.5% i.e. NEUTRAL: DRAM is not a bottleneck
+NOTE the old per-component numbers (conv 36.6 / sload 9.2 / shell 53.4)
+were SEQUENTIAL marginals; sload standalone is ~41-47%, and either of
+{sload, convert} alone collapses the wall to ~the shell floor.
+Instrumented view: softmax warps 72-74% busy / ~26% waiting for S; mma
+warp waits 33% on KVFull (queue pacing, NOT DRAM -- see ablation), 37% on
+softmax (SEmpty+P0+P1), 29% issuing; P0 wait (owners, 22%) >> P1 (6%).
+=> The wall is softmax-CHAIN-bound, not shell-bound.  The shell only
+   costs its EXPOSED part (~26%).  Consequences for 2-CTA: KV-traffic
+   halving is worth ~0 here; the win is halved issue/commit+barrier count
+   (part of the exposed 26%) and halved KV smem (deeper pipeline).
+   Realistic 2-CTA ceiling ~10-20%, NOT a 2x step function.  The 2x-class
+   lever this data points at is the softmax busy chain itself: S tmem
+   load bandwidth (~41-47%) and convert ALU (~40%), which 2-CTA leaves
+   per-CTA-identical.  (FA4's own fwd already runs 2-CTA at these shapes,
+   per the mechanics extraction -- the baseline we chase is a 2-CTA
+   kernel.)

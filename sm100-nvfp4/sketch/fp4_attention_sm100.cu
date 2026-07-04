@@ -55,6 +55,47 @@ constexpr int O_STAGE_BYTES = FA4_Q_STAGE_ROWS * FA4_HEAD_DIM * sizeof(__nv_bflo
 // Pairwise softmax handoff: partner half-row maxima + lazily updated row max.
 constexpr int STATS_BYTES = 2 * FA4_Q_STAGE_ROWS * sizeof(float);
 
+// ---------------------------------------------------------------------------
+// Optional instrumentation (FA4_PROF=1) and ablation (FA4_ABLATE_*=1) builds,
+// driven by profile_breakdown.py.  All flags default OFF and compile to
+// nothing: the production kernel is unchanged.
+// ---------------------------------------------------------------------------
+#ifndef FA4_PROF
+#define FA4_PROF 0
+#endif
+// Softmax-warp tick granularity: the softmax warps ARE the critical path, so
+// their ticks perturb the pipeline.  1 = wait-vs-busy only (2 ticks/iter,
+// low perturbation, the default used by profile_breakdown.py); 2 = also
+// split S-load / stats / convert (adds ~10-15% wall time -- use the ablation
+// mode for an unperturbed view of that sub-structure).
+#ifndef FA4_PROF_SM_LEVEL
+#define FA4_PROF_SM_LEVEL 2
+#endif
+#ifndef FA4_ABLATE_SLOAD      // skip the S tmem score loads (scores read as 0)
+#define FA4_ABLATE_SLOAD 0
+#endif
+#ifndef FA4_ABLATE_REDMAX     // skip the block-max reduction (constant maxima)
+#define FA4_ABLATE_REDMAX 0
+#endif
+#ifndef FA4_ABLATE_CONVERT    // skip score->P conversion and the P/sf stores
+#define FA4_ABLATE_CONVERT 0
+#endif
+#ifndef FA4_ABLATE_RESCALE    // never rescale O (lazy stats still maintained)
+#define FA4_ABLATE_RESCALE 0
+#endif
+#ifndef FA4_ABLATE_KV_TMA     // fetch only K/V scale atoms, not the data tiles
+#define FA4_ABLATE_KV_TMA 0
+#endif
+
+// Per-(CTA, warp) cycle accumulators.  Slot = warp_id for softmax owners
+// (0-3) and partners (4-7); 8 = mma, 9 = load, 10 = store.  Category meaning
+// is per-role; the label tables live in profile_breakdown.py.  The last
+// category is the warp's total span.
+constexpr int PROF_MAX_CTAS = 160;
+constexpr int PROF_SLOTS = 12;
+constexpr int PROF_CATS = 12;
+constexpr int PROF_SPAN = PROF_CATS - 1;
+
 constexpr int SMEM_Q = 0;
 constexpr int SMEM_SF_Q = SMEM_Q + Q_DATA_BYTES;
 constexpr int SMEM_KV = SMEM_SF_Q + Q_SF_BYTES;
@@ -62,7 +103,11 @@ constexpr int SMEM_O = SMEM_KV + FA4_NUM_SLOTS * KV_SLOT_BYTES;
 constexpr int SMEM_STATS = SMEM_O + O_STAGE_BYTES;
 constexpr int SMEM_ONES = SMEM_STATS + STATS_BYTES;
 constexpr int SMEM_ONES_SF = SMEM_ONES + 512;
-constexpr int SMEM_BYTES = SMEM_ONES_SF + 512;
+constexpr int SMEM_PROF = SMEM_ONES_SF + 512;
+// Profiling accumulators live in smem (single-lane adds), not registers: the
+// softmax paths sit at the spill boundary, and register accumulators spilled
+// to local memory, inflating the very segments being measured.
+constexpr int SMEM_BYTES = SMEM_PROF + (FA4_PROF ? PROF_SLOTS * PROF_CATS * 4 : 0);
 
 // tmem: O accumulator, two full-width S buffers (ping-pong across KV
 // iterations), row-sum accumulator, and the scale-factor planes.  P and
@@ -79,6 +124,103 @@ constexpr int TMEM_SFV1 = 424;
 constexpr int TMEM_SFONES = 432;
 constexpr int TMEM_COLS = 512;
 constexpr int FA4_SUM_N = 8;
+
+#if FA4_PROF
+__device__ unsigned long long fa4_prof_buf[PROF_MAX_CTAS * PROF_SLOTS * PROF_CATS];
+
+// Softmax owner/partner categories.  STATS bundles max-reduce + both pair
+// barriers + rescale; EPI bundles the whole per-tile epilogue incl. its
+// waits: 4 ticks per iteration keeps the perturbation of the critical
+// softmax path low (finer splits measurably slowed the pipeline).
+enum { PC_SM_WAIT_S = 0, PC_SM_SLOAD, PC_SM_STATS, PC_SM_CONVERT, PC_SM_EPI };
+// MMA warp categories.
+enum { PC_MMA_WAIT_QFULL = 0, PC_MMA_WAIT_K, PC_MMA_WAIT_SEMPTY,
+       PC_MMA_QK_ISSUE, PC_MMA_WAIT_V, PC_MMA_WAIT_P0, PC_MMA_WAIT_P1,
+       PC_MMA_WAIT_OEMPTY, PC_MMA_PV_ISSUE };
+// Load warp categories.
+enum { PC_LD_WAIT_QEMPTY = 0, PC_LD_WAIT_KEMPTY, PC_LD_ISSUE_K,
+       PC_LD_WAIT_VEMPTY, PC_LD_ISSUE_V, PC_LD_ISSUE_Q };
+// Store warp categories.
+enum { PC_ST_WAIT_OEPI = 0, PC_ST_TMA };
+
+// SM cycle counter, not %globaltimer: the S2R read is a few cycles instead
+// of ~30 ns, which matters at ~4 reads per softmax iteration.  Fractions of
+// a warp's span are exact; profile_breakdown.py converts to wall time.
+__device__ __forceinline__ uint32_t prof_now()
+{
+    uint32_t t;
+    asm volatile("mov.u32 %0, %%clock;" : "=r"(t));
+    return t;
+}
+
+// u32 cycle sums: wraps only past ~2.4 s, far beyond any launch here.  Sums
+// live in the SMEM_PROF region (zeroed by warp 13 before the entry sync);
+// exactly one designated lane per warp accumulates, so only t_prev/t_start
+// and a pointer occupy registers and the hot paths stay spill-free.
+struct ProfAcc {
+    uint32_t* slot_ptr;
+    uint32_t t_prev;
+    uint32_t t_start;
+    bool writer;
+
+    __device__ __forceinline__ void start(char* smem_storage_, int slot, bool writer_)
+    {
+        slot_ptr = reinterpret_cast<uint32_t*>(smem_storage_ + SMEM_PROF)
+            + slot * PROF_CATS;
+        writer = writer_;
+        t_start = t_prev = prof_now();
+    }
+    __device__ __forceinline__ void tick(int cat)
+    {
+        const uint32_t t = prof_now();
+        if (writer) {
+            slot_ptr[cat] += t - t_prev;
+        }
+        t_prev = t;
+    }
+    __device__ __forceinline__ void flush(int slot)
+    {
+        const uint32_t t = prof_now();
+        if (writer && blockIdx.x < PROF_MAX_CTAS) {
+            unsigned long long* p = fa4_prof_buf
+                + (blockIdx.x * PROF_SLOTS + slot) * PROF_CATS;
+            #pragma unroll
+            for (int c = 0; c < PROF_SPAN; c++) {
+                p[c] = slot_ptr[c];
+            }
+            p[PROF_SPAN] = t - t_start;
+        }
+    }
+};
+#define FA4_PROF_DECL                                                        \
+    ProfAcc _prof;                                                           \
+    _prof.start(smem_storage,                                                \
+                warp_id < 8 ? warp_id                                        \
+                            : (warp_id == 12 ? 8                             \
+                                             : (warp_id == 14 ? 9           \
+                                                              : (warp_id == 13 ? 10 : 11))), \
+                lane_id == 0)
+#define FA4_PROF_WRITER(b)   _prof.writer = (b)
+#define FA4_PROF_TICK(cat)   _prof.tick(cat)
+#define FA4_PROF_FLUSH(...)  _prof.flush(__VA_ARGS__)
+#if FA4_PROF_SM_LEVEL >= 1
+#define FA4_PROF_TICK_SM(cat)  _prof.tick(cat)
+#else
+#define FA4_PROF_TICK_SM(cat)  do {} while (0)
+#endif
+#if FA4_PROF_SM_LEVEL >= 2
+#define FA4_PROF_TICK_SM2(cat) _prof.tick(cat)
+#else
+#define FA4_PROF_TICK_SM2(cat) do {} while (0)
+#endif
+#else
+#define FA4_PROF_DECL        do {} while (0)
+#define FA4_PROF_WRITER(b)   do {} while (0)
+#define FA4_PROF_TICK(cat)   do {} while (0)
+#define FA4_PROF_TICK_SM(cat)  do {} while (0)
+#define FA4_PROF_TICK_SM2(cat) do {} while (0)
+#define FA4_PROF_FLUSH(...)  do {} while (0)
+#endif
 
 enum class MbarId : int {
     QFull = 0,
@@ -256,6 +398,16 @@ __device__ __forceinline__
 void tcgen05_fence_after()
 {
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+}
+
+// Producer-side pair of tcgen05_fence_after: required between a warp's last
+// tcgen05.st/ld and the mbarrier arrive that publishes it to another warp
+// (wait::st/ld alone orders only same-thread tcgen05 ops).  Omitting it let
+// the mma warp occasionally read stale P/sf words: nondeterministic output.
+__device__ __forceinline__
+void tcgen05_fence_before()
+{
+    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
 }
 
 __device__ __forceinline__
@@ -699,6 +851,12 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
             ones_data[i] = 0x22222222u;  // fp4 e2m1 1.0 pairs
             ones_sf[i] = 0x38383838u;    // e4m3 1.0
         }
+#if FA4_PROF
+        uint32_t* prof_zero = reinterpret_cast<uint32_t*>(smem_storage + SMEM_PROF);
+        for (int i = lane_id; i < PROF_SLOTS * PROF_CATS; i += WARP_SIZE) {
+            prof_zero[i] = 0;
+        }
+#endif
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     }
 
@@ -732,6 +890,10 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         v_sf_head_base = (batch * num_kv_heads + kv_head) * kv_blocks_64;
     };
     set_tile(blockIdx.x);
+
+    // Profiling accumulators (FA4_PROF builds): shared by reference with the
+    // role lambdas below; each role ticks its own categories.
+    FA4_PROF_DECL;
 
     auto q_smem = [&]() -> uint32_t { return smem + SMEM_Q; };
     auto sf_q_smem = [&]() -> uint32_t { return smem + SMEM_SF_Q; };
@@ -778,28 +940,44 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         tma_2d_gmem2smem(q_smem(), &q_tmap, 0, q_global_row_base, mbar);
         tma_gmem2smem(sf_q_smem(), q_sf_src(), Q_SF_BYTES, mbar);
         mbarrier_arrive_expect_tx(mbar, Q_DATA_BYTES + Q_SF_BYTES);
+        FA4_PROF_TICK(PC_LD_ISSUE_Q);
     };
 
     auto issue_k = [&](int slot, int g, int kv_iter) {
         const int full_phase = (g / FA4_NUM_KV_PAIRS) & 1;
         mbarrier_wait(mbar_base + mbar_offset(MbarId::KVEmpty, slot), full_phase ^ 1);
+        FA4_PROF_TICK(PC_LD_WAIT_KEMPTY);
 
         const uint32_t mbar = mbar_base + mbar_offset(MbarId::KVFull, slot);
         const int kv_row = kv_global_row_base + kv_iter * FA4_KV_TILE;
+#if FA4_ABLATE_KV_TMA
+        (void)kv_row;
+        tma_gmem2smem(kv_slot_sf_smem(slot), k_sf_src(kv_iter), K_SF_BYTES, mbar);
+        mbarrier_arrive_expect_tx(mbar, K_SF_BYTES);
+#else
         tma_2d_gmem2smem(kv_slot_smem(slot), &k_tmap, 0, kv_row, mbar);
         tma_gmem2smem(kv_slot_sf_smem(slot), k_sf_src(kv_iter), K_SF_BYTES, mbar);
         mbarrier_arrive_expect_tx(mbar, KV_DATA_BYTES + K_SF_BYTES);
+#endif
+        FA4_PROF_TICK(PC_LD_ISSUE_K);
     };
 
     auto issue_v = [&](int slot, int g, int kv_iter) {
         const int full_phase = (g / FA4_NUM_KV_PAIRS) & 1;
         mbarrier_wait(mbar_base + mbar_offset(MbarId::KVEmpty, slot), full_phase ^ 1);
+        FA4_PROF_TICK(PC_LD_WAIT_VEMPTY);
 
         const uint32_t mbar = mbar_base + mbar_offset(MbarId::KVFull, slot);
+#if FA4_ABLATE_KV_TMA
+        tma_gmem2smem(kv_slot_sf_smem(slot), v_sf_src(kv_iter), V_SF_BYTES, mbar);
+        mbarrier_arrive_expect_tx(mbar, V_SF_BYTES);
+#else
         tma_2d_gmem2smem(kv_slot_smem(slot), &v_tmap,
                          kv_iter * FA4_KV_TILE, v_global_row_base, mbar);
         tma_gmem2smem(kv_slot_sf_smem(slot), v_sf_src(kv_iter), V_SF_BYTES, mbar);
         mbarrier_arrive_expect_tx(mbar, KV_DATA_BYTES + V_SF_BYTES);
+#endif
+        FA4_PROF_TICK(PC_LD_ISSUE_V);
     };
 
     auto copy_sf_q_to_tmem = [&]() {
@@ -952,15 +1130,31 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
                 const int g = gi + iter;
                 const int buf = g & 1;
                 const int ph = (g >> 1) & 1;
+#if FA4_ABLATE_SLOAD
+                float scores[64] = {};
+#else
                 float scores[64];
+#endif
                 float block_row_max[4];
 
                 mbarrier_wait(mbar_base + mbar_offset(MbarId::SFull, buf), ph);
+                FA4_PROF_TICK_SM(PC_SM_WAIT_S);
                 tcgen05_fence_after();
+#if !FA4_ABLATE_SLOAD
                 tcgen05_ld_32x32bx64(scores, s_tmem(buf) + row_tmem);
+#endif
+                FA4_PROF_TICK_SM2(PC_SM_SLOAD);
+#if FA4_ABLATE_REDMAX
+                #pragma unroll
+                for (int b = 0; b < 4; b++) {
+                    block_row_max[b] = TA_MAGIC;
+                }
+                const float half_max = TA_MAGIC;
+#else
                 reduce_blocks(scores, block_row_max);
                 float half_max = ta_fmax3(block_row_max[0], block_row_max[1], block_row_max[2]);
                 half_max = fmaxf(half_max, block_row_max[3]);
+#endif
 
                 named_barrier_sync(bar_id, 2 * WARP_SIZE);  // partner posted its max
                 const float tile_max = fmaxf(half_max, hmax1[row]);
@@ -973,20 +1167,37 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
                 hm_used[row] = m_used;
                 named_barrier_sync(bar_id, 2 * WARP_SIZE);  // m_used visible
 
-                // SFull implies the previous PV completed (commit chain), so
-                // the rare rescale is ordered; iter 0 rescale can't fire (the
-                // lazy threshold always trips into the acc path fresh, but O
-                // is overwritten by the first PV of the tile anyway).
+                // Rescale must be ordered after PV(g-1)'s writes to O.  SFull(g)
+                // does NOT imply that: the QK-prefetch hoist issues QK(g) before
+                // PV(g-1), so SFull(g)'s commit tracks only ops up to QK(g).
+                // SEmpty(buf(g-1)) is committed right after PV1(g-1): wait for it
+                // on the rare rescale branch (owner is at most one phase behind
+                // that commit, and P1Ready(g-1) already fired, so no deadlock).
+                // iter 0 needs no rescale: the first PV of a tile overwrites O.
+#if FA4_ABLATE_RESCALE
+                (void)acc_scale;
+#else
                 if (iter > 0 && __any_sync(0xffffffffu, acc_scale != 1.0f)) {
+                    // Parity = phase BEFORE commit(pg) = (pg>>1)&1, so the
+                    // wait blocks exactly until that commit flips the phase.
+                    const int pg = g - 1;
+                    mbarrier_wait(mbar_base + mbar_offset(MbarId::SEmpty, pg & 1),
+                                  (pg >> 1) & 1);
                     tcgen05_fence_after();
                     rescale_o(acc_scale);
                 }
+#endif
+                FA4_PROF_TICK_SM2(PC_SM_STATS);
 
+#if !FA4_ABLATE_CONVERT
                 convert_p(buf, 0, scores, block_row_max, row_tmem);
                 tcgen05_st_32x32bx1(sf_p_tmem(buf, 0) + row_tmem + warp_id, sf_word_of(block_row_max, m_used));
+#endif
                 tcgen05_wait_st();
+                tcgen05_fence_before();
                 mbarrier_arrive(mbar_base + mbar_offset(MbarId::P0Ready, buf));
                 mbarrier_arrive(mbar_base + mbar_offset(MbarId::P1Ready, buf));
+                FA4_PROF_TICK_SM(PC_SM_CONVERT);
             }
             gi += kv_iters;
 
@@ -1013,10 +1224,15 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
                 }
             }
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            // OEmpty publishes the O/O_sum tmem reads: the mma warp must not
+            // overwrite O until every owner's tcgen05.ld has actually landed.
+            tcgen05_fence_before();
             mbarrier_arrive(mbar_base + mbar_offset(MbarId::OEpi));
             mbarrier_arrive(mbar_base + mbar_offset(MbarId::OEmpty));
+            FA4_PROF_TICK_SM(PC_SM_EPI);
         }
 
+        FA4_PROF_FLUSH(warp_id);
         mbarrier_arrive(mbar_base + mbar_offset(MbarId::TmemDealloc));
     };
 
@@ -1033,50 +1249,82 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
                 const int g = gi + iter;
                 const int buf = g & 1;
                 const int ph = (g >> 1) & 1;
+#if FA4_ABLATE_SLOAD
+                float scores[64] = {};
+#else
                 float scores[64];
+#endif
                 float block_row_max[4];
 
                 mbarrier_wait(mbar_base + mbar_offset(MbarId::SFull, buf), ph);
+                FA4_PROF_TICK_SM(PC_SM_WAIT_S);
                 tcgen05_fence_after();
+#if !FA4_ABLATE_SLOAD
                 tcgen05_ld_32x32bx64(scores, s_tmem(buf) + row_tmem + 64);
+#endif
+                FA4_PROF_TICK_SM2(PC_SM_SLOAD);
+#if FA4_ABLATE_REDMAX
+                #pragma unroll
+                for (int b = 0; b < 4; b++) {
+                    block_row_max[b] = TA_MAGIC;
+                }
+                hmax1[row] = TA_MAGIC;
+#else
                 reduce_blocks(scores, block_row_max);
                 float half_max = ta_fmax3(block_row_max[0], block_row_max[1], block_row_max[2]);
                 hmax1[row] = fmaxf(half_max, block_row_max[3]);
+#endif
 
                 named_barrier_sync(bar_id, 2 * WARP_SIZE);  // max posted
                 named_barrier_sync(bar_id, 2 * WARP_SIZE);  // m_used ready
                 const float m_used = hm_used[row];
+                FA4_PROF_TICK_SM2(PC_SM_STATS);
 
+#if !FA4_ABLATE_CONVERT
                 convert_p(buf, 1, scores, block_row_max, row_tmem);
                 tcgen05_st_32x32bx1(sf_p_tmem(buf, 1) + row_tmem + w, sf_word_of(block_row_max, m_used));
+#else
+                (void)m_used;
+#endif
                 tcgen05_wait_st();
+                tcgen05_fence_before();
                 mbarrier_arrive(mbar_base + mbar_offset(MbarId::P1Ready, buf));
+                FA4_PROF_TICK_SM(PC_SM_CONVERT);
             }
             gi += kv_iters;
         }
+
+        FA4_PROF_FLUSH(warp_id);
     };
 
     auto epilogue_store = [&]() {
+        FA4_PROF_WRITER(true);
         for (int lt = 0, gtile = blockIdx.x; gtile < num_tiles;
              lt++, gtile += static_cast<int>(gridDim.x)) {
             set_tile(gtile);
             mbarrier_wait(mbar_base + mbar_offset(MbarId::OEpi), lt & 1);
+            FA4_PROF_TICK(PC_ST_WAIT_OEPI);
             tma_2d_smem2gmem(&o_tmap, 0, q_global_row_base, o_stage_smem());
             cp_async_bulk_commit_group();
             cp_async_bulk_wait_group_read_0();
             mbarrier_arrive(mbar_base + mbar_offset(MbarId::OStore));
+            FA4_PROF_TICK(PC_ST_TMA);
         }
+
+        FA4_PROF_FLUSH(10);
     };
 
     auto load_loop = [&]() {
         if (!elect_sync()) {
             return;
         }
+        FA4_PROF_WRITER(true);
         int gi = 0;
         for (int lt = 0, gtile = blockIdx.x; gtile < num_tiles;
              lt++, gtile += static_cast<int>(gridDim.x)) {
             set_tile(gtile);
             mbarrier_wait(mbar_base + mbar_offset(MbarId::QEmpty), (lt & 1) ^ 1);
+            FA4_PROF_TICK(PC_LD_WAIT_QEMPTY);
             issue_q();
             for (int iter = 0; iter < kv_iters; iter++) {
                 const int g = gi + iter;
@@ -1086,20 +1334,25 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
             }
             gi += kv_iters;
         }
+
+        FA4_PROF_FLUSH(9);
     };
 
     auto mma_loop = [&]() {
         const bool elected = elect_sync() != 0;
 
         if (elected) {
+            FA4_PROF_WRITER(true);
             tcgen05_cp(tmem_base + TMEM_SFONES, make_desc_sf(smem + SMEM_ONES_SF));
 
             int gi = 0;
             for (int lt = 0, gtile = blockIdx.x; gtile < num_tiles;
                  lt++, gtile += static_cast<int>(gridDim.x)) {
                 mbarrier_wait(mbar_base + mbar_offset(MbarId::QFull), lt & 1);
+                FA4_PROF_TICK(PC_MMA_WAIT_QFULL);
                 tcgen05_fence_after();
                 copy_sf_q_to_tmem();
+                FA4_PROF_TICK(PC_MMA_QK_ISSUE);
 
                 // First QK of the tile.
                 {
@@ -1108,13 +1361,17 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
                     const int k_slot = 2 * (g % FA4_NUM_KV_PAIRS);
                     const int k_phase = (g / FA4_NUM_KV_PAIRS) & 1;
                     mbarrier_wait(mbar_base + mbar_offset(MbarId::KVFull, k_slot), k_phase);
+                    FA4_PROF_TICK(PC_MMA_WAIT_K);
                     tcgen05_fence_after();
                     copy_sf_k_to_tmem(k_slot, buf);
+                    FA4_PROF_TICK(PC_MMA_QK_ISSUE);
                     mbarrier_wait(mbar_base + mbar_offset(MbarId::SEmpty, buf), (((g >> 1)) & 1) ^ 1);
+                    FA4_PROF_TICK(PC_MMA_WAIT_SEMPTY);
                     tcgen05_fence_after();
                     qk_gemm(buf, k_slot, buf);
                     tcgen05_commit(mbar_base + mbar_offset(MbarId::SFull, buf));
                     tcgen05_commit(mbar_base + mbar_offset(MbarId::KVEmpty, k_slot));
+                    FA4_PROF_TICK(PC_MMA_QK_ISSUE);
                 }
 
                 for (int iter = 0; iter < kv_iters; iter++) {
@@ -1134,41 +1391,54 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
                         const int nk_phase = (ng / FA4_NUM_KV_PAIRS) & 1;
 
                         mbarrier_wait(mbar_base + mbar_offset(MbarId::KVFull, nk_slot), nk_phase);
+                        FA4_PROF_TICK(PC_MMA_WAIT_K);
                         tcgen05_fence_after();
                         copy_sf_k_to_tmem(nk_slot, nbuf);
+                        FA4_PROF_TICK(PC_MMA_QK_ISSUE);
                         mbarrier_wait(mbar_base + mbar_offset(MbarId::SEmpty, nbuf), ((ng >> 1) & 1) ^ 1);
+                        FA4_PROF_TICK(PC_MMA_WAIT_SEMPTY);
                         tcgen05_fence_after();
                         qk_gemm(nbuf, nk_slot, nbuf);
                         tcgen05_commit(mbar_base + mbar_offset(MbarId::SFull, nbuf));
                         tcgen05_commit(mbar_base + mbar_offset(MbarId::KVEmpty, nk_slot));
+                        FA4_PROF_TICK(PC_MMA_QK_ISSUE);
                     }
 
                     mbarrier_wait(mbar_base + mbar_offset(MbarId::KVFull, v_slot), v_phase);
+                    FA4_PROF_TICK(PC_MMA_WAIT_V);
                     tcgen05_fence_after();
                     copy_sf_v_to_tmem(v_slot, vbuf);
+                    FA4_PROF_TICK(PC_MMA_PV_ISSUE);
 
                     mbarrier_wait(mbar_base + mbar_offset(MbarId::P0Ready, buf), ph);
+                    FA4_PROF_TICK(PC_MMA_WAIT_P0);
                     tcgen05_fence_after();
                     if (iter == 0) {
                         // Previous tile's epilogue must have released O/O_sum.
                         mbarrier_wait(mbar_base + mbar_offset(MbarId::OEmpty), (lt & 1) ^ 1);
+                        FA4_PROF_TICK(PC_MMA_WAIT_OEMPTY);
                         tcgen05_fence_after();
                     }
                     pv_gemm(buf, 0, v_slot, vbuf, iter > 0);
+                    FA4_PROF_TICK(PC_MMA_PV_ISSUE);
 
                     mbarrier_wait(mbar_base + mbar_offset(MbarId::P1Ready, buf), ph);
+                    FA4_PROF_TICK(PC_MMA_WAIT_P1);
                     tcgen05_fence_after();
                     pv_gemm(buf, 1, v_slot, vbuf, true);
                     tcgen05_commit(mbar_base + mbar_offset(MbarId::SEmpty, buf));
                     tcgen05_commit(mbar_base + mbar_offset(MbarId::KVEmpty, v_slot));
+                    FA4_PROF_TICK(PC_MMA_PV_ISSUE);
                 }
                 gi += kv_iters;
 
                 tcgen05_commit(mbar_base + mbar_offset(MbarId::QEmpty));
                 tcgen05_commit(mbar_base + mbar_offset(MbarId::OFull));
+                FA4_PROF_TICK(PC_MMA_PV_ISSUE);
             }
 
             mbarrier_wait(mbar_base + mbar_offset(MbarId::TmemDealloc), 0);
+            FA4_PROF_FLUSH(8);
         }
 
         __syncwarp();
@@ -1561,4 +1831,49 @@ cudaError_t nvfp4_sm100_attention_launch(const void* q,
         num_tiles);
 
     return cudaGetLastError();
+}
+
+// Profiling-buffer accessors: always exported so the extension links in every
+// build; no-ops (enabled=0) unless compiled with -DFA4_PROF=1.
+extern "C"
+void nvfp4_sm100_prof_info(int* enabled, int* ctas, int* slots, int* cats)
+{
+    *enabled = FA4_PROF;
+    *ctas = PROF_MAX_CTAS;
+    *slots = PROF_SLOTS;
+    *cats = PROF_CATS;
+}
+
+extern "C"
+cudaError_t nvfp4_sm100_prof_reset(cudaStream_t stream)
+{
+#if FA4_PROF
+    void* ptr = nullptr;
+    cudaError_t err = cudaGetSymbolAddress(&ptr, fa4_prof_buf);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    return cudaMemsetAsync(ptr, 0, sizeof(fa4_prof_buf), stream);
+#else
+    (void)stream;
+    return cudaSuccess;
+#endif
+}
+
+extern "C"
+cudaError_t nvfp4_sm100_prof_fetch(unsigned long long* dst, cudaStream_t stream)
+{
+#if FA4_PROF
+    void* ptr = nullptr;
+    cudaError_t err = cudaGetSymbolAddress(&ptr, fa4_prof_buf);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    return cudaMemcpyAsync(dst, ptr, sizeof(fa4_prof_buf),
+                           cudaMemcpyDeviceToDevice, stream);
+#else
+    (void)dst;
+    (void)stream;
+    return cudaSuccess;
+#endif
 }

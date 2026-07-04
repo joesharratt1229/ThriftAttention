@@ -66,6 +66,10 @@ extern "C" cudaError_t nvfp4_sm100_attention_launch(
     float v_descale,
     cudaStream_t stream);
 
+extern "C" void nvfp4_sm100_prof_info(int* enabled, int* ctas, int* slots, int* cats);
+extern "C" cudaError_t nvfp4_sm100_prof_reset(cudaStream_t stream);
+extern "C" cudaError_t nvfp4_sm100_prof_fetch(unsigned long long* dst, cudaStream_t stream);
+
 namespace {
 
 void check_cuda(cudaError_t err, const char* what) {
@@ -208,9 +212,39 @@ torch::Tensor attention_only(
     return out;
 }
 
+pybind11::tuple prof_info() {
+    int enabled = 0, ctas = 0, slots = 0, cats = 0;
+    nvfp4_sm100_prof_info(&enabled, &ctas, &slots, &cats);
+    return pybind11::make_tuple(enabled, ctas, slots, cats);
+}
+
+void prof_reset() {
+    check_cuda(nvfp4_sm100_prof_reset(at::cuda::getCurrentCUDAStream().stream()),
+               "nvfp4_sm100_prof_reset");
+}
+
+torch::Tensor prof_fetch() {
+    int enabled = 0, ctas = 0, slots = 0, cats = 0;
+    nvfp4_sm100_prof_info(&enabled, &ctas, &slots, &cats);
+    auto out = torch::zeros({ctas, slots, cats},
+                            torch::dtype(torch::kInt64).device(torch::kCUDA));
+    if (enabled) {
+        check_cuda(nvfp4_sm100_prof_fetch(
+                       reinterpret_cast<unsigned long long*>(out.data_ptr()),
+                       at::cuda::getCurrentCUDAStream().stream()),
+                   "nvfp4_sm100_prof_fetch");
+    }
+    return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantise_and_attention", &quantise_and_attention,
           "Quantize Q/K/V to NVFP4, pack scale atoms, and run SM100 attention");
     m.def("attention_only", &attention_only,
           "Run SM100 NVFP4 attention on pre-quantised inputs (for kernel-only benchmarking)");
+    m.def("prof_info", &prof_info,
+          "(enabled, ctas, slots, cats) for the FA4_PROF instrumentation buffer");
+    m.def("prof_reset", &prof_reset, "Zero the FA4_PROF instrumentation buffer");
+    m.def("prof_fetch", &prof_fetch,
+          "Copy the FA4_PROF buffer to a [ctas, slots, cats] int64 CUDA tensor");
 }
