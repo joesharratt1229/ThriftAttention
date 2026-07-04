@@ -17,16 +17,15 @@ Two independent methods (hardware counters are blocked in this container):
    left when all softmax work is removed = MMA + TMA + mbarrier chain +
    handshake latencies (the RESTRUCTURE_PLAN 53% number).
 
-Reading the result for the 2-CTA decision (mma-warp view):
-  waiting KVFull      -> TMA/DRAM bound   (2-CTA halves KV traffic)
-  waiting SEmpty/P0/P1-> softmax bound    (2-CTA does not help)
-  issue+commit        -> issue bound      (2-CTA halves instruction count)
+Reading the mma-warp view:
+  waiting KVFull       -> TMA/DRAM bound
+  waiting SEmpty/P0/P1 -> softmax bound
+  issue+commit         -> MMA issue bound
 """
 from __future__ import annotations
 
 import argparse
 import math
-import os
 from pathlib import Path
 
 import torch
@@ -244,15 +243,13 @@ def print_derived(summary: dict):
     smx = mma.get(2, 0) + mma.get(5, 0) + mma.get(6, 0)
     issue = mma.get(3, 0) + mma.get(8, 0)
     tile = mma.get(0, 0) + mma.get(7, 0)
-    print(f"    waiting on TMA (KVFull K+V):        {tma * 100:5.1f}%  <- 2-CTA halves KV DRAM traffic")
-    print(f"    waiting on softmax (SEmpty+P0+P1):  {smx * 100:5.1f}%  <- 2-CTA does NOT help")
-    print(f"    issue+commit work (QK+PV):          {issue * 100:5.1f}%  <- 2-CTA halves issue count")
+    print(f"    waiting on TMA (KVFull K+V):        {tma * 100:5.1f}%")
+    print(f"    waiting on softmax (SEmpty+P0+P1):  {smx * 100:5.1f}%")
+    print(f"    issue+commit work (QK+PV):          {issue * 100:5.1f}%")
     print(f"    tile chain (QFull+OEmpty):          {tile * 100:5.1f}%")
 
 
-def run_instrumented(shapes, batch, heads, warmup, reps, iters, fine=False, pair=False):
-    os.environ["FA4_FORCE_PAIR"] = "1" if pair else "0"
-    print(f"variant under profile: {'2-CTA cluster (FA4_FORCE_PAIR=1)' if pair else '1-CTA'}")
+def run_instrumented(shapes, batch, heads, warmup, reps, iters, fine=False):
     print("building production extension (baseline)...")
     prod = build_variant("fp4_attention_sm100_ext")
     if fine:
@@ -291,9 +288,7 @@ def run_instrumented(shapes, batch, heads, warmup, reps, iters, fine=False, pair
         torch.cuda.empty_cache()
 
 
-def run_ablations(shapes, batch, heads, warmup, iters, pair=False):
-    os.environ["FA4_FORCE_PAIR"] = "1" if pair else "0"
-    print(f"ablations on: {'2-CTA cluster variant' if pair else '1-CTA variant'}")
+def run_ablations(shapes, batch, heads, warmup, iters):
     print("building production extension (baseline)...")
     prod = build_variant("fp4_attention_sm100_ext")
     variants = []
@@ -336,18 +331,15 @@ def main() -> None:
                     help="also run counterfactual ablation builds")
     ap.add_argument("--fine", action="store_true",
                     help="fine-grained softmax ticks (higher perturbation)")
-    ap.add_argument("--pair", action="store_true",
-                    help="profile the 2-CTA cluster variant (FA4_FORCE_PAIR=1)")
     args = ap.parse_args()
 
     assert torch.cuda.is_available()
     print(f"GPU: {torch.cuda.get_device_name()}")
     run_instrumented(args.seqlens, args.batch, args.heads,
-                     args.warmup, args.reps, args.iters, fine=args.fine,
-                     pair=args.pair)
+                     args.warmup, args.reps, args.iters, fine=args.fine)
     if args.ablate:
         run_ablations(args.seqlens, args.batch, args.heads,
-                      args.warmup, args.iters, pair=args.pair)
+                      args.warmup, args.iters)
 
 
 if __name__ == "__main__":
