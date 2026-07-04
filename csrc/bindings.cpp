@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <vector>
 
+#include <cuda_runtime_api.h>
+
 namespace {
 
 void check_hi_qkv(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
@@ -207,6 +209,19 @@ void single_query_quest_topk(
     int head_dim,
     int topk_count,
     bool is_bf16);
+// Implemented in csrc/cuda/sm120/shared/block_selection.cu.
+cudaError_t local_block_topk(
+    int32_t* topk_out,
+    int flat_heads,
+    int num_q_blocks,
+    int num_kv_blocks,
+    int topk_count,
+    bool causal);
+cudaError_t single_query_local_topk(
+    int32_t* topk_out,
+    int flat_heads,
+    int num_kv_blocks,
+    int topk_count);
 void single_query_key_mean_topk_chunked(
     const void* q_grouped,
     const void* k_mean,
@@ -1289,6 +1304,69 @@ static at::Tensor single_query_quest_topk_impl(
     return topk;
 }
 
+static at::Tensor local_block_topk_impl(
+    const at::Tensor& q,
+    int num_kv_blocks,
+    int topk_count,
+    bool causal = true,
+    int block_size = 64) {
+    TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");
+    TORCH_CHECK(q.dim() == 4, "q must be 4D [batch, heads, seq, head_dim]");
+    TORCH_CHECK(block_size > 0, "block_size must be positive");
+    TORCH_CHECK(q.size(2) % block_size == 0,
+                "q sequence length must be divisible by block_size");
+    TORCH_CHECK(num_kv_blocks >= 0, "num_kv_blocks must be non-negative");
+    TORCH_CHECK(topk_count >= 0 && topk_count <= num_kv_blocks,
+                "topk_count must be in [0, num_kv_blocks]");
+
+    const int batch = q.size(0);
+    const int heads = q.size(1);
+    const int flat_heads = batch * heads;
+    const int num_q_blocks = q.size(2) / block_size;
+
+    auto opts = at::TensorOptions().dtype(at::kInt).device(q.device());
+    at::Tensor topk = at::empty({flat_heads, num_q_blocks, topk_count}, opts);
+    if (topk_count == 0 || flat_heads == 0 || num_q_blocks == 0) {
+        return topk;
+    }
+
+    const cudaError_t err = local_block_topk(
+        topk.data_ptr<int32_t>(), flat_heads, num_q_blocks, num_kv_blocks, topk_count, causal);
+    TORCH_CHECK(err == cudaSuccess,
+                "local_block_topk kernel launch failed: ", cudaGetErrorString(err));
+
+    return topk;
+}
+
+static at::Tensor single_query_local_topk_impl(
+    const at::Tensor& q_grouped,
+    int topk_count,
+    int num_kv_blocks) {
+    TORCH_CHECK(q_grouped.is_cuda(), "q_grouped must be a CUDA tensor");
+    TORCH_CHECK(q_grouped.dim() == 4,
+                "q_grouped must be 4D [batch, kv_heads, groups, head_dim]");
+    TORCH_CHECK(num_kv_blocks >= 0, "num_kv_blocks must be non-negative");
+    TORCH_CHECK(topk_count >= 0 && topk_count <= num_kv_blocks,
+                "topk_count must be in [0, num_kv_blocks]");
+
+    const int batch = q_grouped.size(0);
+    const int kv_heads = q_grouped.size(1);
+    const int flat_heads = batch * kv_heads;
+
+    auto opts = at::TensorOptions().dtype(at::kInt).device(q_grouped.device());
+    at::Tensor topk = at::empty({flat_heads, topk_count}, opts);
+    if (topk_count == 0 || flat_heads == 0) {
+        return topk;
+    }
+
+    const cudaError_t err = single_query_local_topk(
+        topk.data_ptr<int32_t>(), flat_heads, num_kv_blocks, topk_count);
+    TORCH_CHECK(err == cudaSuccess,
+                "single_query_local_topk kernel launch failed: ", cudaGetErrorString(err));
+
+    return topk;
+}
+
 static at::Tensor single_query_key_mean_topk_into_impl(
     const at::Tensor& q_grouped,
     const at::Tensor& k_mean,
@@ -1568,6 +1646,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_kv_blocks"),
           pybind11::arg("is_bf16") = false,
           "Select decode KV blocks using grouped single-query QUEST min/max scores");
+    m.def("local_block_topk", &local_block_topk_impl,
+          pybind11::arg("q"),
+          pybind11::arg("num_kv_blocks"),
+          pybind11::arg("topk_count"),
+          pybind11::arg("causal") = true,
+          pybind11::arg("block_size") = 64,
+          "Select a contiguous local KV-block window for each query block");
+    m.def("single_query_local_topk", &single_query_local_topk_impl,
+          pybind11::arg("q_grouped"),
+          pybind11::arg("topk_count"),
+          pybind11::arg("num_kv_blocks"),
+          "Select the trailing local KV-block window for decode");
     m.def("single_query_key_mean_topk_into", &single_query_key_mean_topk_into_impl,
           pybind11::arg("q_grouped"),
           pybind11::arg("k_mean"),

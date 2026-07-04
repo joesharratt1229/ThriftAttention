@@ -12,6 +12,7 @@ from ..backends.single_query import _group_single_query, _ungroup_single_query
 from ..quant.formats import get_quant_format
 from ..quantization import nvfp4_quantize, nvfp4_quantize_transposed
 from ..selection import resolve_top_k
+from ..selection.local import select_local_block_pairs
 from .._extension import get_extension
 
 
@@ -601,12 +602,7 @@ def cached_decode_attention(
     if config.method != "thrift":
         raise ValueError(f"unsupported ThriftAttention method {config.method!r}")
 
-    selected_blocks = layer.select_key_blocks(
-        q_grouped,
-        top_k=config.top_k,
-        fraction=config.fraction,
-        block_size=config.block_size,
-    )
+    selected_blocks = select_cached_decode_blocks(q_grouped, layer, config)
     out = get_extension().thrift_attention_single_query_nvfp4_packed(
         q_grouped,
         layer.key_view(),
@@ -656,8 +652,9 @@ def cached_prefill_attention(
     if config.method != "thrift":
         raise ValueError(f"unsupported ThriftAttention method {config.method!r}")
 
-    selected_blocks = _select_block_pairs_from_cached_means(
+    selected_blocks = select_cached_prefill_blocks(
         q,
+        k_fp16,
         layer,
         config,
         real_q_len=cache.prefill_real_seq_len,
@@ -681,6 +678,78 @@ def cached_prefill_attention(
         v_scale_t,
         is_bf16,
     )
+
+
+def select_cached_decode_blocks(
+    q_grouped: torch.Tensor,
+    layer: ThriftAttentionCacheLayer,
+    config: AttentionConfig,
+) -> torch.Tensor:
+    if config.selection == "block_mean":
+        return select_topk_key_blocks(q_grouped, layer, config)
+    if config.selection == "local":
+        return select_local_key_blocks(q_grouped, layer, config)
+    raise ValueError(f"unsupported cached decode selection {config.selection!r}")
+
+
+def select_topk_key_blocks(
+    q_grouped: torch.Tensor,
+    layer: ThriftAttentionCacheLayer,
+    config: AttentionConfig,
+) -> torch.Tensor:
+    return layer.select_key_blocks(
+        q_grouped,
+        top_k=config.top_k,
+        fraction=config.fraction,
+        block_size=config.block_size,
+    )
+
+
+def select_local_key_blocks(
+    q_grouped: torch.Tensor,
+    layer: ThriftAttentionCacheLayer,
+    config: AttentionConfig,
+) -> torch.Tensor:
+    complete_blocks = layer.seq_len // config.block_size
+    selected_count = resolve_top_k(
+        complete_blocks,
+        causal=False,
+        top_k=config.top_k,
+        fraction=config.fraction,
+    )
+    flat_heads = q_grouped.shape[0] * q_grouped.shape[1]
+    if selected_count == 0:
+        return torch.empty(flat_heads, 0, device=q_grouped.device, dtype=torch.int32)
+    return get_extension().single_query_local_topk(q_grouped, selected_count, complete_blocks)
+
+
+def select_cached_prefill_blocks(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    layer: ThriftAttentionCacheLayer,
+    config: AttentionConfig,
+    real_q_len: int | None = None,
+    is_bf16: bool = False,
+) -> torch.Tensor:
+    if config.selection == "block_mean":
+        return _select_block_pairs_from_cached_means(
+            q,
+            layer,
+            config,
+            real_q_len=real_q_len,
+            is_bf16=is_bf16,
+        )
+    if config.selection == "local":
+        return select_local_block_pairs(
+            q,
+            k,
+            causal=config.causal,
+            top_k=config.top_k,
+            fraction=config.fraction,
+            block_size=config.block_size,
+            is_bf16=is_bf16,
+        )
+    raise ValueError(f"unsupported cached prefill selection {config.selection!r}")
 
 
 def _select_block_pairs_from_cached_means(

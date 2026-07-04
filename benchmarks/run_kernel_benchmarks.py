@@ -85,6 +85,18 @@ def parse_fraction_list(value: str) -> list[float]:
     return fractions
 
 
+def parse_selection_list(value: str) -> list[str]:
+    valid = {"block_mean", "quest", "local"}
+    selections = [part.strip() for part in value.split(",") if part.strip()]
+    if not selections:
+        raise argparse.ArgumentTypeError("at least one selection method is required")
+    invalid = [selection for selection in selections if selection not in valid]
+    if invalid:
+        formatted = ", ".join(sorted(valid))
+        raise argparse.ArgumentTypeError(f"selection methods must be one of {formatted}")
+    return selections
+
+
 def parse_dtype(value: str) -> torch.dtype:
     normalized = value.strip().lower()
     if normalized in ("fp16", "float16", "half"):
@@ -227,26 +239,28 @@ def build_specs(
             )
         )
     if not args.skip_thrift:
-        for coverage in args.coverages:
-            specs.append(
-                BenchmarkSpec(
-                    f"thrift_{args.quant_format}_{coverage * 100:g}pct",
-                    coverage,
-                    selected_top_k(seq_len, coverage, causal=args.causal and q.shape[2] != 1),
-                    lambda coverage=coverage: ta.attention(
-                        q,
-                        k,
-                        v,
-                        config=ta.AttentionConfig(
-                            method="thrift",
-                            causal=args.causal,
-                            fraction=coverage,
-                            implementation=impl,
-                            quant_format=args.quant_format,
+        for selection in args.selections:
+            for coverage in args.coverages:
+                specs.append(
+                    BenchmarkSpec(
+                        f"thrift_{args.quant_format}_{selection}_{coverage * 100:g}pct",
+                        coverage,
+                        selected_top_k(seq_len, coverage, causal=args.causal and q.shape[2] != 1),
+                        lambda coverage=coverage, selection=selection: ta.attention(
+                            q,
+                            k,
+                            v,
+                            config=ta.AttentionConfig(
+                                method="thrift",
+                                causal=args.causal,
+                                selection=selection,
+                                fraction=coverage,
+                                implementation=impl,
+                                quant_format=args.quant_format,
+                            ),
                         ),
-                    ),
+                    )
                 )
-            )
 
     if not args.skip_fp4:
         try:
@@ -406,6 +420,12 @@ def parse_args() -> argparse.Namespace:
         type=parse_fraction_list,
         default=parse_fraction_list("1%,5%,10%"),
         help="Comma-separated ThriftAttention coverages. Values may be fractions or percentages.",
+    )
+    parser.add_argument(
+        "--selections",
+        type=parse_selection_list,
+        default=parse_selection_list("block_mean"),
+        help="Comma-separated ThriftAttention selection methods.",
     )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--heads", type=int, default=16)

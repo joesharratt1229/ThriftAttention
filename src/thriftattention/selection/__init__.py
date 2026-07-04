@@ -10,6 +10,11 @@ from .block_mean import (
     select_block_pairs,
     select_key_blocks,
 )
+from .local import (
+    LocalSelectionPolicy,
+    select_local_block_pairs,
+    select_local_key_blocks,
+)
 from .quest import (
     QuestSelectionPolicy,
     block_minmax,
@@ -19,6 +24,7 @@ from .quest import (
 
 _POLICIES: dict[str, SelectionPolicy] = {
     "block_mean": BlockMeanSelectionPolicy(),
+    "local": LocalSelectionPolicy(),
     "quest": QuestSelectionPolicy(),
 }
 
@@ -34,6 +40,7 @@ __all__ = [
     "SelectionConfig",
     "SelectionPolicy",
     "BlockMeanSelectionPolicy",
+    "LocalSelectionPolicy",
     "QuestSelectionPolicy",
     "block_minmax",
     "block_means",
@@ -41,6 +48,8 @@ __all__ = [
     "resolve_top_k",
     "select_block_pairs",
     "select_key_blocks",
+    "select_local_block_pairs",
+    "select_local_key_blocks",
     "select_quest_block_pairs",
     "select_quest_key_blocks",
 ]

@@ -1,7 +1,10 @@
+from typing import get_args
+
 import pytest
 
 torch = pytest.importorskip("torch")
 
+from thriftattention.config import AttentionConfig, SelectionMethod
 from thriftattention.selection import get_selection_policy, resolve_top_k
 
 
@@ -58,6 +61,15 @@ def test_select_key_blocks_groups_gqa(monkeypatch):
 
 def test_get_selection_policy_resolves_quest():
     assert get_selection_policy("quest").name == "quest"
+
+
+def test_get_selection_policy_resolves_local():
+    assert get_selection_policy("local").name == "local"
+
+
+def test_attention_config_accepts_local_selection():
+    assert "local" in get_args(SelectionMethod)
+    assert AttentionConfig(selection="local").selection == "local"
 
 
 def test_select_quest_key_blocks_uses_minmax(monkeypatch):
