@@ -337,26 +337,16 @@ void fp4_attention_single_query_kernel_hd256(
         asm volatile("cp.async.commit_group;");
     };
 
-    // Preload first block
-    if (num_kv_iters > 0)
-        start_kv_load(0, 0);
-
+    // Single-buffered
     int cur_buf = 0;
     for (int kv_iter = 0; kv_iter < num_kv_iters; kv_iter++) {
         float S_rmem[BLOCK_KV / MMA_N][4] = {};
         uint32_t S_fp4_rmem[BLOCK_KV / MMA_K][4];
         uint32_t S_fp4_s_rmem[BLOCK_KV / MMA_K];
 
-        // Preload next block into alternate buffer
-        if (kv_iter + 1 < num_kv_iters)
-            start_kv_load(1 - cur_buf, kv_iter + 1);
-
-        // Wait for current buffer
-        if (kv_iter + 1 < num_kv_iters) {
-            asm volatile("cp.async.wait_group %0;" :: "n"(1));
-        } else {
-            asm volatile("cp.async.wait_all;");
-        }
+        // Load current block
+        start_kv_load(0, kv_iter);
+        asm volatile("cp.async.wait_all;");
         __syncwarp();
 
         // Aliases for current buffer
@@ -623,8 +613,6 @@ void fp4_attention_single_query_kernel_hd256(
                     S_fp4_s_rmem[mma_id_kv],
                     sfV_rmem[mma_id_kv][mma_id_d],
                     O_rmem[mma_id_d]);
-
-        cur_buf = 1 - cur_buf;
     }
 
     // ---- Phase 3: Write partials — float2 vectorised stores ----
@@ -1711,7 +1699,7 @@ static void fp4_attention_single_query_split_launch_hd256(
                                 + BLOCK_KV * SCALE_DIM * sizeof(__nv_fp8_e4m3)
                                 + HEAD_DIM * (BLOCK_KV / 2) * sizeof(__nv_fp4x2_e2m1)
                                 + HEAD_DIM * (BLOCK_KV / 16) * sizeof(__nv_fp8_e4m3);
-    constexpr int kv_phase_smem = kv_phase_smem_single * 2;  // double-buffer
+    constexpr int kv_phase_smem = kv_phase_smem_single; 
     constexpr int smem_size = q_phase_smem > kv_phase_smem ? q_phase_smem : kv_phase_smem;
 
     auto kernel = fp4_attention_single_query_kernel_hd256<T, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM>;
@@ -1755,9 +1743,14 @@ static void fp4_attention_single_query_nvfp4_typed_hd256(
     const int total_kv_blocks = cdiv_sqfp4(kv_len, BLOCK_KV);
 
     if (total_kv_blocks <= 4) {
-            fp4_attention_single_query_nosplit_launch_hd256<T, 256>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+        fp4_attention_single_query_nosplit_launch_hd256<T, 256>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+    } else if (total_kv_blocks < 128) {
+        fp4_attention_single_query_cta_launch_hd256<T, 256>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
     } else {
-            fp4_attention_single_query_cta_launch_hd256<T, 256>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+        fp4_attention_single_query_split_launch_hd256<T, 256>(
+            Q, K, V, S_Q, S_K, S_V, O,
+            reinterpret_cast<float*>(workspace_raw),
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
     }
 }
 

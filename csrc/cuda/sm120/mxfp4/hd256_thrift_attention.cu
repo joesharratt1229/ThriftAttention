@@ -420,26 +420,71 @@ void thrift_attention_kernel_hd256(
         }
     }
 
-    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
-        for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
-            const int row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
-            const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
-            float *regs = O_rmem[mma_id_q][mma_id_d];
+    // Two passes of 64 rows each, reusing KV smem for coalesced output stores
+    constexpr int O_HALF_ROWS = BLOCK_Q / 2;  // 64
+    constexpr int O_PAD = 8;
+    constexpr int O_ROW_STRIDE = HEAD_DIM + O_PAD;  // 264
+    const uint32_t O_stg_smem = smem_base;
 
-            const float norm0 = rowsum[mma_id_q][0] > 0.0f
-                ? FP4_RANGE_INV / rowsum[mma_id_q][0]
-                : 0.0f;
-            const float norm1 = rowsum[mma_id_q][1] > 0.0f
-                ? FP4_RANGE_INV / rowsum[mma_id_q][1]
-                : 0.0f;
+    // Pass 1: first half of warps scatter, all threads gather
+    __syncthreads();
+    if (warp_id < NUM_WARPS / 2) {
+        for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+            const float norm0 = rowsum[mma_id_q][0] > 0.0f ? FP4_RANGE_INV / rowsum[mma_id_q][0] : 0.0f;
+            const float norm1 = rowsum[mma_id_q][1] > 0.0f ? FP4_RANGE_INV / rowsum[mma_id_q][1] : 0.0f;
+            const int base_row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+            for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
+                const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
+                float* regs = O_rmem[mma_id_q][mma_id_d];
+                union { typename Traits::vec2 v; uint32_t u; } v0, v1;
+                v0.v = Traits::pack2(regs[0] * norm0, regs[1] * norm0);
+                v1.v = Traits::pack2(regs[2] * norm1, regs[3] * norm1);
+                const uint32_t addr0 = O_stg_smem + (uint32_t)((base_row + 0) * O_ROW_STRIDE + col) * (uint32_t)sizeof(T);
+                const uint32_t addr1 = O_stg_smem + (uint32_t)((base_row + 8) * O_ROW_STRIDE + col) * (uint32_t)sizeof(T);
+                asm volatile("st.shared.b32 [%0], %1;" :: "r"(addr0), "r"(v0.u));
+                asm volatile("st.shared.b32 [%0], %1;" :: "r"(addr1), "r"(v1.u));
+            }
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < O_HALF_ROWS * HEAD_DIM / 2; i += TB_SIZE) {
+        const int row_i = (i * 2) / HEAD_DIM;
+        const int col_i = (i * 2) % HEAD_DIM;
+        union { typename Traits::vec2 v; uint32_t u; } val;
+        const uint32_t smem_addr = O_stg_smem + (uint32_t)(row_i * O_ROW_STRIDE + col_i) * (uint32_t)sizeof(T);
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(val.u) : "r"(smem_addr));
+        reinterpret_cast<typename Traits::vec2*>(O + row_i * HEAD_DIM + col_i)[0] = val.v;
+    }
 
-            regs[0] *= norm0;  regs[1] *= norm0;
-            regs[2] *= norm1;  regs[3] *= norm1;
-
-            reinterpret_cast<typename Traits::vec2*>(O + (row + 0) * HEAD_DIM + col)[0] =
-                Traits::pack2(regs[0], regs[1]);
-            reinterpret_cast<typename Traits::vec2*>(O + (row + 8) * HEAD_DIM + col)[0] =
-                Traits::pack2(regs[2], regs[3]);
+    // Pass 2: second half of warps scatter, all threads gather
+    __syncthreads();
+    if (warp_id >= NUM_WARPS / 2) {
+        for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+            const float norm0 = rowsum[mma_id_q][0] > 0.0f ? FP4_RANGE_INV / rowsum[mma_id_q][0] : 0.0f;
+            const float norm1 = rowsum[mma_id_q][1] > 0.0f ? FP4_RANGE_INV / rowsum[mma_id_q][1] : 0.0f;
+            const int base_row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+            const int smem_row = base_row - O_HALF_ROWS;
+            for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
+                const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
+                float* regs = O_rmem[mma_id_q][mma_id_d];
+                union { typename Traits::vec2 v; uint32_t u; } v0, v1;
+                v0.v = Traits::pack2(regs[0] * norm0, regs[1] * norm0);
+                v1.v = Traits::pack2(regs[2] * norm1, regs[3] * norm1);
+                const uint32_t addr0 = O_stg_smem + (uint32_t)((smem_row + 0) * O_ROW_STRIDE + col) * (uint32_t)sizeof(T);
+                const uint32_t addr1 = O_stg_smem + (uint32_t)((smem_row + 8) * O_ROW_STRIDE + col) * (uint32_t)sizeof(T);
+                asm volatile("st.shared.b32 [%0], %1;" :: "r"(addr0), "r"(v0.u));
+                asm volatile("st.shared.b32 [%0], %1;" :: "r"(addr1), "r"(v1.u));
+            }
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < O_HALF_ROWS * HEAD_DIM / 2; i += TB_SIZE) {
+        const int row_i = (i * 2) / HEAD_DIM;
+        const int col_i = (i * 2) % HEAD_DIM;
+        union { typename Traits::vec2 v; uint32_t u; } val;
+        const uint32_t smem_addr = O_stg_smem + (uint32_t)(row_i * O_ROW_STRIDE + col_i) * (uint32_t)sizeof(T);
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(val.u) : "r"(smem_addr));
+        reinterpret_cast<typename Traits::vec2*>(O + (row_i + O_HALF_ROWS) * HEAD_DIM + col_i)[0] = val.v;
     }
 }
 
@@ -710,27 +755,72 @@ void thrift_attention_fp16_finalize_kernel_hd256(
         __syncthreads();
     }
 
-    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
-        for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
-            const int row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
-            const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
-            float *regs = O_rmem[mma_id_q][mma_id_d];
+    // Same two-pass approach as the FP4 state kernel above
+    constexpr int O_HALF_ROWS = BLOCK_Q / 2;  // 64
+    constexpr int O_PAD = 8;
+    constexpr int O_ROW_STRIDE = HEAD_DIM + O_PAD;  // 264
+    const uint32_t O_stg_smem = smem_base;
 
-            const float norm0 = rowsum[mma_id_q][0] > 0.0f
-                ? FP4_RANGE_INV / rowsum[mma_id_q][0]
-                : 0.0f;
-            const float norm1 = rowsum[mma_id_q][1] > 0.0f
-                ? FP4_RANGE_INV / rowsum[mma_id_q][1]
-                : 0.0f;
-
-            regs[0] *= norm0;  regs[1] *= norm0;
-            regs[2] *= norm1;  regs[3] *= norm1;
-
-            reinterpret_cast<typename Traits::vec2*>(O + (row + 0) * HEAD_DIM + col)[0] =
-                Traits::pack2(regs[0], regs[1]);
-            reinterpret_cast<typename Traits::vec2*>(O + (row + 8) * HEAD_DIM + col)[0] =
-                Traits::pack2(regs[2], regs[3]);
+    // Pass 1: first half of warps scatter, all threads gather
+    __syncthreads();
+    if (warp_id < NUM_WARPS / 2) {
+        for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+            const float norm0 = rowsum[mma_id_q][0] > 0.0f ? FP4_RANGE_INV / rowsum[mma_id_q][0] : 0.0f;
+            const float norm1 = rowsum[mma_id_q][1] > 0.0f ? FP4_RANGE_INV / rowsum[mma_id_q][1] : 0.0f;
+            const int base_row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+            for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
+                const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
+                float* regs = O_rmem[mma_id_q][mma_id_d];
+                union { typename Traits::vec2 v; uint32_t u; } v0, v1;
+                v0.v = Traits::pack2(regs[0] * norm0, regs[1] * norm0);
+                v1.v = Traits::pack2(regs[2] * norm1, regs[3] * norm1);
+                const uint32_t addr0 = O_stg_smem + (uint32_t)((base_row + 0) * O_ROW_STRIDE + col) * (uint32_t)sizeof(T);
+                const uint32_t addr1 = O_stg_smem + (uint32_t)((base_row + 8) * O_ROW_STRIDE + col) * (uint32_t)sizeof(T);
+                asm volatile("st.shared.b32 [%0], %1;" :: "r"(addr0), "r"(v0.u));
+                asm volatile("st.shared.b32 [%0], %1;" :: "r"(addr1), "r"(v1.u));
+            }
         }
+    }
+    __syncthreads();
+    for (int i = tid; i < O_HALF_ROWS * HEAD_DIM / 2; i += TB_SIZE) {
+        const int row_i = (i * 2) / HEAD_DIM;
+        const int col_i = (i * 2) % HEAD_DIM;
+        union { typename Traits::vec2 v; uint32_t u; } val;
+        const uint32_t smem_addr = O_stg_smem + (uint32_t)(row_i * O_ROW_STRIDE + col_i) * (uint32_t)sizeof(T);
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(val.u) : "r"(smem_addr));
+        reinterpret_cast<typename Traits::vec2*>(O + row_i * HEAD_DIM + col_i)[0] = val.v;
+    }
+
+    // Pass 2: second half of warps scatter, all threads gather
+    __syncthreads();
+    if (warp_id >= NUM_WARPS / 2) {
+        for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+            const float norm0 = rowsum[mma_id_q][0] > 0.0f ? FP4_RANGE_INV / rowsum[mma_id_q][0] : 0.0f;
+            const float norm1 = rowsum[mma_id_q][1] > 0.0f ? FP4_RANGE_INV / rowsum[mma_id_q][1] : 0.0f;
+            const int base_row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+            const int smem_row = base_row - O_HALF_ROWS;
+            for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
+                const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
+                float* regs = O_rmem[mma_id_q][mma_id_d];
+                union { typename Traits::vec2 v; uint32_t u; } v0, v1;
+                v0.v = Traits::pack2(regs[0] * norm0, regs[1] * norm0);
+                v1.v = Traits::pack2(regs[2] * norm1, regs[3] * norm1);
+                const uint32_t addr0 = O_stg_smem + (uint32_t)((smem_row + 0) * O_ROW_STRIDE + col) * (uint32_t)sizeof(T);
+                const uint32_t addr1 = O_stg_smem + (uint32_t)((smem_row + 8) * O_ROW_STRIDE + col) * (uint32_t)sizeof(T);
+                asm volatile("st.shared.b32 [%0], %1;" :: "r"(addr0), "r"(v0.u));
+                asm volatile("st.shared.b32 [%0], %1;" :: "r"(addr1), "r"(v1.u));
+            }
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < O_HALF_ROWS * HEAD_DIM / 2; i += TB_SIZE) {
+        const int row_i = (i * 2) / HEAD_DIM;
+        const int col_i = (i * 2) % HEAD_DIM;
+        union { typename Traits::vec2 v; uint32_t u; } val;
+        const uint32_t smem_addr = O_stg_smem + (uint32_t)(row_i * O_ROW_STRIDE + col_i) * (uint32_t)sizeof(T);
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(val.u) : "r"(smem_addr));
+        reinterpret_cast<typename Traits::vec2*>(O + (row_i + O_HALF_ROWS) * HEAD_DIM + col_i)[0] = val.v;
+    }
 }
 
 template<typename T, bool CAUSAL, int HEAD_DIM, int BLOCK_Q, int BLOCK_KV_FP4, int TOPK_BUCKET>
@@ -864,15 +954,15 @@ static void launch_thrift_attention_hd256(
 
     const int num_blocks = bs * ta_cdiv(q_len, BLOCK_Q);
 
-    constexpr int q_phase_smem =
-        BLOCK_Q * HEAD_DIM_2 * (int)sizeof(__nv_fp4x2_e2m1) +
-        BLOCK_Q * SCALE_DIM * (int)sizeof(__nv_fp8_e8m0);
+    constexpr int k_phase_smem =
+        BLOCK_KV_FP4 * HEAD_DIM_2 * (int)sizeof(__nv_fp4x2_e2m1) +
+        BLOCK_KV_FP4 * SCALE_DIM  * (int)sizeof(__nv_fp8_e8m0);
 
     constexpr int v_phase_smem =
-        HEAD_DIM * (BLOCK_KV_FP4 / 2) * (int)sizeof(__nv_fp4x2_e2m1) +
+        HEAD_DIM * (BLOCK_KV_FP4 / 2)  * (int)sizeof(__nv_fp4x2_e2m1) +
         HEAD_DIM * (BLOCK_KV_FP4 / 32) * (int)sizeof(__nv_fp8_e8m0);
 
-    constexpr int fp4_kv_smem = q_phase_smem + v_phase_smem;
+    constexpr int fp4_kv_smem = k_phase_smem + v_phase_smem;
 
     auto fp4_state_kernel = thrift_attention_kernel_hd256<
         T, CAUSAL, BLOCK_Q, BLOCK_KV_FP4, HEAD_DIM,

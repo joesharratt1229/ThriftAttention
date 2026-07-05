@@ -1393,7 +1393,7 @@ void thrift_attention_single_query_split_kernel_hd256(
     const uint32_t K_smem_fp16 = smem_base;
     const uint32_t V_smem_fp16 = K_smem_fp16 + BLOCK_KV_FP16 * HEAD_DIM * (int)sizeof(T);
 
-    // ---- Double-buffered FP4 loop ----
+    // ---- Single-buffered FP4 loop ----
     {
         // Find first non-topk block
         int cur_iter = -1;
@@ -1405,11 +1405,9 @@ void thrift_attention_single_query_split_kernel_hd256(
             if (num_kv_iters > 0) cur_iter = 0;
         }
 
-        if (cur_iter >= 0) {
-            int cur_buf = 0;
+        while (cur_iter >= 0) {
             int gid = kv_block_start + cur_iter;
 
-            // Preload first FP4 block
             load_kv_fp4_async_sqmix<BLOCK_KV_FP4, HEAD_DIM, HEAD_DIM_2, SCALE_DIM>(
                 K_smem_buf[0], K_sf_buf[0], V_smem_buf[0], V_sf_buf[0],
                 K + gid * BLOCK_KV_FP4 * HEAD_DIM_2,
@@ -1417,58 +1415,32 @@ void thrift_attention_single_query_split_kernel_hd256(
                 S_K + gid * BLOCK_KV_FP4 * SCALE_DIM,
                 S_V + gid * BLOCK_KV_FP4 / 16,
                 lane_id, v_kv);
+            asm volatile("cp.async.wait_all;");
+            __syncwarp();
 
-            while (cur_iter >= 0) {
-                // Find next non-topk block
-                int next_iter = -1;
-                for (int j = cur_iter + 1; j < num_kv_iters; j++) {
-                    if (!range_has_fp16 || !is_topk(j)) {
-                        next_iter = j;
-                        break;
-                    }
-                }
-
-                // Preload next block into alternate buffer
-                if (next_iter >= 0) {
-                    int next_gid = kv_block_start + next_iter;
-                    load_kv_fp4_async_sqmix<BLOCK_KV_FP4, HEAD_DIM, HEAD_DIM_2, SCALE_DIM>(
-                        K_smem_buf[1 - cur_buf], K_sf_buf[1 - cur_buf],
-                        V_smem_buf[1 - cur_buf], V_sf_buf[1 - cur_buf],
-                        K + next_gid * BLOCK_KV_FP4 * HEAD_DIM_2,
-                        V + next_gid * BLOCK_KV_FP4 / 2,
-                        S_K + next_gid * BLOCK_KV_FP4 * SCALE_DIM,
-                        S_V + next_gid * BLOCK_KV_FP4 / 16,
-                        lane_id, v_kv);
-                }
-
-                // Wait for current buffer's load to complete
-                if (next_iter >= 0) {
-                    asm volatile("cp.async.wait_group %0;" :: "n"(1));
-                } else {
-                    asm volatile("cp.async.wait_all;");
-                }
-                __syncwarp();
-
-                // Compute attention on current buffer.  GQA single-query usually
-                // has q_len=4, so instantiate a variant that skips lower-half
-                // scalar softmax/packing work for rows 8..15.
-                if constexpr (UPPER_ONLY) {
-                    compute_kv_fp4_sqmix<BLOCK_KV_FP4, HEAD_DIM, HEAD_DIM_2, SCALE_DIM, false, 2>(
-                        rowmax, rowsum, O_rmem, Q_rmem, sfQ_rmem,
-                        K_sf_buf[cur_buf], V_smem_buf[cur_buf], V_sf_buf[cur_buf],
-                        K_ld_buf[cur_buf],
-                        lane_id, softmax_scale);
-                } else {
-                    compute_kv_fp4_sqmix<BLOCK_KV_FP4, HEAD_DIM, HEAD_DIM_2, SCALE_DIM, true, 4>(
-                        rowmax, rowsum, O_rmem, Q_rmem, sfQ_rmem,
-                        K_sf_buf[cur_buf], V_smem_buf[cur_buf], V_sf_buf[cur_buf],
-                        K_ld_buf[cur_buf],
-                        lane_id, softmax_scale);
-                }
-
-                cur_buf = 1 - cur_buf;
-                cur_iter = next_iter;
+            if constexpr (UPPER_ONLY) {
+                compute_kv_fp4_sqmix<BLOCK_KV_FP4, HEAD_DIM, HEAD_DIM_2, SCALE_DIM, false, 2>(
+                    rowmax, rowsum, O_rmem, Q_rmem, sfQ_rmem,
+                    K_sf_buf[0], V_smem_buf[0], V_sf_buf[0],
+                    K_ld_buf[0],
+                    lane_id, softmax_scale);
+            } else {
+                compute_kv_fp4_sqmix<BLOCK_KV_FP4, HEAD_DIM, HEAD_DIM_2, SCALE_DIM, true, 4>(
+                    rowmax, rowsum, O_rmem, Q_rmem, sfQ_rmem,
+                    K_sf_buf[0], V_smem_buf[0], V_sf_buf[0],
+                    K_ld_buf[0],
+                    lane_id, softmax_scale);
             }
+
+            // Find next non-topk block
+            int next_iter = -1;
+            for (int j = cur_iter + 1; j < num_kv_iters; j++) {
+                if (!range_has_fp16 || !is_topk(j)) {
+                    next_iter = j;
+                    break;
+                }
+            }
+            cur_iter = next_iter;
         }
     }
 
@@ -1645,8 +1617,8 @@ static void thrift_attention_single_query_split_launch_hd256(
       + HEAD_DIM * (BLOCK_KV_FP4 / 2)  * (int)sizeof(__nv_fp4x2_e2m1)
       + HEAD_DIM * (BLOCK_KV_FP4 / 16) * (int)sizeof(__nv_fp8_e4m3);
 
-    // Double-buffered FP4
-    constexpr int kv_smem_fp4 = kv_smem_fp4_single * 2;
+    // Single-buffered FP4
+    constexpr int kv_smem_fp4 = kv_smem_fp4_single;
 
     constexpr int kv_smem_fp16 = BLOCK_KV_FP16 * HEAD_DIM * (int)sizeof(T) * 2;
 
