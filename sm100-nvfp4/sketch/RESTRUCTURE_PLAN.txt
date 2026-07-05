@@ -482,3 +482,188 @@ softmax (SEmpty+P0+P1), 29% issuing; P0 wait (owners, 22%) >> P1 (6%).
    per-CTA-identical.  (FA4's own fwd already runs 2-CTA at these shapes,
    per the mechanics extraction -- the baseline we chase is a 2-CTA
    kernel.)
+
+SOFTMAX-CHAIN MITIGATION PLAN (2026-07-04, post-breakdown)
+==========================================================
+Ranked levers against the softmax busy chain (the ~72-77%-busy owner/partner
+warps), from the bottleneck session on the Mac.  #1 is IMPLEMENTED (below,
+unvalidated -- no GPU locally); 2-6 are queued.
+
+1. Integer-domain e2m1 encode  -> IMPLEMENTED as the INT_ENCODE variant.
+2. Three-way split-P using idle wg2: warps 8-11 sit on sub-partitions 0-3,
+   so a third warp per row group is LEGAL (this is NOT the failed KV64
+   12-warp merge, which needed foreign-lane access + smem relays).  GATED
+   on a microbench: does aggregate tcgen05.ld throughput scale from 2 -> 3
+   warps per sub-partition, or is the tmem port per-sub-partition saturated?
+   (Same measurement confirms/kills the 2-CTA DSMEM-contention hypothesis.)
+3. Reorder convert ahead of the max-exchange named barriers: convert_p only
+   needs block_row_max (own per-16-block maxima), not m_used.  Sequence
+   load -> reduce -> post half-max -> CONVERT -> barrier -> m_used -> sf ->
+   rescale -> arrive hides the pair-sync latency behind convert ALU.  No
+   protocol change (P0/P1 arrives stay last, rescale-before-arrive kept).
+4. Software-pipeline S(g+1) load against convert(g): SFull(g+1) often fires
+   during convert(g) thanks to the QK-prefetch hoist; start with a 32-col
+   early load (scores[64] already costs 64 regs of the 176 budget; 8*176 +
+   8*80 = 2048 exactly, no headroom to raise).
+5. MUFU offload for ~1/4 of elements (ex2 of an integer-snapped input stays
+   exact); one-afternoon experiment, drop if quarter-rate MUFU loses.
+6. Owner/partner rebalance: owner busy 308us vs partner 270us while partner
+   waits 12pts more on SFull.  Cheap transfers: partner takes half the
+   epilogue normalise + half of rescale_o's 128 O columns (same rows, legal,
+   no relay); optionally shift one 16-col convert block (sf boundary word
+   then needs one extra smem max post on the existing barrier).
+Do NOT revisit: smem-relay conversion spreading, 2-CTA (until 2's microbench
+answers the contention question), cross-tile QK prefetch (but re-check that
+conclusion if 6 moves the epilogue off the owners).
+
+INT_ENCODE VARIANT: INTEGER-DOMAIN E2M1 ENCODE (implemented 2026-07-04,
+UNVALIDATED -- written on the Mac, needs a B200 run via modal_bench.py)
+------------------------------------------------------------------------
+Derivation (why the pow2+cvt chain is a fixed re-encoding):
+  r = fma(score, scale_log2, TA_MAGIC - M) lands in [2^23, 2^24) where the
+  fp32 ulp is 1.0, so RN snaps the block-relative log2 to an INTEGER v and
+  bits(r) = 0x4B400000 + v.  pow2x4 then builds p = 2^(v+2) -- an EXACT
+  power of two -- and cvt.rn.satfinite.e2m1x2 quantises it.  The only
+  rounding in the whole tail is the v = -4 tie (p = 0.25, exactly halfway
+  between 0 and 0.5), which RN-even resolves to 0.  Code table:
+      v:    0   -1   -2   -3   -4   <=-5     (p = 4, 2, 1, 0.5, 0.25, ...)
+      code: 6    4    2    1    0    0
+  NOT affine (the 0.5 subnormal breaks the line) -> byte-LUT via PRMT.
+Implementation (fp4_attention_sm100.cu):
+  - ta_encode_8_e2m1_int(): per 8 scores.  (a) signed-int max of the float
+    bits against 0x4B400000 -- replaces BOTH the fmaxf floor and the
+    magic-aliasing guard (bit patterns are monotonic for positive floats;
+    negatives/underflows compare below as signed ints).  NaN caveat: NaN
+    bits compare ABOVE the floor; finite-fp4 QK cannot produce NaN.
+    (b) +4 LUT-index bias folded into the addend: block_addend becomes
+    (TA_MAGIC_X2 + 4.0f) - block_row_max, exact (integer floats < 2^24),
+    so the low byte of the clamped bits IS u = v+4 in [0,4].  (c) PRMT
+    gather to nibble-packed selectors, PRMT LUT (0x04020100 / 0x06060606;
+    entries 5-7 = 6 reproduce satfinite, future-proof for deferred-
+    correction v=+1), nibble pack.  Output word bit-identical to
+    ta_cvt_8xf32_to_e2m1_packed(p1,p0,p3,p2,p5,p4,p7,p6) (element i in
+    nibble i; cvt.e2m1x2 d,a,b packs a high / b low).
+  - Kernel is now template<bool INT_ENCODE> (extern "C" dropped; symbol
+    only referenced by the launcher); convert_p branches if constexpr.
+    Base instantiation is byte-identical logic to the shipped kernel.
+  - Dispatch: nvfp4_sm100_attention_launch grew an int_encode arg;
+    extension exposes attention_only(..., int_encode=False) and
+    quantise_and_attention(..., int_encode=False) (defaulted: existing
+    callers incl. profile_breakdown.py unchanged).
+Expected effect (pipe rebalance, not op-count reduction): per 8 elements
+the old tail is 8 FMNMX (FMA pipe, shared with the FFMA2s + rescale/epi
+mul2) + ~8-16 int + 4 CVT (cvt pipe) + pack movs; the new tail is ~29
+ALU-pipe ops (8 IMNMX + 9 PRMT + 12 SHF/LOP3), zero FMA-pipe, zero CVT.
+Win iff ALU/PRMT has headroom in the softmax warps and/or cvt.e2m1x2 is
+slow-rate; loss if ALU saturates.  That question is exactly what the A/B
+answers; also nets back the ~3% previously rejected for dropping the floor
+(the clamp now rides the mandatory LUT-index clamp).
+Validation gates (in order, on B200):
+  1. bench_attention.py biteq column: torch.equal(base, int) on EVERY
+     shape -- strict re-encoding, any diff is a bug (first suspects:
+     nibble order, the v=-4 tie, PRMT selector nibble layout).
+  2. Hang matrix (unchanged protocol) on the int variant: default x5,
+     kv=384, q=2048 H=16 kv=1152, kv_iters=1 multi-tile, 128x128, GQA 8:2.
+  3. Interleaved perf (bench_attention.py prints base | int | fa4).
+  4. SASS audit: nvdisasm the convert region of the <true> instantiation;
+     LUT constants + floor hoisted, IMNMX is signed, PRMTs not re-expanded.
+Bench on Modal: `modal run modal_bench.py` from sketch/ (B200; sources
+shipped at run time so local .cu edits need no image rebuild; FA4 column
+degrades gracefully if flash-attn/cutlass-dsl install fails).
+
+INT_ENCODE RESULT (2026-07-04, B200 via modal_bench): BIT-EXACT, ~18% SLOWER
+-> REVERTED
+-----------------------------------------------------------------------------
+Compiled and ran first try; biteq=True on every shape (the derivation, the
+v=-4 tie, the PRMT nibble layout, and the signed-bits clamp all confirmed
+correct on hardware).  Perf (interleaved, batch=1 H=16):
+  seq    base ms   int ms    speedup
+  1024   0.015     0.015     0.99x   (tail/launch-bound, uninformative)
+  2048   0.033     0.039     0.85x
+  4096   0.109     0.131     0.83x
+  8192   0.351     0.429     0.82x
+  16384  1.355     1.674     0.81x
+Uniform ~0.82x at 2k-16k => steady-state per-element convert cost, not
+scheduling.  The int tail is ~29 ALU ops per 8 elements vs ~18 mixed-pipe
+ops before (+~60%), and the wall grew by almost exactly that fraction of
+the convert-standalone share (+0.078 ms on ~0.14 ms at 8k).
+
+THE LESSON (the valuable part): convert cost scales with INSTRUCTION
+COUNT, not pipe placement.  The softmax warps are ISSUE-bound (or
+shared-ALU-pipe-bound) -- FMNMX and cvt.e2m1x2 were never expensive, and
+moving work off the FMA/CVT pipes onto the ALU pipe buys nothing.
+(Caveat: the <true> SASS was never checked for register spills; the
+uniform ratio across sizes argues against a spill artifact.)
+Consequences for the ranked levers above:
+  - Lever 2 (3-way split via wg2) DOWNGRADED: owner w, partner w+4, and
+    helper w+8 share the same SM sub-partition SCHEDULER, so a third warp
+    adds no issue bandwidth -- only tcgen05.ld latency overlap.  Still
+    gated on the ld-throughput microbench, but expect small.
+  - Levers that REMOVE instructions or stalls from the softmax warps are
+    now the whole game: 3 (convert before the max-exchange barriers),
+    4 (pipeline S(g+1) load against convert(g)), 6 (move epilogue/rescale
+    instructions off owners into partner SFull slack).
+  - Lever 5 (MUFU) only helps if it LOWERS op count per element (fadd+ex2
+    vs fma+fmnmx+shl+iadd), not as pipe relief; numerics change if the
+    magic snap is skipped -- measure separately if at all.
+
+REVERTED from the tree: kernel/extension back to the pre-variant state
+(bench_attention.py keeps the FA4-optional import guard + interleaved
+harness so modal runs survive a missing flash-attn).  The full working
+variant is snapshotted UNTRACKED at fp4_attention_sm100_intenc_snapshot.cu
+(template<bool INT_ENCODE> kernel, ta_encode_8_e2m1_int helper, convert_p
+if-constexpr branch with block_addend = (TA_MAGIC_X2 + 4.0f) -
+block_row_max, launcher int_encode arg) -- diff it against the shipped
+kernel to resurrect.
+fa4 column was missing from the run: flash-attn failed to install in the
+Modal image (its sdist setup.py needs psutil/packaging/einops even with
+FLASH_ATTENTION_SKIP_CUDA_BUILD); modal_bench.py image deps patched,
+unverified until the next run.
+
+SOFTMAX ITERATION RESCHEDULING (levers 3+4, in-tile): ALL VARIANTS SLOWER
+-> REVERTED (2026-07-04, B200 via modal_bench --cmd validate_stream.py)
+--------------------------------------------------------------------------
+Fresh standalone ablations first (confirms the plan numbers): sload -47.2%,
+convert -40.2%, redmax -6.7%, rescale -5.2%, kvtma -0.6%, shell 50.1%
+(8k; 16k within 2 points).  Three schedule variants were then built, all
+bit-exact (torch.equal vs shipped on the full hang-matrix ladder incl.
+GQA 8:2 / odd kv_iters / kv_iters=1, det x5), all interleave-timed A/B in
+one process (validate_stream.py):
+  1. Chunked S load (4x ld.32x32b.x16, wait/issue interleaved so chunk c
+     converts while c+1 flies) + convert-early + P-store-early:
+       0.963x @8k (0.954-0.967x across 2k-16k, uniform).
+  2. Monolithic x64 load, convert-early + P-store-early (pure lever 3):
+       0.912x @8k, 0.904x @16k -- the WORST variant.
+  3. Monolithic x64 load, convert-early, P-store back in the late slot:
+       0.949x @8k -- recovers about half of variant 2's loss.
+Mechanisms (each variant isolates one):
+  a. tcgen05.wait::ld waits on ALL outstanding lds (no per-load token), so
+     in-tile chunking re-pays the tmem fixed latency per chunk instead of
+     once.  There is NO PTX-level way to pipeline two S chunk loads against
+     compute inside one iteration.
+  b. 2 vs 3: moving the P x8 store before the pair barriers costs ~4% by
+     itself -- tcgen05.st and .ld share the sub-partition tmem port, and
+     the baseline's late-store slot kept stores out of everyone's S-load
+     window.  Early stores collide with the other warps' loads.
+  c. 3 vs base: convert-before-barrier still loses ~5% with the store slot
+     fixed.  Best explanation: ptxas already overlaps reduce with the x64's
+     streaming register returns (SASS scoreboards), and the LOAD TAIL that
+     doesn't fit under reduce drains during the pair-barrier waits.  Convert
+     placed directly after the load stalls on that tail instead, and the
+     barrier waits become pure idle.  The shipped order (load -> reduce ->
+     bars -> rescale -> convert -> store) is locally optimal; the barrier
+     "idle" was already doing latency-hiding work.
+THE LESSON: the 47% S-load ablation share is NOT schedulable stall -- it is
+intrinsic tmem port/streaming time already maximally overlapped by ptxas +
+the barrier structure.  Do not attempt further in-iteration reordering.
+What survives this result: (i) reduce convert INSTRUCTION COUNT (f16x2
+packed tail, zero-block skip via warp vote on block_row_max) -- issue slots
+and port time are additive in the warp's serial chain; (ii) the tmem-ld
+throughput-vs-warps microbench (would confirm the port-bound reading and
+settle lever 2 / the 2-CTA contention hypothesis for good); (iii) anything
+that removes tmem TRAFFIC.  Note e4m3-P would DOUBLE P store traffic on
+this same port -- downgrade that lever.
+Tooling kept in tree: modal_bench.py --cmd (run any sketch script on the
+B200), validate_stream.py (snapshot-vs-tree bit-exact ladder + interleaved
+A/B; recreate fp4_attention_sm100_pre_stream_snapshot.cu via cp before the
+next experiment).  Kernel/profiler reverted to pre-experiment state.

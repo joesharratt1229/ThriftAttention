@@ -4,6 +4,10 @@
 Both kernels run non-causal attention, head_dim=128, bf16 in/out.
 NVFP4 quantisation/packing happens once outside the timed region; the timed
 call is attention_only(), which launches just nvfp4_sm100_attention_kernel.
+
+The fa4 column is skipped (with a note) if flash_attn.cute fails to import,
+so the script still runs in environments without the FA4 baseline (e.g. a
+Modal container where the flash-attn install failed).
 """
 from __future__ import annotations
 
@@ -13,7 +17,14 @@ import math
 import torch
 
 from run_fp4_attention import build_extension
-from flash_attn.cute import flash_attn_func
+
+try:
+    from flash_attn.cute import flash_attn_func
+    HAVE_FA4 = True
+except Exception as exc:  # noqa: BLE001 - any import failure just drops the column
+    flash_attn_func = None
+    HAVE_FA4 = False
+    _FA4_IMPORT_ERROR = repr(exc)
 
 HEAD_DIM = 128
 
@@ -76,6 +87,18 @@ def bench_shape(ext, batch: int, heads: int, q_len: int, kv_len: int,
     args = (pre["q_fp4"], pre["k_fp4"], pre["v_t_fp4"],
             pre["q_sf_atoms"], pre["k_sf_atoms"], pre["v_sf_atoms"])
 
+    flops = 4.0 * batch * heads * q_len * kv_len * HEAD_DIM
+
+    if not HAVE_FA4:
+        nvfp4_ms = time_fn(lambda: ext.attention_only(*args, scale), warmup, iters)
+        return {
+            "nvfp4_ms": nvfp4_ms,
+            "fa4_ms": float("nan"),
+            "nvfp4_tflops": flops / (nvfp4_ms * 1e-3) / 1e12,
+            "fa4_tflops": float("nan"),
+            "cos": float("nan"),
+        }
+
     # FA4 wants (B, S, H, D).
     q4 = q.transpose(1, 2).contiguous()
     k4 = k.transpose(1, 2).contiguous()
@@ -93,7 +116,6 @@ def bench_shape(ext, batch: int, heads: int, q_len: int, kv_len: int,
     cos = torch.nn.functional.cosine_similarity(
         out_nvfp4.float().flatten(), out_fa4.float().flatten(), dim=0).item()
 
-    flops = 4.0 * batch * heads * q_len * kv_len * HEAD_DIM
     return {
         "nvfp4_ms": nvfp4_ms,
         "fa4_ms": fa4_ms,
@@ -116,15 +138,20 @@ def main() -> None:
     ext = build_extension(verbose=False)
     print(f"GPU: {torch.cuda.get_device_name()}  batch={args.batch} heads={args.heads} "
           f"head_dim={HEAD_DIM} non-causal, q_len=kv_len")
+    if not HAVE_FA4:
+        print(f"flash_attn.cute unavailable ({_FA4_IMPORT_ERROR}); fa4 column skipped")
     header = (f"{'seqlen':>7} | {'nvfp4 ms':>9} {'nvfp4 TF/s':>10} | "
               f"{'fa4 ms':>9} {'fa4 TF/s':>10} | {'speedup':>7} {'cos':>6}")
     print(header)
     print("-" * len(header))
     for s in args.seqlens:
         r = bench_shape(ext, args.batch, args.heads, s, s, args.warmup, args.iters)
-        print(f"{s:>7} | {r['nvfp4_ms']:>9.3f} {r['nvfp4_tflops']:>10.1f} | "
-              f"{r['fa4_ms']:>9.3f} {r['fa4_tflops']:>10.1f} | "
-              f"{r['fa4_ms'] / r['nvfp4_ms']:>6.2f}x {r['cos']:>6.3f}")
+        if HAVE_FA4:
+            fa4_cols = (f"{r['fa4_ms']:>9.3f} {r['fa4_tflops']:>10.1f} | "
+                        f"{r['fa4_ms'] / r['nvfp4_ms']:>6.2f}x {r['cos']:>6.3f}")
+        else:
+            fa4_cols = f"{'-':>9} {'-':>10} | {'-':>7} {'-':>6}"
+        print(f"{s:>7} | {r['nvfp4_ms']:>9.3f} {r['nvfp4_tflops']:>10.1f} | {fa4_cols}")
 
 
 if __name__ == "__main__":

@@ -2,3 +2,4 @@
 *cpython*
 *egg-info*
 .torch_extensions/
+.claude/settings.local.json

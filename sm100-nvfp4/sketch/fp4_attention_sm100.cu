@@ -39,7 +39,7 @@ constexpr int FA4_PV_N = 128;
 constexpr int FA4_QK_K_ITERS = FA4_HEAD_DIM / FA4_MMA_K;
 constexpr int FA4_PV_K_ITERS = FA4_KV_CHUNKS;
 constexpr int FA4_S_BUFS = 2;
-constexpr int FA4_NUM_SLOTS = 16;
+constexpr int FA4_NUM_SLOTS = 20;
 constexpr int FA4_NUM_KV_PAIRS = FA4_NUM_SLOTS / 2;
 
 constexpr int SF_ATOM_BYTES = 512;
