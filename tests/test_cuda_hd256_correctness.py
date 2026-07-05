@@ -11,6 +11,7 @@ _C = pytest.importorskip("thriftattention._C")
 CONTEXT_LENGTHS = (4096, 8192, 32768, 131072)
 CONTEXT_LENGTHS_DECODE = (128, 256, 512, 1024, 4096, 8192, 32768, 131072)
 DTYPES = (torch.float16, torch.bfloat16)
+BATCH_SIZES = (1, 2, 4)
 
 
 def _requires_sm120_cuda() -> None:
@@ -42,12 +43,13 @@ def _nvfp4_quantize_qkv(
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("kv_len", CONTEXT_LENGTHS_DECODE)
-def test_single_query_nvfp4_hd256_matches_sdpa(dtype: torch.dtype, kv_len: int) -> None:
+@pytest.mark.parametrize("batch", BATCH_SIZES)
+def test_single_query_nvfp4_hd256_matches_sdpa(dtype: torch.dtype, kv_len: int, batch: int) -> None:
 	_requires_sm120_cuda()
 	torch.manual_seed(10)
 	device = torch.device("cuda")
 	is_bf16 = dtype == torch.bfloat16
-	batch, q_heads, kv_heads, head_dim = 1, 4, 2, 256
+	q_heads, kv_heads, head_dim = 4, 2, 256
 	groups = q_heads // kv_heads
 
 	q = (torch.randn(batch, q_heads, 1, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
@@ -90,12 +92,13 @@ def test_single_query_nvfp4_hd256_matches_sdpa(dtype: torch.dtype, kv_len: int) 
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("kv_len", CONTEXT_LENGTHS)
-def test_tiled_nvfp4_hd256_matches_sdpa(dtype: torch.dtype, kv_len: int) -> None:
+@pytest.mark.parametrize("batch", BATCH_SIZES)
+def test_tiled_nvfp4_hd256_matches_sdpa(dtype: torch.dtype, kv_len: int, batch: int) -> None:
 	_requires_sm120_cuda()
 	torch.manual_seed(11)
 	device = torch.device("cuda")
 	is_bf16 = dtype == torch.bfloat16
-	batch, q_heads, kv_heads, seq_len, head_dim = 1, 2, 1, kv_len, 256
+	q_heads, kv_heads, seq_len, head_dim = 2, 1, kv_len, 256
 	groups = q_heads // kv_heads
 
 	q = (torch.randn(batch, q_heads, seq_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
@@ -127,12 +130,13 @@ def test_tiled_nvfp4_hd256_matches_sdpa(dtype: torch.dtype, kv_len: int) -> None
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("kv_len", CONTEXT_LENGTHS)
-def test_tiled_nvfp4_hd256_noncausal_matches_sdpa(dtype: torch.dtype, kv_len: int) -> None:
+@pytest.mark.parametrize("batch", BATCH_SIZES)
+def test_tiled_nvfp4_hd256_noncausal_matches_sdpa(dtype: torch.dtype, kv_len: int, batch: int) -> None:
 	_requires_sm120_cuda()
 	torch.manual_seed(20)
 	device = torch.device("cuda")
 	is_bf16 = dtype == torch.bfloat16
-	batch, q_heads, kv_heads, seq_len, head_dim = 1, 2, 1, kv_len, 256
+	q_heads, kv_heads, seq_len, head_dim = 2, 1, kv_len, 256
 	groups = q_heads // kv_heads
 
 	q = (torch.randn(batch, q_heads, seq_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
@@ -181,12 +185,13 @@ def _mxfp4_quantize_qkv(
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("kv_len", CONTEXT_LENGTHS_DECODE)
-def test_single_query_mxfp4_hd256_matches_sdpa(dtype: torch.dtype, kv_len: int) -> None:
+@pytest.mark.parametrize("batch", BATCH_SIZES)
+def test_single_query_mxfp4_hd256_matches_sdpa(dtype: torch.dtype, kv_len: int, batch: int) -> None:
 	_requires_sm120_cuda()
 	torch.manual_seed(12)
 	device = torch.device("cuda")
 	is_bf16 = dtype == torch.bfloat16
-	batch, q_heads, kv_heads, head_dim = 1, 4, 2, 256
+	q_heads, kv_heads, head_dim = 4, 2, 256
 	groups = q_heads // kv_heads
 
 	q = (torch.randn(batch, q_heads, 1, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
@@ -229,12 +234,13 @@ def test_single_query_mxfp4_hd256_matches_sdpa(dtype: torch.dtype, kv_len: int) 
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("kv_len", CONTEXT_LENGTHS)
-def test_tiled_mxfp4_hd256_matches_sdpa(dtype: torch.dtype, kv_len: int) -> None:
+@pytest.mark.parametrize("batch", BATCH_SIZES)
+def test_tiled_mxfp4_hd256_matches_sdpa(dtype: torch.dtype, kv_len: int, batch: int) -> None:
 	_requires_sm120_cuda()
 	torch.manual_seed(13)
 	device = torch.device("cuda")
 	is_bf16 = dtype == torch.bfloat16
-	batch, q_heads, kv_heads, seq_len, head_dim = 1, 2, 1, kv_len, 256
+	q_heads, kv_heads, seq_len, head_dim = 2, 1, kv_len, 256
 	groups = q_heads // kv_heads
 
 	q = (torch.randn(batch, q_heads, seq_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
@@ -267,12 +273,13 @@ def test_tiled_mxfp4_hd256_matches_sdpa(dtype: torch.dtype, kv_len: int) -> None
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("kv_len", CONTEXT_LENGTHS)
-def test_tiled_mxfp4_hd256_noncausal_matches_sdpa(dtype: torch.dtype, kv_len: int) -> None:
+@pytest.mark.parametrize("batch", BATCH_SIZES)
+def test_tiled_mxfp4_hd256_noncausal_matches_sdpa(dtype: torch.dtype, kv_len: int, batch: int) -> None:
 	_requires_sm120_cuda()
 	torch.manual_seed(21)
 	device = torch.device("cuda")
 	is_bf16 = dtype == torch.bfloat16
-	batch, q_heads, kv_heads, seq_len, head_dim = 1, 2, 1, kv_len, 256
+	q_heads, kv_heads, seq_len, head_dim = 2, 1, kv_len, 256
 	groups = q_heads // kv_heads
 
 	q = (torch.randn(batch, q_heads, seq_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
