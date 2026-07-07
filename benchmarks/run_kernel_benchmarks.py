@@ -16,6 +16,7 @@ if SRC_ROOT.exists():
     sys.path.insert(0, str(SRC_ROOT))
 
 import torch
+import torch.nn.functional as F
 
 import thriftattention as ta
 
@@ -106,6 +107,37 @@ def parse_dtype(value: str) -> torch.dtype:
     raise argparse.ArgumentTypeError("dtype must be fp16 or bf16")
 
 
+def parse_expected_sm(value: str) -> tuple[int, int]:
+    compact = value.strip().lower().replace("-", "_")
+    has_arch_prefix = False
+    for prefix in ("sm_", "sm", "compute_", "compute", "cc_", "cc"):
+        if compact.startswith(prefix):
+            compact = compact[len(prefix) :]
+            has_arch_prefix = True
+            break
+
+    try:
+        if "." in compact:
+            major_text, minor_text = compact.split(".", 1)
+            major, minor = int(major_text), int(minor_text)
+        elif (has_arch_prefix and len(compact) >= 2) or int(compact) >= 50:
+            major, minor = int(compact[:-1]), int(compact[-1])
+        else:
+            major, minor = int(compact), 0
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--expected-sm must look like 10.0, 100, or sm_100"
+        ) from exc
+
+    if major <= 0 or minor < 0 or major > 20:
+        raise argparse.ArgumentTypeError("--expected-sm must look like 10.0, 100, or sm_100")
+    return major, minor
+
+
+def format_sm(capability: tuple[int, int]) -> str:
+    return f"sm_{capability[0]}{capability[1]}"
+
+
 def percentile(values: list[float], q: float) -> float:
     if not values:
         raise ValueError("cannot compute percentile of an empty list")
@@ -151,16 +183,46 @@ def make_qkv(args: argparse.Namespace, seq_len: int) -> tuple[torch.Tensor, torc
 def require_flash_attn_func() -> Callable[..., torch.Tensor]:
     try:
         from flash_attn import flash_attn_func
-    except Exception as exc:
+    except ImportError as exc:
         raise MissingDependency(
             "flash-attn is not importable; install it or use --fp16-backend torch"
         ) from exc
     return flash_attn_func
 
 
+def require_flash_attn4_func() -> Callable[..., torch.Tensor]:
+    try:
+        from flash_attn.cute import flash_attn_func
+    except ImportError:
+        try:
+            from flash_attn4 import flash_attn_func
+        except ImportError as exc:
+            raise MissingDependency("FlashAttention 4 is not importable") from exc
+    return flash_attn_func
+
+
 def missing_dependency_fn(note: str) -> TensorFn:
     def run() -> torch.Tensor:
         raise MissingDependency(note)
+
+    return run
+
+
+def make_torch_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    causal: bool,
+) -> TensorFn:
+    def run() -> torch.Tensor:
+        return F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=causal,
+            enable_gqa=q.shape[1] != k.shape[1],
+        )
 
     return run
 
@@ -177,10 +239,29 @@ def make_flash_attn_fp16(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, c
     return run
 
 
+def make_flash_attn4(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    causal: bool,
+) -> TensorFn:
+    flash_attn_func = require_flash_attn4_func()
+    q_bshd = q.transpose(1, 2).contiguous()
+    k_bshd = k.transpose(1, 2).contiguous()
+    v_bshd = v.transpose(1, 2).contiguous()
+
+    def run() -> torch.Tensor:
+        out = flash_attn_func(q_bshd, k_bshd, v_bshd, causal=causal)
+        return out[0] if isinstance(out, tuple) else out
+
+    return run
+
+
 def require_sageattn3() -> Callable[..., torch.Tensor]:
     try:
         from sageattn3 import sageattn3_blackwell
-    except Exception as exc:
+    except ImportError as exc:
         raise MissingDependency("sageattn3 is not importable; install SageAttention/sageattention3_blackwell") from exc
     return sageattn3_blackwell
 
@@ -209,16 +290,27 @@ def build_specs(
     impl = attention_implementation(q.shape[2])
 
     if not args.skip_fp16:
-        if args.fp16_backend == "flash-attn":
-            fn = make_flash_attn_fp16(q, k, v, causal=args.causal)
+        if args.fp16_backend in ("torch", "both"):
             specs.append(
                 BenchmarkSpec(
-                    f"{args.dtype_name}_flash_attn",
+                    f"{args.dtype_name}_torch_sdpa",
                     None,
                     None,
-                    fn,
+                    make_torch_sdpa(q, k, v, causal=args.causal),
                 )
             )
+        if args.fp16_backend in ("flash-attn", "both"):
+            try:
+                fn = make_flash_attn_fp16(q, k, v, causal=args.causal)
+            except MissingDependency as exc:
+                fn = missing_dependency_fn(str(exc))
+            specs.append(BenchmarkSpec(f"{args.dtype_name}_flash_attn", None, None, fn))
+        if not args.skip_fa4:
+            try:
+                fn = make_flash_attn4(q, k, v, causal=args.causal)
+            except MissingDependency as exc:
+                fn = missing_dependency_fn(str(exc))
+            specs.append(BenchmarkSpec("flash_attn4", None, None, fn))
     if not args.skip_fp4:
         specs.append(
             BenchmarkSpec(
@@ -306,7 +398,7 @@ def measure_cuda_events(fn: TensorFn, *, warmup: int, repeat: int) -> TimingStat
 def profile_cuda_kernels(name: str, fn: TensorFn, *, iters: int, row_limit: int) -> None:
     try:
         from torch.profiler import ProfilerActivity, profile, record_function
-    except Exception as exc:
+    except ImportError as exc:
         print(f"\nProfiler unavailable for {name}: {exc}")
         return
 
@@ -391,6 +483,18 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--warmup must be non-negative")
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for these benchmarks")
+    device = torch.device(args.device)
+    if device.type != "cuda":
+        raise SystemExit("--device must be a CUDA device")
+    device_index = torch.cuda.current_device() if device.index is None else device.index
+    if device_index >= torch.cuda.device_count():
+        raise SystemExit(f"--device index {device_index} is not available")
+    if args.expected_sm is not None:
+        actual_sm = torch.cuda.get_device_capability(device_index)
+        if actual_sm != args.expected_sm:
+            raise SystemExit(
+                f"expected {format_sm(args.expected_sm)}, got {format_sm(actual_sm)}"
+            )
     for seq_len in args.seq_lens:
         q_len = query_len(args, seq_len)
         if seq_len <= 0:
@@ -442,10 +546,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=50)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--expected-sm",
+        type=parse_expected_sm,
+        default=None,
+        help="Fail unless the selected CUDA device has this SM, e.g. 10.0, 100, or sm_100.",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--non-causal", dest="causal", action="store_false")
-    parser.add_argument("--fp16-backend", choices=("flash-attn", "torch"), default="flash-attn")
+    parser.add_argument(
+        "--fp16-backend",
+        choices=("flash-attn", "torch", "both"),
+        default="flash-attn",
+    )
     parser.add_argument("--skip-fp16", action="store_true")
+    parser.add_argument("--skip-fa4", action="store_true")
     parser.add_argument("--skip-thrift", action="store_true")
     parser.add_argument("--skip-fp4", action="store_true")
     parser.add_argument("--profile", action="store_true", help="Print a torch.profiler CUDA table for each benchmark.")
