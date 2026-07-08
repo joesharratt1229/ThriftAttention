@@ -1,36 +1,51 @@
-#!/usr/bin/env python3
-"""Kernel-only benchmark: NVFP4 SM100 attention vs FlashAttention-4 (CuTe DSL).
-
-Both kernels run non-causal attention, head_dim=128, bf16 in/out.
-NVFP4 quantisation/packing happens once outside the timed region; the timed
-call is attention_only(), which launches just nvfp4_sm100_attention_kernel.
-
-The fa4 column is skipped (with a note) if flash_attn.cute fails to import,
-so the script still runs in environments without the FA4 baseline (e.g. a
-Modal container where the flash-attn install failed).
-"""
 from __future__ import annotations
 
 import argparse
 import math
+from pathlib import Path
 
 import torch
+from torch.utils.cpp_extension import load
 
-from run_fp4_attention import build_extension
+ROOT = Path(__file__).resolve().parent
+HEAD_DIM = 128
 
 try:
     from flash_attn.cute import flash_attn_func
     HAVE_FA4 = True
-except Exception as exc:  # noqa: BLE001 - any import failure just drops the column
+except Exception as exc:
     flash_attn_func = None
     HAVE_FA4 = False
     _FA4_IMPORT_ERROR = repr(exc)
 
-HEAD_DIM = 128
+
+def build_extension(verbose: bool = False):
+    build_dir = ROOT / ".torch_extensions" / "fp4_attention_sm100_ext"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    return load(
+        name="fp4_attention_sm100_ext",
+        sources=[
+            str(ROOT / "fp4_attention_extension.cpp"),
+            str(ROOT / "fp4_attention_sm100.cu"),
+            str(ROOT / "quantise_nvfp4.cu"),
+        ],
+        extra_cuda_cflags=[
+            "-O3",
+            "-std=c++17",
+            "-gencode=arch=compute_100a,code=sm_100a",
+            "--use_fast_math",
+            "--expt-relaxed-constexpr",
+            "--relocatable-device-code=false",
+            "-lineinfo",
+        ],
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_ldflags=["-lcuda"],
+        build_directory=str(build_dir),
+        verbose=verbose,
+    )
 
 
 def time_fn(fn, warmup: int, iters: int) -> float:
-    """Return average milliseconds per call, timed with CUDA events."""
     for _ in range(warmup):
         fn()
     start = torch.cuda.Event(enable_timing=True)
@@ -45,9 +60,6 @@ def time_fn(fn, warmup: int, iters: int) -> float:
 
 
 def time_interleaved(fn_a, fn_b, warmup: int, iters: int, chunks: int = 10) -> tuple[float, float]:
-    """Time two kernels in alternating chunks so both see the same average
-    thermal/power state (back-to-back blocks bias against whichever runs
-    second once the GPU throttles under sustained load)."""
     for _ in range(warmup):
         fn_a()
         fn_b()
@@ -82,7 +94,6 @@ def bench_shape(ext, batch: int, heads: int, q_len: int, kv_len: int,
     k = torch.randn(batch, heads, kv_len, HEAD_DIM, device=device, dtype=dtype)
     v = torch.randn(batch, heads, kv_len, HEAD_DIM, device=device, dtype=dtype)
 
-    # Quantise once (untimed), keep fp4 payloads + scale atoms for the timed loop.
     pre = ext.quantise_and_attention(q, k, v, scale)
     args = (pre["q_fp4"], pre["k_fp4"], pre["v_t_fp4"],
             pre["q_sf_atoms"], pre["k_sf_atoms"], pre["v_sf_atoms"])
@@ -99,7 +110,6 @@ def bench_shape(ext, batch: int, heads: int, q_len: int, kv_len: int,
             "cos": float("nan"),
         }
 
-    # FA4 wants (B, S, H, D).
     q4 = q.transpose(1, 2).contiguous()
     k4 = k.transpose(1, 2).contiguous()
     v4 = v.transpose(1, 2).contiguous()
@@ -109,7 +119,6 @@ def bench_shape(ext, batch: int, heads: int, q_len: int, kv_len: int,
         lambda: flash_attn_func(q4, k4, v4, softmax_scale=scale, causal=False),
         warmup, iters)
 
-    # Output agreement (fp4 quantisation bounds the achievable match).
     out_nvfp4 = ext.attention_only(*args, scale)
     out_fa4 = flash_attn_func(q4, k4, v4, softmax_scale=scale, causal=False)[0]
     out_fa4 = out_fa4.transpose(1, 2)

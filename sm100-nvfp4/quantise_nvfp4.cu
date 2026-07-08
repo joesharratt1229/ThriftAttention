@@ -174,7 +174,6 @@ void nvfp4_quantise_kernel(const T* X, __nv_fp4x2_e2m1* X_fp4, __nv_fp8_e4m3* X_
     float vec_max = max(Traits::to_float(Traits::low(local_max)),
                         Traits::to_float(Traits::high(local_max)));
 
-    // compute scale factor: quantise to fp8, then recover for exact representable value
     float sf = vec_max / 6.0f;
     uint8_t sf_fp8;
     reinterpret_cast<__nv_fp8_e4m3&>(sf_fp8) = __nv_fp8_e4m3(sf);
@@ -190,8 +189,6 @@ void nvfp4_quantise_kernel(const T* X, __nv_fp4x2_e2m1* X_fp4, __nv_fp8_e4m3* X_
         X_f2[i].y *= sf_inv;
     }
 
-    // convert to fp4 e2m1: 16 elements = 2 x uint32_t (8 nibbles each)
-    // swap .y/.x at call site so .x (even elem) lands in low nibble
     uint32_t fp4_packed[2];
     fp4_packed[0] = ta_cvt_8xf32_to_e2m1_packed(
         X_f2[0].y, X_f2[0].x, X_f2[1].y, X_f2[1].x,
@@ -200,22 +197,16 @@ void nvfp4_quantise_kernel(const T* X, __nv_fp4x2_e2m1* X_fp4, __nv_fp8_e4m3* X_
         X_f2[4].y, X_f2[4].x, X_f2[5].y, X_f2[5].x,
         X_f2[6].y, X_f2[6].x, X_f2[7].y, X_f2[7].x);
 
-    // store fp4 output: 16 fp4 values = 8 bytes per thread
-    // output layout: [bs, seq_len, head_dim/2] (each byte = 2 fp4 values)
     if (seq_id < seq_len) {
         __nv_fp4x2_e2m1* out = X_fp4 + batch_id * seq_len * (head_dim / 2)
                               + seq_id * (head_dim / 2)
                               + head_id * (ELEMENTS_PER_THREAD / 2);
         reinterpret_cast<uint64_t*>(out)[0] = reinterpret_cast<uint64_t*>(fp4_packed)[0];
 
-        // store scale factor: 1 fp8 per 16 elements
-        // output layout: [bs, seq_len, head_dim/16]
         X_scale[batch_id * seq_len * (head_dim / 16) + seq_id * (head_dim / 16) + head_id] =
             reinterpret_cast<__nv_fp8_e4m3&>(sf_fp8);
     }
 }
-
-// ---- launch wrapper ----
 
 template<typename T, int HEAD_DIM>
 static void nvfp4_quantise_launch(
@@ -419,13 +410,6 @@ void nvfp4_quantise_permute_seq(
     }
 }
 
-// ============================================================================
-// Transpose + quantise kernel
-// Reads  [bs, seq_len, HEAD_DIM]  (row-major, contiguous)
-// Writes [bs, HEAD_DIM, padded_seq/2]  (fp4x2) and [bs, HEAD_DIM, padded_seq/16]  (fp8 scale)
-// i.e. transposes the last two dims while quantising to NV-FP4.
-// ============================================================================
-
 template<typename T, int HEAD_DIM, int SEQ_PER_BLOCK>
 __global__
 void nvfp4_quantise_transpose_kernel(
@@ -442,10 +426,6 @@ void nvfp4_quantise_transpose_kernel(
     const int batch_id = bid / num_seq_blocks;
     const int seq_block_id = bid % num_seq_blocks;
 
-    // --- Phase 1: Load input tile [SEQ_PER_BLOCK, HEAD_DIM] into shared mem ---
-    // Thread mapping (same as non-transpose kernel):
-    //   load_seq_local  = which row within the block   [0, SEQ_PER_BLOCK)
-    //   load_head_chunk = which 16-element chunk of d   [0, THREADS_PER_HEAD)
     const int load_seq_local  = tid / THREADS_PER_HEAD;
     const int load_head_chunk = tid % THREADS_PER_HEAD;
     const int load_seq_global = seq_block_id * SEQ_PER_BLOCK + load_seq_local;
@@ -471,7 +451,6 @@ void nvfp4_quantise_transpose_kernel(
         }
     }
 
-    // smem layout: [SEQ_PER_BLOCK][HEAD_DIM]
     __shared__ T smem[SEQ_PER_BLOCK * HEAD_DIM];
 
     T* smem_row = smem + load_seq_local * HEAD_DIM + load_head_chunk * ELEMENTS_PER_THREAD;
@@ -480,10 +459,6 @@ void nvfp4_quantise_transpose_kernel(
 
     __syncthreads();
 
-    // --- Phase 2: Read transposed — 16 elements along seq for one head_dim pos ---
-    // Thread mapping after transpose:
-    //   dim_id    = which head_dim position   [0, HEAD_DIM)
-    //   seq_chunk = which 16-element group     [0, THREADS_PER_SEQ)
     const int dim_id    = tid / THREADS_PER_SEQ;
     const int seq_chunk = tid % THREADS_PER_SEQ;
 
@@ -496,7 +471,6 @@ void nvfp4_quantise_transpose_kernel(
                                        smem[s1 * HEAD_DIM + dim_id]);
     }
 
-    // --- Quantise (identical to non-transpose kernel) ---
     typename Traits::vec2 local_max = Traits::abs2(vals_h2[0]);
     #pragma unroll
     for (int i = 1; i < 8; i++) {
@@ -527,8 +501,6 @@ void nvfp4_quantise_transpose_kernel(
         X_f2[4].y, X_f2[4].x, X_f2[5].y, X_f2[5].x,
         X_f2[6].y, X_f2[6].x, X_f2[7].y, X_f2[7].x);
 
-    // --- Store in transposed layout ---
-    // fp4 output: [bs, HEAD_DIM, padded_seq / 2]
     const int seq_offset = seq_block_id * SEQ_PER_BLOCK + seq_chunk * ELEMENTS_PER_THREAD;
 
     __nv_fp4x2_e2m1* out = X_fp4 + batch_id * HEAD_DIM * (padded_seq / 2)
@@ -536,14 +508,11 @@ void nvfp4_quantise_transpose_kernel(
                           + seq_offset / 2;
     reinterpret_cast<uint64_t*>(out)[0] = reinterpret_cast<uint64_t*>(fp4_packed)[0];
 
-    // scale output: [bs, HEAD_DIM, padded_seq / 16]
     X_scale[batch_id * HEAD_DIM * (padded_seq / 16)
             + dim_id * (padded_seq / 16)
             + seq_block_id * (SEQ_PER_BLOCK / 16) + seq_chunk] =
         reinterpret_cast<__nv_fp8_e4m3&>(sf_fp8);
 }
-
-// ---- launch wrapper (transpose) ----
 
 template<typename T, int HEAD_DIM>
 static void nvfp4_quantise_transpose_launch(
