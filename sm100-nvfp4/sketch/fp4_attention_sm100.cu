@@ -24,7 +24,7 @@ constexpr float TA_MAGIC_X2 = 25165824.0f;
 constexpr float LAZY_RESCALE_T = 4.0f;
 constexpr float P_SCALE_RANGE = 448.0f / 16.0f;
 
-constexpr int FA4_NUM_WARPS = 16;
+constexpr int FA4_NUM_WARPS = 12;
 constexpr int FA4_THREADS = FA4_NUM_WARPS * WARP_SIZE;
 constexpr int FA4_HEAD_DIM = 128;
 constexpr int FA4_Q_STAGES = 1;
@@ -154,7 +154,7 @@ __device__ __forceinline__ uint32_t prof_now()
 }
 
 // u32 cycle sums: wraps only past ~2.4 s, far beyond any launch here.  Sums
-// live in the SMEM_PROF region (zeroed by warp 13 before the entry sync);
+// live in the SMEM_PROF region (zeroed by warp 9 before the entry sync);
 // exactly one designated lane per warp accumulates, so only t_prev/t_start
 // and a pointer occupy registers and the hot paths stay spill-free.
 struct ProfAcc {
@@ -196,9 +196,9 @@ struct ProfAcc {
     ProfAcc _prof;                                                           \
     _prof.start(smem_storage,                                                \
                 warp_id < 8 ? warp_id                                        \
-                            : (warp_id == 12 ? 8                             \
-                                             : (warp_id == 14 ? 9           \
-                                                              : (warp_id == 13 ? 10 : 11))), \
+                            : (warp_id == 8 ? 8                              \
+                                            : (warp_id == 10 ? 9            \
+                                                             : (warp_id == 9 ? 10 : 11))), \
                 lane_id == 0)
 #define FA4_PROF_WRITER(b)   _prof.writer = (b)
 #define FA4_PROF_TICK(cat)   _prof.tick(cat)
@@ -793,11 +793,9 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
     // wg0: softmax owners (chunk 0, cols 0-63, stats + rescale + epilogue);
     // wg1: softmax partners (chunk 1, cols 64-127) -- warps w and w+4 share
     // tmem sub-partition w%4, so both can serve the same 32 rows;
-    // wg2: unused (exits); wg3: mma / epilogue-store / load.
+    // wg2: mma / epilogue-store / load / one inactive companion warp.
     if (warp_id < 8) {
-        setmaxnreg_inc<176>();
-    } else if (warp_id < 12) {
-        setmaxnreg_dec<80>();
+        setmaxnreg_inc<80>();
     } else {
         setmaxnreg_dec<80>();
     }
@@ -839,12 +837,12 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
 
-    if (warp_id == 12) {
+    if (warp_id == 8) {
         tcgen05_alloc(tmem_addr_smem, TMEM_COLS);
         tcgen05_relinquish_alloc_permit();
     }
 
-    if (warp_id == 13) {
+    if (warp_id == 9) {
         uint32_t* ones_data = reinterpret_cast<uint32_t*>(smem_storage + SMEM_ONES);
         uint32_t* ones_sf = reinterpret_cast<uint32_t*>(smem_storage + SMEM_ONES_SF);
         for (int i = lane_id; i < 128; i += WARP_SIZE) {
@@ -862,7 +860,7 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
 
     __syncthreads();
 
-    if (warp_id == 15 || (warp_id >= 8 && warp_id < 12)) {
+    if (warp_id == 11) {
         return;
     }
 
@@ -1449,13 +1447,13 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         softmax_owner();
     } else if (warp_id < 8) {
         softmax_partner();
-    } else if (warp_id == 12) {
+    } else if (warp_id == 8) {
         mma_loop();
-    } else if (warp_id == 13) {
+    } else if (warp_id == 9) {
         if (elect_sync()) {
             epilogue_store();
         }
-    } else if (warp_id == 14) {
+    } else if (warp_id == 10) {
         load_loop();
     }
 }

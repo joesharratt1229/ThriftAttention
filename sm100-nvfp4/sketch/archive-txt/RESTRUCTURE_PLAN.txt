@@ -667,3 +667,230 @@ Tooling kept in tree: modal_bench.py --cmd (run any sketch script on the
 B200), validate_stream.py (snapshot-vs-tree bit-exact ladder + interleaved
 A/B; recreate fp4_attention_sm100_pre_stream_snapshot.cu via cp before the
 next experiment).  Kernel/profiler reverted to pre-experiment state.
+
+CVT_X4 VARIANT: cvt.rs.e2m1x4 CONVERT TAIL (implemented 2026-07-08,
+UNVALIDATED -- written on the Mac, needs a B200 run)
+------------------------------------------------------------------------
+Motivation: the INT_ENCODE lesson says convert cost = ISSUE SLOTS, and the
+post-stream lesson says what survives is "reduce convert INSTRUCTION
+COUNT".  Full integer-domain packing lost because its LUT/merge tax (~29
+ALU ops/8) exceeds the cvt hardware's built-in pack.  This variant keeps
+the cvt hardware doing the packing but converts FOUR elements per
+instruction instead of two, and pins the pow2 reconstruct to one IMAD:
+
+  cvt.rs{.relu}.satfinite.e2m1x4.f32 d, {a, b, e, f}, rbits;   (PTX 8.7+,
+  sm_100a/103a; CUDA >= 12.8 -- container is 13.0.1, OK)
+
+Bit-identity argument (gate 1 must show biteq=True, any diff is a bug):
+  - PTX: ".rs: ... result is rounded in the direction toward zero or away
+    from zero based on the carry out of the integer addition of the
+    supplied random bits (rbits) to the truncated off (discarded) bits of
+    mantissa from the input."  rbits = 0 => carry never fires => round
+    toward zero.
+  - Every input to the pack is p = 2^(v+2), v in [-126, 0] (exact e2m1
+    value or below range): discarded bits are all-zero => conversion exact
+    under ANY rounding.  The only rounding case in the base path, v = -4
+    (p = 0.25, discarded bits "10..."), gives no carry => 0, matching
+    cvt.rn's tie-to-even => 0.  Values below (v <= -5, incl. the clamped
+    floor 2^-124) truncate to 0 = rn result.
+  - Nibble order (PTX): "the value converted from inputs a, b, e, f are
+    stored in each 4 bits starting from upper bits of d", i.e. a ->
+    d[15:12] ... f -> d[3:0].  Helper lists (f3, f2, f1, f0) so element i
+    lands in nibble i; word = mov.b32 {lo, hi} keeps elements 0-7 ->
+    nibbles 0-7 as in the base path.  (Base x2 packs a HIGH / b low, hence
+    its swapped-pair call sites; the x4 helper takes plain element order.)
+Instruction accounting per 8 elements (tail after the 4 FFMA2):
+  base:  8 FMNMX + 8x(SHF+IADD | LEA) + 4 CVT(e2m1x2) + ~3 pack movs
+         = 23-31 issue slots
+  x4:    8 FMNMX + 8 IMAD (mad.lo pinned) + 2 CVT.RS(e2m1x4) + 1 mov.b32
+         = 19 issue slots
+  => -17% to -39% of the convert tail; convert+P-store ablation is ~40% of
+  wall, so expect roughly -4% to -10% wall if CVT.RS is single-SASS and
+  issue-bound reasoning holds.  FMNMX floor is retained (no min/max.f32x2
+  exists -- LLVM lowers v2f32 maxnum to two scalar max.f32 even on sm_100;
+  matches the FMNMX2-free SASS audit).  Register pressure neutral (same 8
+  live p floats; constants fold into IMAD imm / RZ).
+Implementation (mirrors INT_ENCODE plumbing):
+  - ta_pow2x4_from_bits_mad(): mad.lo.u32 br*0x800000 + 0x40800000 (the
+    C++ shift+add left ptxas free to emit SHF+IADD).
+  - ta_score_to_p2_mad(): same fma2 + fmaxf floor, mad reconstruct.
+  - ta_cvt_8xf32_to_e2m1_packed_x4(): 2x cvt.rs.satfinite.e2m1x4.f32
+    (rbits = 0) + mov.b32; args in element order.
+  - Kernel is template<bool CVT_X4> (extern "C" dropped, launcher-only
+    symbol); convert_p branches if constexpr; <false> is byte-identical
+    logic to the shipped kernel.
+  - nvfp4_sm100_attention_launch grew int cvt_x4 (0/1) BEFORE stream --
+    NOTE ABI: any snapshot .cu built against the current extension .cpp
+    must add the arg (extern "C" would link an old snapshot silently and
+    misread the stream).  Extension: attention_only(..., cvt_x4=False),
+    quantise_and_attention(..., cvt_x4=False), kwargs defaulted so all
+    existing callers are unchanged.
+  - bench_attention.py: base|x4 interleaved + biteq column (fa4 pair
+    unchanged; ratios only meaningful within a pair).
+Validation gates (in order, on B200, `modal run modal_bench.py`):
+  1. biteq column True on EVERY shape (first suspects if not: x4 nibble
+     order -- fix is reversing the {%4,%3,%2,%1} lists; rbits lane
+     mapping -- irrelevant at 0; the v=-4 tie).
+  2. Hang matrix unchanged on the x4 variant (default x5, kv=384, q=2048
+     H=16 kv=1152, kv_iters=1 multi-tile, 128x128, GQA 8:2).
+  3. Interleaved perf: expect uniform gain at 2k-16k (steady-state
+     convert share); flat/negative => check gate 4 before concluding.
+  4. SASS audit of the <true> convert region: CVT.RS single-op per 4
+     elements (if it expands to >=2 SASS ops the win halves), IMAD single,
+     no spill delta vs <false> (ptxas -v reg counts equal).
+If x4 wins, follow-ups in this direction: fold the e4m3 SF pack the same
+way (cvt.rs.e4m3x4, ~0.05 slots/element, minor); zero-block skip via warp
+vote on block_row_max (post-stream lesson item); MUFU lever 5 re-costed
+with the x4 pack (fadd+ex2+0.25 cvt = ~1.9 slots/elem for the offloaded
+quarter, numerics change, separate experiment).
+
+NOTE 2026-07-08: the CVT_X4 section above describes the intended variant but
+the implementation is NOT in the tree (fp4_attention_sm100.cu at HEAD is the
+base kernel; no template/cvt.rs anywhere).  Treat CVT_X4 as spec'd, unbuilt.
+
+PIPE2: ITERATION-INTERLEAVED SOFTMAX (2026-07-08): BIT-EXACT, 0.87x -> REVERTED
+--------------------------------------------------------------------------------
+Idea: remove the per-iteration owner/partner rendezvous entirely.  Warp w
+handles the EVEN global iterations whole (both 64-col chunks, S buffer A
+fixed since buf == g&1), w+4 the ODD ones (buffer B); the only remaining
+cross-iteration dependency -- the lazy row-max chain m(g-1) -> m(g) -- rides
+hm_used[row] behind a per-row-group MStats mbarrier pair (arrive.release
+publishes the smem store; posted right after the stats step).  The two named
+barriers per iteration disappear; P0Ready/P1Ready counts and the mma/load/
+store warps are untouched (the iteration's handler arrives P1Ready twice).
+In-warp order: ld c0 -> reduce c0 -> convert c0 (block-relative, no m
+needed) -> ld c1 reusing the 64 score regs (128 live floats would spill) ->
+reduce c1 -> baton -> stats/rescale -> sf words -> arrives -> convert c1.
+Motivation: "software-pipeline S(g+1) load against convert(g)" is impossible
+in-warp (tcgen05.wait::ld waits on ALL outstanding loads) but trivial across
+warps -- each warp has its own ld scoreboard.  Epilogue/TmemDealloc stay on
+warps 0-3; odd kv_iters flip each warp's starting parity per tile (g is
+global under drain-free persistence); kv_iters==1 leaves one warp of each
+pair idle per tile.  MStats can never alias a phase: its next arrival always
+sits behind the previous reader's completed iteration (in-tile via the baton
+itself, across tiles via OFull->epilogue on w / the mma tile preamble).
+
+Result (B200, validate_stream.py): bit-exact on the full ladder incl. GQA
+and kv_iters=1 multi-tile, det x5, no hangs -- but uniformly SLOWER:
+  2k 0.870x | 4k 0.884x | 8k 0.869x (0.352 -> 0.405 ms) | 16k 0.862x
+Profile (--fine, 8k): softmax wait-for-S grew 26% -> 35-36% while busy FELL
+to ~62% -- the loss is pure exposed SFull latency, not issue collisions.
+(Also from this profile: S tmem load segment is only ~3% of softmax span;
+the 47% sload ablation share is dependency/issue structure, not port time.
+mma warp: 47% waiting on softmax, 28% on KVFull slack, 24% issuing.  Load
+warp 70% parked on KVEmpty backpressure = TMA queue far ahead; DRAM idle.)
+
+THE MECHANISM (the valuable part): with 2 S buffers and P stored INSIDE the
+consumed S buffer, QK(g+2) is gated on SEmpty(g) = "PV1(g) complete", i.e.
+on the handler's OWN final arrive.  Interleaved, each warp therefore pays
+the full softmax -> PV1 -> QK -> SFull round-trip PRIVATELY once per handled
+iteration; the old pair structure only needs S one iteration ahead and the
+prefetch hoist covers that.  Confirmed by construction, not just data:
+tcgen05.commit(SFull) tracks ALL prior async ops of the mma thread (incl.
+the PVs issued before it), so at prefetch distance 1 SFull can never beat
+the PV round-trip NO MATTER what barrier gates QK.  => The shipped kernel's
+own 26% SFull wait is this same loop.  Attack the loop, not the softmax
+schedule.  Do not re-attempt softmax-side rescheduling (in-warp OR
+cross-warp) while S depth is 2 and P lives inside S.
+(Variant not kept on disk; re-derivable from this entry.)
+
+EARLYQK: P PLANES OUT OF S + SFree-GATED DISTANCE-2 QK (2026-07-08):
+BIT-EXACT, 0.91x -> REVERTED
+------------------------------------------------------------------------
+Follow-up to PIPE2's mechanism finding, on the UNCHANGED softmax schedule:
+P/sf_p moved to dedicated tmem planes (436..483, 12 cols per (buf, chunk)),
+a new SFree[buf] mbarrier (count 256) armed by each softmax warp right
+after its x64 S load, QK(g+2) issued at the TOP of mma iteration g gated on
+SFree instead of SEmpty (2-QK tile preamble), and a compensating WAR wait
+(SEmpty[buf], parity ph^1) in the softmax warps before convert_p overwrites
+the P planes.  Bit-exact on the full ladder, det x5, no hangs.
+  2k 0.923x | 4k 0.919x | 8k 0.911x (0.353 -> 0.387 ms) | 16k 0.907x
+Why it lost ~9%: the softmax critical chain gained 4 ops per warp-iteration
+(SFree fence+arrive, WAR try_wait+fence) and the pacing loop was NOT the QK
+gate: the mma warp still parks once per iteration (now on SFree(g), the
+softmax loads, instead of SEmpty) before it can issue anything, and the
+added softmax ops price straight into the wall (chain-paced, ~1:1).
+
+REVISED MODEL OF THE 26% SFull WAIT (both failures + the profile agree):
+the pacer is the mma warp's serial park/wake chain -- ~5 mbarrier waits per
+iteration (KVFull-K, SEmpty, KVFull-V, P0, P1), each park/wake costing
+~O(100-300) cycles on the supply path -- NOT MMA exec (tensor pipe ~20%
+busy), NOT DRAM (load warp 70% ahead), NOT the softmax issue count alone.
+Lever: REMOVE WAITS from the mma warp's loop, don't re-gate them.
+
+QK2: BOTTOM-OF-LOOP DISTANCE-2 QK PREFETCH (2026-07-08): BIT-EXACT, ~1.01x
+-> NOT KEPT (reverted with the session's other changes; the ~1% is real if
+ever wanted -- re-apply recipe at the end of this entry)
+------------------------------------------------------------------------
+The minimal extraction from the two failures: mma-loop-only.  The QK
+prefetch moves from the top of iteration g (QK(g+1), warp PARKED on
+SEmpty until PV1(g-1) completed) to the bottom (QK(g+2), right after
+PV1(g)'s issue), where it needs NO recycle wait at all: P1Ready(g) --
+just passed -- implies softmax(g) finished reading S[buf] (wait::ld
+precedes the arrives), and the tensor pipe orders the S overwrite after
+PV1(g)'s P read (same-thread issue order); commit(SFull(g+2)) tracking
+PV1(g) is a full iteration of slack.  Tile preamble seeds BOTH S buffers
+(2 QKs, no SEmpty wait: previous tile's PV1s are pipe-prior).  SEmpty
+survives only for the softmax rescale branch.  Softmax code untouched.
+Bit-exact on the full ladder, det x5, no hangs.
+  2k 1.016x | 4k 1.009x | 8k 1.008x (0.351 -> 0.349 ms) | 16k 1.007x
+Small but uniform-sign under interleaved timing.  Re-apply recipe (mma_loop
+only, ~30 lines): (1) turn the tile-preamble "first QK" block into a
+`for (pre = 0; pre < 2 && pre < kv_iters; pre++)` over g = gi+pre and DELETE
+its SEmpty wait; (2) delete the top-of-loop QK(g+1) prefetch block; (3) after
+the PV1 commits at the bottom of the iteration, add the same block with
+`if (iter + 2 < kv_iters)`, ng = g + 2, and NO SEmpty wait.  All barrier
+counts/phases and the softmax code are untouched; SEmpty keeps its commits
+(the rescale branch still waits it).
+
+TRIANGULATION (PIPE2 -13% / EARLYQK -9% / QK2 +1%): the SFull supply path
+was NEVER the pacer -- the softmax warps' 26% "wait for S" is queueing
+slack, not removable latency.  The wall is the softmax warps' own
+instruction stream + dependency stalls on the shared schedulers (INT_ENCODE
+already said this: cost ~ issue slots).  Supply-side and barrier-side
+restructures are EXHAUSTED (three bit-exact experiments, one day).  The
+remaining levers all REMOVE softmax instructions: CVT_X4 (next), zero-block
+skip, e4m3x4 sf pack (subnormal-range rn-vs-rs caveat: NOT bit-exact, needs
+its own gate).
+
+CVT_X4 BUILT AND MEASURED (2026-07-08, stacked on QK2): BIT-EXACT, ~-1%
+-> REVERTED (variant not kept on disk; the section above spells out the
+helpers, and the hardware-validated details are recorded here)
+------------------------------------------------------------------------
+Gate 1 PASSED on hardware: cvt.rs.satfinite.e2m1x4.f32 with rbits=0 +
+mad.lo pow2 reconstruct is torch.equal with the base path on every ladder
+shape -- the round-toward-zero-on-exact-powers argument, the v=-4 tie, and
+the reversed {a,b,e,f} nibble order are all confirmed correct.  Perf
+(interleaved, vs shipped snapshot): 2k 1.033x | 4k 1.000x | 8k 0.995x |
+16k 0.994x -- i.e. ~-1 to -1.5% net of QK2's +1%.  Gate 4 (SASS audit:
+CVT.RS expansion, IMAD scheduling) was not run; candidate culprits are a
+multi-op CVT.RS lowering, slow-rate cvt.rs, or the IMAD pin fighting the
+scheduler.  LESSON, combined with INT_ENCODE (+60% instr -> +18% wall) and
+this (-20% convert tail -> -0%): the instruction-count sensitivity is
+ASYMMETRIC -- adding serial work prices in, but removing tail work only
+widens existing stall windows.  The softmax warps have residual
+latency-bound slack that soaks up small wins; only component-scale
+removals (the ablation numbers) move the wall.
+
+SESSION SUMMARY 2026-07-08 (four bit-exact experiments, all validated on
+B200 -- biteq on the full ladder, det x5, no hangs -- and ALL removed from
+the tree at session end; this file is the sole record):
+  PIPE2 (iteration-interleaved softmax)      0.87x
+  EARLYQK (P out of S + SFree distance-2)    0.91x
+  QK2 (bottom-of-loop distance-2 prefetch)   1.01x  (re-apply recipe above)
+  CVT_X4 (e2m1x4 convert tail, on QK2)       0.99x
+Shipped kernel: unchanged base.  validate_stream.py (deleted from the tree
+before this session) is recoverable from git (commit b70ac7a); the runs
+above used it with SNAPSHOT_CU/NEW_NAME/NEW_LABEL constants hoisted to the
+top for per-experiment retargeting.
+The dormant-wg2 question is now closed empirically AND mechanistically:
+warps 8-11/15 share the softmax warps' four SM sub-partition schedulers, so
+they cannot add issue bandwidth; their real role is register donor (8*176 +
+8*80 = 2048 exactly).  Remaining levers ranked: (1) zero-block skip via
+sf-underflow vote -- skip convert+P-store, write sf_p=0, exact because
+sf==0 nullifies the block in the MMA; invisible on the random-data bench,
+real on peaked attention -- build it when there is a real-workload eval;
+(2) causal masking / split-KV (roadmap features, also big effective-FLOP
+wins); (3) e4m3x4 sf pack (NOT bit-exact in the subnormal range: rn vs rs
+truncation differ there -- needs its own accuracy gate); (4) MUFU offload
+still downgraded (does not reduce op count).

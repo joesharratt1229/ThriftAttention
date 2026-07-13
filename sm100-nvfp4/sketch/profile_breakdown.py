@@ -64,7 +64,7 @@ ROLES = [
         (2, "stats (reduce+pair bars)"),
         (3, "busy (load+stats+convert+store P)"),
     ]),
-    ("mma (w12)", slice(8, 9), [
+    ("mma (w8)", slice(8, 9), [
         (0, "wait QFull (Q TMA, per tile)"),
         (1, "wait KVFull K (K TMA)"),
         (2, "wait SEmpty (S buf recycled)"),
@@ -75,7 +75,7 @@ ROLES = [
         (7, "wait OEmpty (epilogue frees O)"),
         (8, "PV issue (sf cp+mma+commits)"),
     ]),
-    ("load (w14)", slice(9, 10), [
+    ("load (w10)", slice(9, 10), [
         (0, "wait QEmpty"),
         (1, "wait KVEmpty (K slot)"),
         (2, "issue K TMA"),
@@ -83,7 +83,7 @@ ROLES = [
         (4, "issue V TMA"),
         (5, "issue Q TMA"),
     ]),
-    ("store (w13)", slice(10, 11), [
+    ("store (w9)", slice(10, 11), [
         (0, "wait OEpi (owners staged O)"),
         (1, "O TMA store + drain + arrive"),
     ]),
@@ -226,7 +226,7 @@ def print_breakdown(acc: torch.Tensor, wall_ms: float, flops: float):
 def print_derived(summary: dict):
     own = summary.get("softmax owner (w0-3)")
     par = summary.get("softmax partner (w4-7)")
-    mma = summary.get("mma (w12)")
+    mma = summary.get("mma (w8)")
     if not (own and par and mma):
         return
     print("\n  == derived (softmax view: owner+partner averaged) ==")
