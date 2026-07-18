@@ -512,7 +512,7 @@ static at::Tensor thrift_attention_nvfp4_packed(
     const int q_len = q_packed.size(2);
     const int kv_len = k_packed.size(2);
     const int head_dim = q_packed.size(3) * 2;
-    constexpr int block_q = 64;
+    const int block_q = (head_dim == 256) ? 128 : 64;
     const int num_q_blocks = (q_len + block_q - 1) / block_q;
     const int topk_count = selected_blocks.size(2);
     const int kv_capacity = static_cast<int>(k_packed.stride(1)) / (head_dim / 2);
@@ -634,7 +634,7 @@ static at::Tensor thrift_attention_mxfp4_packed(
     const int q_len = q_packed.size(2);
     const int kv_len = k_packed.size(2);
     const int head_dim = q_packed.size(3) * 2;
-    constexpr int block_q = 64;
+    const int block_q = (head_dim == 256) ? 128 : 64;
     const int num_q_blocks = (q_len + block_q - 1) / block_q;
     const int topk_count = selected_blocks.size(2);
     const int kv_capacity = static_cast<int>(k_packed.stride(1)) / (head_dim / 2);
@@ -784,7 +784,8 @@ static at::Tensor thrift_attention_single_query_nvfp4_packed(
     auto dispatch = [&](void* workspace) {
         thrift_attention_single_query_nvfp4(
             q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
-            static_cast<const int32_t*>(selected_blocks.data_ptr()), topk_count,
+            static_cast<const int32_t*>(selected_blocks.data_ptr()),
+            topk_count,
             q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
             q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
             out.data_ptr(), workspace,
@@ -899,8 +900,8 @@ static std::vector<at::Tensor> nvfp4_quantize(const at::Tensor& x, bool is_bf16 
     const int heads = x.size(1);
     const int seq_len = x.size(2);
     const int head_dim = x.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
 
     auto opts_u8 = at::TensorOptions().dtype(at::kByte).device(x.device());
     auto opts_f8 = at::TensorOptions().dtype(at::kFloat8_e4m3fn).device(x.device());
@@ -923,8 +924,8 @@ static std::vector<at::Tensor> nvfp4_quantize_permuted(const at::Tensor& x, bool
     const int heads = x.size(1);
     const int seq_len = x.size(2);
     const int head_dim = x.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
 
     auto opts_u8 = at::TensorOptions().dtype(at::kByte).device(x.device());
     auto opts_f8 = at::TensorOptions().dtype(at::kFloat8_e4m3fn).device(x.device());
@@ -947,8 +948,8 @@ static std::vector<at::Tensor> nvfp4_quantize_transposed(const at::Tensor& x, bo
     const int heads = x.size(1);
     const int seq_len = x.size(2);
     const int head_dim = x.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
 
     constexpr int seq_block = 128;
     const int padded_seq = ((seq_len + seq_block - 1) / seq_block) * seq_block;
@@ -973,8 +974,8 @@ static std::vector<at::Tensor> nvfp4_quantize_transposed_permuted(const at::Tens
     const int heads = x.size(1);
     const int seq_len = x.size(2);
     const int head_dim = x.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
 
     constexpr int seq_block = 128;
     const int padded_seq = ((seq_len + seq_block - 1) / seq_block) * seq_block;
@@ -999,8 +1000,8 @@ static std::vector<at::Tensor> mxfp4_quantize(const at::Tensor& x, bool is_bf16 
     const int heads = x.size(1);
     const int seq_len = x.size(2);
     const int head_dim = x.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
 
     auto opts_u8 = at::TensorOptions().dtype(at::kByte).device(x.device());
     auto opts_e8m0 = at::TensorOptions().dtype(at::kFloat8_e8m0fnu).device(x.device());
@@ -1023,8 +1024,8 @@ static std::vector<at::Tensor> mxfp4_quantize_permuted(const at::Tensor& x, bool
     const int heads = x.size(1);
     const int seq_len = x.size(2);
     const int head_dim = x.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
 
     auto opts_u8 = at::TensorOptions().dtype(at::kByte).device(x.device());
     auto opts_e8m0 = at::TensorOptions().dtype(at::kFloat8_e8m0fnu).device(x.device());
@@ -1047,8 +1048,8 @@ static std::vector<at::Tensor> mxfp4_quantize_transposed(const at::Tensor& x, bo
     const int heads = x.size(1);
     const int seq_len = x.size(2);
     const int head_dim = x.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
 
     constexpr int seq_block = 128;
     const int padded_seq = ((seq_len + seq_block - 1) / seq_block) * seq_block;
@@ -1073,8 +1074,8 @@ static std::vector<at::Tensor> mxfp4_quantize_transposed_permuted(const at::Tens
     const int heads = x.size(1);
     const int seq_len = x.size(2);
     const int head_dim = x.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
 
     constexpr int seq_block = 128;
     const int padded_seq = ((seq_len + seq_block - 1) / seq_block) * seq_block;
@@ -1115,8 +1116,8 @@ static at::Tensor block_mean_topk_impl(
     const int num_q_blocks = q_mean.size(2);
     const int num_kv_blocks = k_mean.size(2);
     const int head_dim = q_mean.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
     TORCH_CHECK(num_kv_blocks <= 2048,
                 "block selector supports <= 2048 KV blocks, got ", num_kv_blocks);
     TORCH_CHECK(topk_count >= 0 && topk_count <= num_kv_blocks,
@@ -1163,8 +1164,8 @@ static at::Tensor quest_block_topk_impl(
     const int num_q_blocks = q_mean.size(2);
     const int num_kv_blocks = k_min.size(2);
     const int head_dim = q_mean.size(3);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
     TORCH_CHECK(num_kv_blocks <= 2048,
                 "QUEST block selector supports <= 2048 KV blocks, got ", num_kv_blocks);
     TORCH_CHECK(topk_count >= 0 && topk_count <= num_kv_blocks,
@@ -1210,8 +1211,8 @@ static at::Tensor single_query_key_mean_topk_impl(
     const int k_mean_capacity_blocks = k_mean.size(2);
     TORCH_CHECK(groups >= 1 && groups <= 16,
                 "grouped single-query selector expects groups in [1, 16], got ", groups);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
     TORCH_CHECK(num_kv_blocks >= 0 && num_kv_blocks <= k_mean_capacity_blocks,
                 "num_kv_blocks must be in [0, k_mean capacity]");
     TORCH_CHECK(num_kv_blocks <= 2048,
@@ -1281,8 +1282,8 @@ static at::Tensor single_query_quest_topk_impl(
     const int k_stat_capacity_blocks = k_min.size(2);
     TORCH_CHECK(groups >= 1 && groups <= 16,
                 "grouped single-query selector expects groups in [1, 16], got ", groups);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
     TORCH_CHECK(num_kv_blocks >= 0 && num_kv_blocks <= k_stat_capacity_blocks,
                 "num_kv_blocks must be in [0, key stat capacity]");
     TORCH_CHECK(num_kv_blocks <= 2048,
@@ -1412,8 +1413,8 @@ static at::Tensor single_query_key_mean_topk_into_impl(
                 "done_counts must be shaped [batch * kv_heads]");
     TORCH_CHECK(groups >= 1 && groups <= 16,
                 "grouped single-query selector expects groups in [1, 16], got ", groups);
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "head_dim must be 64 or 128, got ", head_dim);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128 || head_dim == 256,
+                "head_dim must be 64, 128, or 256, got ", head_dim);
     TORCH_CHECK(num_kv_blocks >= 0 && num_kv_blocks <= k_mean_capacity_blocks,
                 "num_kv_blocks must be in [0, k_mean capacity]");
     TORCH_CHECK(num_kv_blocks <= 2048,

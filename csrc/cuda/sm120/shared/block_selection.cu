@@ -972,6 +972,14 @@ static void dispatch_block_mean_topk_typed(
             dispatch_block_mean_topk<T, false, 128>(
                 q_mean, k_mean, topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count);
         }
+    } else if (head_dim == 256) {
+        if (causal) {
+            dispatch_block_mean_topk<T, true, 256>(
+                q_mean, k_mean, topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count);
+        } else {
+            dispatch_block_mean_topk<T, false, 256>(
+                q_mean, k_mean, topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count);
+        }
     } else {
         fprintf(stderr, "block_mean_topk: unsupported head_dim=%d\n", head_dim);
     }
@@ -1037,6 +1045,14 @@ static void dispatch_quest_block_topk_typed(
             dispatch_quest_block_topk<T, false, 128>(
                 q_mean, k_min, k_max, topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count);
         }
+    } else if (head_dim == 256) {
+        if (causal) {
+            dispatch_quest_block_topk<T, true, 256>(
+                q_mean, k_min, k_max, topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count);
+        } else {
+            dispatch_quest_block_topk<T, false, 256>(
+                q_mean, k_min, k_max, topk_out, flat_heads, num_q_blocks, num_kv_blocks, topk_count);
+        }
     } else {
         fprintf(stderr, "quest_block_topk: unsupported head_dim=%d\n", head_dim);
     }
@@ -1092,6 +1108,10 @@ static void dispatch_single_query_key_mean_topk_typed(
             k_mean_capacity_blocks, topk_count);
     } else if (head_dim == 128) {
         dispatch_single_query_key_mean_topk<T, 128>(
+            q_grouped, k_mean, topk_out, flat_heads, groups, num_kv_blocks,
+            k_mean_capacity_blocks, topk_count);
+    } else if (head_dim == 256) {
+        dispatch_single_query_key_mean_topk<T, 256>(
             q_grouped, k_mean, topk_out, flat_heads, groups, num_kv_blocks,
             k_mean_capacity_blocks, topk_count);
     } else {
@@ -1150,6 +1170,10 @@ static void dispatch_single_query_quest_topk_typed(
             k_stat_capacity_blocks, topk_count);
     } else if (head_dim == 128) {
         dispatch_single_query_quest_topk<T, 128>(
+            q_grouped, k_min, k_max, topk_out, flat_heads, groups, num_kv_blocks,
+            k_stat_capacity_blocks, topk_count);
+    } else if (head_dim == 256) {
+        dispatch_single_query_quest_topk<T, 256>(
             q_grouped, k_min, k_max, topk_out, flat_heads, groups, num_kv_blocks,
             k_stat_capacity_blocks, topk_count);
     } else {
@@ -1219,6 +1243,11 @@ static void dispatch_single_query_key_mean_topk_chunked_typed(
             topk_count, chunk_count, local_count);
     } else if (head_dim == 128) {
         launch_single_query_key_mean_topk_chunked<T, 128>(
+            q_grouped, k_mean, topk_out, local_scores, local_indices, done_counts,
+            flat_heads, groups, num_kv_blocks, k_mean_capacity_blocks,
+            topk_count, chunk_count, local_count);
+    } else if (head_dim == 256) {
+        launch_single_query_key_mean_topk_chunked<T, 256>(
             q_grouped, k_mean, topk_out, local_scores, local_indices, done_counts,
             flat_heads, groups, num_kv_blocks, k_mean_capacity_blocks,
             topk_count, chunk_count, local_count);

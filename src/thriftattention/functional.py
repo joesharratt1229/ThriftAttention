@@ -32,6 +32,9 @@ def attention(
     selection = None
     if config.method == "thrift":
         policy = get_selection_policy(config.selection)
+        # hd256 tiled kernels use 128 Q/KV blocks; all other paths use config.block_size
+        is_tiled = q.shape[2] > 1
+        block_size = 128 if (head_dim == 256 and is_tiled) else config.block_size
         selection = policy.select(
             q,
             k,
@@ -39,7 +42,7 @@ def attention(
                 name=config.selection,
                 fraction=config.fraction,
                 top_k=config.top_k,
-                block_size=config.block_size,
+                block_size=block_size,
             ),
             causal=config.causal,
             is_bf16=is_bf16,

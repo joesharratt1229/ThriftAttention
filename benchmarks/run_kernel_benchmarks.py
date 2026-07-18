@@ -245,7 +245,7 @@ def build_specs(
                     BenchmarkSpec(
                         f"thrift_{args.quant_format}_{selection}_{coverage * 100:g}pct",
                         coverage,
-                        selected_top_k(seq_len, coverage, causal=args.causal and q.shape[2] != 1),
+                        selected_top_k(seq_len, coverage, causal=args.causal and q.shape[2] != 1, block_size=128 if (args.head_dim == 256 and q.shape[2] != 1) else 64),
                         lambda coverage=coverage, selection=selection: ta.attention(
                             q,
                             k,
@@ -263,10 +263,15 @@ def build_specs(
                 )
 
     if not args.skip_fp4:
-        try:
-            fn = make_sage_fp4(q, k, v, causal=args.causal)
-        except MissingDependency as exc:
-            fn = missing_dependency_fn(str(exc))
+        if args.head_dim == 256:
+            note = "sageattn3 skipped, unsupported Headdim 256"
+            print(f"  SKIP fp4_sageattn3: {note}")
+            fn = missing_dependency_fn(note)
+        else:
+            try:
+                fn = make_sage_fp4(q, k, v, causal=args.causal)
+            except MissingDependency as exc:
+                fn = missing_dependency_fn(str(exc))
         specs.append(
             BenchmarkSpec(
                 "fp4_sageattn3",
@@ -381,8 +386,8 @@ def print_results(results: list[BenchmarkResult]) -> None:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.head_dim not in (64, 128):
-        raise SystemExit("--head-dim must be 64 or 128")
+    if args.head_dim not in (64, 128, 256):
+        raise SystemExit("--head-dim must be 64, 128, or 256")
     if args.heads % args.kv_heads != 0:
         raise SystemExit("--heads must be divisible by --kv-heads")
     if args.repeat < 1:

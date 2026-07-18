@@ -13,8 +13,8 @@ def require_cuda_half(name: str, tensor: torch.Tensor) -> None:
 
 
 def require_supported_head_dim(head_dim: int) -> None:
-    if head_dim not in (64, 128):
-        raise ValueError(f"head_dim must be 64 or 128, got {head_dim}")
+    if head_dim not in (64, 128, 256):
+        raise ValueError(f"head_dim must be 64, 128, or 256, got {head_dim}")
 
 
 def check_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:

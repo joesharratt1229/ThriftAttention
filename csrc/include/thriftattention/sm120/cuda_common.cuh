@@ -107,7 +107,7 @@ __device__ inline void ta_gmem_to_smem_linear(uint32_t dst, const T* src, int ti
 template <int HEIGHT, int WIDTH, int TB_SIZE, typename T>
 __device__ inline void ta_load_scales(uint32_t dst, const T* src, int src_stride, int tid) {
     constexpr int cp_size = WIDTH * sizeof(T);
-    static_assert(cp_size < 16);
+    static_assert(cp_size <= 16);
 
     auto load_row = [&](int row) {
         const uint32_t dst_addr = dst + row * WIDTH * sizeof(T);

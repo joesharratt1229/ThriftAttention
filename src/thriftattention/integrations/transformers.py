@@ -375,8 +375,8 @@ def _fast_path_rejection_reason(
         return "query/key/value tensors must have the same dtype"
 
     head_dim = query.shape[-1]
-    if head_dim not in (64, 128):
-        return f"ThriftAttention supports head_dim 64 or 128, got {head_dim}"
+    if head_dim not in (64, 128, 256):
+        return f"ThriftAttention supports head_dim 64, 128, or 256, got {head_dim}"
 
     expected_scaling = head_dim**-0.5
     scaling = kwargs.get("scaling", expected_scaling)
@@ -455,8 +455,8 @@ def _cached_decode_rejection_reason(
         return "query heads must be divisible by KV heads"
     if key.shape[3] != query.shape[3] or value.shape[3] != query.shape[3]:
         return "query/key/value head_dim must match"
-    if query.shape[3] not in (64, 128):
-        return f"ThriftAttention supports head_dim 64 or 128, got {query.shape[3]}"
+    if query.shape[3] not in (64, 128, 256):
+        return f"ThriftAttention supports head_dim 64, 128, or 256, got {query.shape[3]}"
 
     groups = query.shape[1] // key.shape[1]
     if groups > 16:

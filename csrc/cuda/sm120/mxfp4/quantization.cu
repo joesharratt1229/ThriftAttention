@@ -130,7 +130,7 @@ static void mxfp4_quantise_launch(
     const T* X, __nv_fp4x2_e2m1* X_fp4, __nv_fp8_e8m0* X_scale,
     int bs, int seq_len) {
 
-    constexpr int SEQ_PER_BLOCK = 128;
+    constexpr int SEQ_PER_BLOCK = (HEAD_DIM == 256) ? 64 : 128;
     constexpr int THREADS_PER_HEAD = HEAD_DIM / ELEMENTS_PER_THREAD;
     constexpr int TB_SIZE = SEQ_PER_BLOCK * THREADS_PER_HEAD;
 
@@ -161,8 +161,10 @@ static void dispatch_mxfp4_quantise(
         mxfp4_quantise_launch<T, 64>(X, X_fp4, X_scale, bs, seq_len);
     else if (head_dim == 128)
         mxfp4_quantise_launch<T, 128>(X, X_fp4, X_scale, bs, seq_len);
+    else if (head_dim == 256)
+        mxfp4_quantise_launch<T, 256>(X, X_fp4, X_scale, bs, seq_len);
     else
-        fprintf(stderr, "mxfp4_quantise: unsupported head_dim=%d (must be 64 or 128)\n", head_dim);
+        fprintf(stderr, "mxfp4_quantise: unsupported head_dim=%d (must be 64, 128, or 256)\n", head_dim);
 }
 
 void mxfp4_quantise(
@@ -284,7 +286,7 @@ static void mxfp4_quantise_permute_seq_launch(
     const T* X, __nv_fp4x2_e2m1* X_fp4, __nv_fp8_e8m0* X_scale,
     int bs, int seq_len, bool inverse) {
 
-    constexpr int SEQ_PER_BLOCK = 128;
+    constexpr int SEQ_PER_BLOCK = (HEAD_DIM == 256) ? 64 : 128;
     constexpr int THREADS_PER_HEAD = HEAD_DIM / ELEMENTS_PER_THREAD;
     constexpr int TB_SIZE = SEQ_PER_BLOCK * THREADS_PER_HEAD;
 
@@ -317,8 +319,10 @@ static void dispatch_mxfp4_quantise_permute_seq(
         mxfp4_quantise_permute_seq_launch<T, 64>(X, X_fp4, X_scale, bs, seq_len, inverse);
     else if (head_dim == 128)
         mxfp4_quantise_permute_seq_launch<T, 128>(X, X_fp4, X_scale, bs, seq_len, inverse);
+    else if (head_dim == 256)
+        mxfp4_quantise_permute_seq_launch<T, 256>(X, X_fp4, X_scale, bs, seq_len, inverse);
     else
-        fprintf(stderr, "mxfp4_quantise_permute_seq: unsupported head_dim=%d (must be 64 or 128)\n", head_dim);
+        fprintf(stderr, "mxfp4_quantise_permute_seq: unsupported head_dim=%d (must be 64, 128, or 256)\n", head_dim);
 }
 
 void mxfp4_quantise_permute_seq(
@@ -486,7 +490,7 @@ static void mxfp4_quantise_transpose_launch(
     const T* X, __nv_fp4x2_e2m1* X_fp4, __nv_fp8_e8m0* X_scale,
     int bs, int seq_len) {
 
-    constexpr int SEQ_PER_BLOCK = 128;
+    constexpr int SEQ_PER_BLOCK = (HEAD_DIM == 256) ? 64 : 128;
     constexpr int TB_SIZE = SEQ_PER_BLOCK * HEAD_DIM / ELEMENTS_PER_THREAD;
 
     const int num_blocks = bs * ta_cdiv(seq_len, SEQ_PER_BLOCK);
@@ -518,8 +522,10 @@ static void dispatch_mxfp4_quantise_transpose(
         mxfp4_quantise_transpose_launch<T, 64>(X, X_fp4, X_scale, bs, seq_len);
     else if (head_dim == 128)
         mxfp4_quantise_transpose_launch<T, 128>(X, X_fp4, X_scale, bs, seq_len);
+    else if (head_dim == 256)
+        mxfp4_quantise_transpose_launch<T, 256>(X, X_fp4, X_scale, bs, seq_len);
     else
-        fprintf(stderr, "mxfp4_quantise_transpose: unsupported head_dim=%d (must be 64 or 128)\n", head_dim);
+        fprintf(stderr, "mxfp4_quantise_transpose: unsupported head_dim=%d (must be 64, 128, or 256)\n", head_dim);
 }
 
 void mxfp4_quantise_transpose(
@@ -663,7 +669,7 @@ static void mxfp4_quantise_transpose_permute_seq_launch(
     const T* X, __nv_fp4x2_e2m1* X_fp4, __nv_fp8_e8m0* X_scale,
     int bs, int seq_len, bool inverse) {
 
-    constexpr int SEQ_PER_BLOCK = 128;
+    constexpr int SEQ_PER_BLOCK = (HEAD_DIM == 256) ? 64 : 128;
     constexpr int TB_SIZE = SEQ_PER_BLOCK * HEAD_DIM / ELEMENTS_PER_THREAD;
 
     const int num_blocks = bs * ta_cdiv(seq_len, SEQ_PER_BLOCK);
@@ -696,8 +702,10 @@ static void dispatch_mxfp4_quantise_transpose_permute_seq(
         mxfp4_quantise_transpose_permute_seq_launch<T, 64>(X, X_fp4, X_scale, bs, seq_len, inverse);
     else if (head_dim == 128)
         mxfp4_quantise_transpose_permute_seq_launch<T, 128>(X, X_fp4, X_scale, bs, seq_len, inverse);
+    else if (head_dim == 256)
+        mxfp4_quantise_transpose_permute_seq_launch<T, 256>(X, X_fp4, X_scale, bs, seq_len, inverse);
     else
-        fprintf(stderr, "mxfp4_quantise_transpose_permute_seq: unsupported head_dim=%d (must be 64 or 128)\n", head_dim);
+        fprintf(stderr, "mxfp4_quantise_transpose_permute_seq: unsupported head_dim=%d (must be 64, 128, or 256)\n", head_dim);
 }
 
 void mxfp4_quantise_transpose_permute_seq(

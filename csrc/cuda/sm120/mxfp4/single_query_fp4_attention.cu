@@ -72,7 +72,7 @@ template <int HEIGHT, int WIDTH, int TB_SIZE, typename T>
 __device__
 void load_scales_sqmxfp4(uint32_t dst, const T *src, int src_stride, int tid) {
   constexpr int cp_size = WIDTH * sizeof(T);
-  static_assert(cp_size < 16);
+  static_assert(cp_size <= 16);
 
   auto load_row = [&](int row) {
     const uint32_t dst_addr = dst + row * WIDTH * sizeof(T);
@@ -381,7 +381,7 @@ void fp4_attention_single_query_kernel(
         const uint32_t cur_K_ld  = K_ld_buf[cur_buf];
 
         // K → registers
-        if constexpr (HEAD_DIM / MMA_K >= 2) {
+        if constexpr (HEAD_DIM / MMA_K == 2) {
             for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
                 uint32_t addr = cur_K_ld + mma_id_kv * MMA_N * HEAD_DIM_2;
                 ldmatrix_x4_sqmxfp4(K_rmem[mma_id_kv][0], addr);
@@ -895,7 +895,7 @@ void fp4_attention_single_query_nosplit_kernel(
         asm volatile("cp.async.wait_all;");
         __syncwarp();
 
-        if constexpr (HEAD_DIM / MMA_K >= 2) {
+        if constexpr (HEAD_DIM / MMA_K == 2) {
             for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
                 uint32_t addr = K_ld_base + mma_id_kv * MMA_N * HEAD_DIM_2;
                 ldmatrix_x4_sqmxfp4(K_rmem[mma_id_kv][0], addr);
@@ -1332,7 +1332,7 @@ void fp4_attention_single_query_cta_kernel(
         __syncwarp();
 
         // K → registers
-        if constexpr (HEAD_DIM / MMA_K >= 2) {
+        if constexpr (HEAD_DIM / MMA_K == 2) {
             for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
                 uint32_t addr = K_ld_base + mma_id_kv * MMA_N * HEAD_DIM_2;
                 ldmatrix_x4_sqmxfp4(K_rmem[mma_id_kv][0], addr);
@@ -1812,13 +1812,17 @@ static void fp4_attention_single_query_mxfp4_typed(
     if (total_kv_blocks <= 4) {
         if (head_dim == 64)
             fp4_attention_single_query_nosplit_launch<T, 64>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
-        else
+        else if (head_dim == 128)
             fp4_attention_single_query_nosplit_launch<T, 128>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+        else
+            fp4_attention_single_query_nosplit_launch<T, 256>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
     } else {
         if (head_dim == 64)
             fp4_attention_single_query_cta_launch<T, 64>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
-        else
+        else if (head_dim == 128)
             fp4_attention_single_query_cta_launch<T, 128>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+        else
+            fp4_attention_single_query_cta_launch<T, 256>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
     }
 }
 
