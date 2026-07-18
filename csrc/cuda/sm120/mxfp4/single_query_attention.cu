@@ -96,7 +96,7 @@ template <int HEIGHT, int WIDTH, int TB_SIZE, typename T>
 __device__
 void load_scales_sqmxfp4mix(uint32_t dst, const T *src, int src_stride, int tid) {
     constexpr int cp_size = WIDTH * sizeof(T);
-    static_assert(cp_size < 16);
+    static_assert(cp_size <= 16);
 
     auto load_row = [&](int row) {
         const uint32_t dst_addr = dst + row * WIDTH * sizeof(T);
@@ -513,10 +513,16 @@ void compute_kv_fp4_sqmxfp4mix(
     uint32_t K_rmem [BLOCK_KV / MMA_N][HEAD_DIM / MMA_K][2];
     uint32_t sfK_rmem[BLOCK_KV / MMA_N][HEAD_DIM / MMA_K];
 
-    if constexpr (HEAD_DIM / MMA_K >= 2) {
+    if constexpr (HEAD_DIM / MMA_K == 2) {
         for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
             uint32_t addr = K_ld_base + mma_id_kv * MMA_N * HEAD_DIM_2;
             ldmatrix_x4_sqmxfp4mix(K_rmem[mma_id_kv][0], addr);
+        }
+    } else if constexpr (HEAD_DIM / MMA_K == 4) {
+        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+            uint32_t addr = K_ld_base + mma_id_kv * MMA_N * HEAD_DIM_2;
+            ldmatrix_x4_sqmxfp4mix(K_rmem[mma_id_kv][0], addr);
+            ldmatrix_x4_sqmxfp4mix(K_rmem[mma_id_kv][2], addr ^ (2 * (MMA_K / 2)));
         }
     } else {
         for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
@@ -1120,7 +1126,7 @@ static void thrift_attention_single_query_cta_launch(
     constexpr int HEAD_DIM_2 = HEAD_DIM / 2;
     constexpr int SCALE_DIM = HEAD_DIM / 32;
     constexpr int BLOCK_KV_FP4 = 64;
-    constexpr int BLOCK_KV_FP16 = 32;
+    constexpr int BLOCK_KV_FP16 = (HEAD_DIM == 256) ? 16 : 32;
     constexpr int BLOCK_Q = 16;
     constexpr int NUM_WARPS = 4;
     constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE_sqmxfp4mix;
@@ -1759,8 +1765,15 @@ static void thrift_attention_single_query_mxfp4_typed(
                 Q, K, V, S_Q, S_K, S_V, O,
                 bs, q_len, kv_len, kv_capacity,
                 num_q_heads, num_kv_heads);
-        } else {
+        } else if (head_dim == 128) {
             thrift_attention_single_query_cta_launch<T, 128>(
+                Q_fp16, K_fp16, V_fp16,
+                top_k, topk_count,
+                Q, K, V, S_Q, S_K, S_V, O,
+                bs, q_len, kv_len, kv_capacity,
+                num_q_heads, num_kv_heads);
+        } else {
+            thrift_attention_single_query_cta_launch<T, 256>(
                 Q_fp16, K_fp16, V_fp16,
                 top_k, topk_count,
                 Q, K, V, S_Q, S_K, S_V, O,
@@ -1777,8 +1790,15 @@ static void thrift_attention_single_query_mxfp4_typed(
                 Q, K, V, S_Q, S_K, S_V, O, workspace,
                 bs, q_len, kv_len, kv_capacity,
                 num_q_heads, num_kv_heads);
-        } else {
+        } else if (head_dim == 128) {
             thrift_attention_single_query_split_launch<T, 128>(
+                Q_fp16, K_fp16, V_fp16,
+                top_k, topk_count,
+                Q, K, V, S_Q, S_K, S_V, O, workspace,
+                bs, q_len, kv_len, kv_capacity,
+                num_q_heads, num_kv_heads);
+        } else {
+            thrift_attention_single_query_split_launch<T, 256>(
                 Q_fp16, K_fp16, V_fp16,
                 top_k, topk_count,
                 Q, K, V, S_Q, S_K, S_V, O, workspace,

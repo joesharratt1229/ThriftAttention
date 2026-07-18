@@ -63,7 +63,7 @@ template <int HEIGHT, int WIDTH, int TB_SIZE, typename T>
 __device__
 void load_scales_sqfp4(uint32_t dst, const T *src, int src_stride, int tid) {
   constexpr int cp_size = WIDTH * sizeof(T);
-  static_assert(cp_size < 16);
+  static_assert(cp_size <= 16);
 
   auto load_row = [&](int row) {
     const uint32_t dst_addr = dst + row * WIDTH * sizeof(T);
@@ -187,13 +187,6 @@ void fp4_attention_single_query_kernel(
     constexpr int MMA_K = 64;
     constexpr int MMA_N = 8;
 
-    // Size of one FP4 KV buffer in smem (bytes)
-    constexpr int FP4_BUF_BYTES =
-        BLOCK_KV * HEAD_DIM_2 * (int)sizeof(__nv_fp4x2_e2m1)
-      + BLOCK_KV * SCALE_DIM  * (int)sizeof(__nv_fp8_e4m3)
-      + HEAD_DIM * (BLOCK_KV / 2)  * (int)sizeof(__nv_fp4x2_e2m1)
-      + HEAD_DIM * (BLOCK_KV / 16) * (int)sizeof(__nv_fp8_e4m3);
-
     const float softmax_scale = rsqrtf(static_cast<float>(HEAD_DIM));
 
     // V/S_V are transposed; per-row stride uses capacity, not logical kv_len.
@@ -299,22 +292,22 @@ void fp4_attention_single_query_kernel(
             : "r"(Q_sf_smem + offset));
     }
 
-    // ---- Phase 2: Double-buffered KV loop ----
+    // ---- Phase 2: Single-buffered KV loop ----
     __syncwarp();
 
     const uint32_t smem_base = __cvta_generic_to_shared(smem);
 
-    // Two smem buffers for double-buffering
-    uint32_t K_smem_buf[2], K_sf_buf[2], V_smem_buf[2], V_sf_buf[2], K_ld_buf[2];
-    for (int b = 0; b < 2; b++) {
-        K_smem_buf[b] = smem_base + b * FP4_BUF_BYTES;
-        K_sf_buf[b]   = K_smem_buf[b] + BLOCK_KV * HEAD_DIM_2 * (int)sizeof(__nv_fp4x2_e2m1);
-        V_smem_buf[b] = K_sf_buf[b]   + BLOCK_KV * SCALE_DIM  * (int)sizeof(__nv_fp8_e4m3);
-        V_sf_buf[b]   = V_smem_buf[b] + HEAD_DIM * (BLOCK_KV / 2) * (int)sizeof(__nv_fp4x2_e2m1);
+    // Smem layout: K | K scales | V | V scales (one KV tile)
+    const uint32_t K_smem_sq = smem_base;
+    const uint32_t cur_K_sf  = K_smem_sq + BLOCK_KV * HEAD_DIM_2 * (int)sizeof(__nv_fp4x2_e2m1);
+    const uint32_t cur_V     = cur_K_sf  + BLOCK_KV * SCALE_DIM  * (int)sizeof(__nv_fp8_e4m3);
+    const uint32_t cur_V_sf  = cur_V     + HEAD_DIM * (BLOCK_KV / 2) * (int)sizeof(__nv_fp4x2_e2m1);
 
+    uint32_t cur_K_ld;
+    {
         const int row_off = lane_id % 8;
         const int col_off = (lane_id / 8) * 16;
-        K_ld_buf[b] = swizzle_sqfp4<HEAD_DIM_2>(K_smem_buf[b] + row_off * HEAD_DIM_2 + col_off);
+        cur_K_ld = swizzle_sqfp4<HEAD_DIM_2>(K_smem_sq + row_off * HEAD_DIM_2 + col_off);
     }
 
     uint32_t K_rmem[BLOCK_KV / MMA_N][HEAD_DIM / MMA_K][2];
@@ -324,52 +317,40 @@ void fp4_attention_single_query_kernel(
 
     const int num_kv_iters = kv_block_end - kv_block_start;
 
-    // Helper: start async load of KV block at offset iter into buffer buf
-    auto start_kv_load = [&](int buf, int iter) {
+    // Helper: start async load of KV block at offset iter
+    auto start_kv_load = [&](int iter) {
         const auto* Kp  = K   + iter * BLOCK_KV * HEAD_DIM_2;
         const auto* Vp  = V   + iter * BLOCK_KV / 2;
         const auto* SKp = S_K + iter * BLOCK_KV * SCALE_DIM;
         const auto* SVp = S_V + iter * BLOCK_KV / 16;
-        gmem_to_smem_sqfp4<BLOCK_KV, HEAD_DIM_2, TB_SIZE, __nv_fp4x2_e2m1>(K_smem_buf[buf], Kp, tid, HEAD_DIM_2);
-        load_scales_sqfp4<BLOCK_KV, SCALE_DIM, TB_SIZE, __nv_fp8_e4m3>(K_sf_buf[buf], SKp, SCALE_DIM, tid);
-        gmem_to_smem_sqfp4<HEAD_DIM, BLOCK_KV / 2, TB_SIZE, __nv_fp4x2_e2m1>(V_smem_buf[buf], Vp, tid, v_kv / 2);
-        load_scales_sqfp4<HEAD_DIM, BLOCK_KV / 16, TB_SIZE, __nv_fp8_e4m3>(V_sf_buf[buf], SVp, v_kv / 16, tid);
+        gmem_to_smem_sqfp4<BLOCK_KV, HEAD_DIM_2, TB_SIZE, __nv_fp4x2_e2m1>(K_smem_sq, Kp, tid, HEAD_DIM_2);
+        load_scales_sqfp4<BLOCK_KV, SCALE_DIM, TB_SIZE, __nv_fp8_e4m3>(cur_K_sf, SKp, SCALE_DIM, tid);
+        gmem_to_smem_sqfp4<HEAD_DIM, BLOCK_KV / 2, TB_SIZE, __nv_fp4x2_e2m1>(cur_V, Vp, tid, v_kv / 2);
+        load_scales_sqfp4<HEAD_DIM, BLOCK_KV / 16, TB_SIZE, __nv_fp8_e4m3>(cur_V_sf, SVp, v_kv / 16, tid);
         asm volatile("cp.async.commit_group;");
     };
 
-    // Preload first block
-    if (num_kv_iters > 0)
-        start_kv_load(0, 0);
-
-    int cur_buf = 0;
     for (int kv_iter = 0; kv_iter < num_kv_iters; kv_iter++) {
         float S_rmem[BLOCK_KV / MMA_N][4] = {};
         uint32_t S_fp4_rmem[BLOCK_KV / MMA_K][4];
         uint32_t S_fp4_s_rmem[BLOCK_KV / MMA_K];
 
-        // Preload next block into alternate buffer
-        if (kv_iter + 1 < num_kv_iters)
-            start_kv_load(1 - cur_buf, kv_iter + 1);
-
-        // Wait for current buffer
-        if (kv_iter + 1 < num_kv_iters) {
-            asm volatile("cp.async.wait_group %0;" :: "n"(1));
-        } else {
-            asm volatile("cp.async.wait_all;");
-        }
+        // Load current block
+        start_kv_load(kv_iter);
+        asm volatile("cp.async.wait_all;");
         __syncwarp();
 
-        // Aliases for current buffer
-        const uint32_t cur_K_sf  = K_sf_buf[cur_buf];
-        const uint32_t cur_V     = V_smem_buf[cur_buf];
-        const uint32_t cur_V_sf  = V_sf_buf[cur_buf];
-        const uint32_t cur_K_ld  = K_ld_buf[cur_buf];
-
         // K → registers
-        if constexpr (HEAD_DIM / MMA_K >= 2) {
+        if constexpr (HEAD_DIM / MMA_K == 2) {
             for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
                 uint32_t addr = cur_K_ld + mma_id_kv * MMA_N * HEAD_DIM_2;
                 ldmatrix_x4_sqfp4(K_rmem[mma_id_kv][0], addr);
+            }
+        } else if constexpr (HEAD_DIM / MMA_K == 4) {
+            for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+                uint32_t addr = cur_K_ld + mma_id_kv * MMA_N * HEAD_DIM_2;
+                ldmatrix_x4_sqfp4(K_rmem[mma_id_kv][0], addr);
+                ldmatrix_x4_sqfp4(K_rmem[mma_id_kv][2], addr ^ (2 * (MMA_K / 2)));
             }
         } else {
             for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
@@ -538,30 +519,6 @@ void fp4_attention_single_query_kernel(
         }
 
         for (int g = 0; g < BLOCK_KV / MMA_N / 4; g++) {
-            for (int r = 0; r < 4; r++) {
-                float send = (qid & 1) ? S_rmem[g*4 + 0][r] : S_rmem[g*4 + 1][r];
-                float recv = __shfl_xor_sync(0xFFFFFFFF, send, 1);
-                if (qid & 1) S_rmem[g*4 + 0][r] = recv;
-                else         S_rmem[g*4 + 1][r] = recv;
-
-                send = (qid & 1) ? S_rmem[g*4 + 2][r] : S_rmem[g*4 + 3][r];
-                recv = __shfl_xor_sync(0xFFFFFFFF, send, 1);
-                if (qid & 1) S_rmem[g*4 + 2][r] = recv;
-                else         S_rmem[g*4 + 3][r] = recv;
-
-                send = (qid & 2) ? S_rmem[g*4 + 0][r] : S_rmem[g*4 + 2][r];
-                recv = __shfl_xor_sync(0xFFFFFFFF, send, 2);
-                if (qid & 2) S_rmem[g*4 + 0][r] = recv;
-                else         S_rmem[g*4 + 2][r] = recv;
-
-                send = (qid & 2) ? S_rmem[g*4 + 1][r] : S_rmem[g*4 + 3][r];
-                recv = __shfl_xor_sync(0xFFFFFFFF, send, 2);
-                if (qid & 2) S_rmem[g*4 + 1][r] = recv;
-                else         S_rmem[g*4 + 3][r] = recv;
-            }
-        }
-
-        for (int g = 0; g < BLOCK_KV / MMA_N / 4; g++) {
             float *r0 = S_rmem[g*4];
             float *r1 = S_rmem[g*4 + 1];
             float *r2 = S_rmem[g*4 + 2];
@@ -623,8 +580,6 @@ void fp4_attention_single_query_kernel(
                     S_fp4_s_rmem[mma_id_kv],
                     sfV_rmem[mma_id_kv][mma_id_d],
                     O_rmem[mma_id_d]);
-
-        cur_buf = 1 - cur_buf;
     }
 
     // ---- Phase 3: Write partials — float2 vectorised stores ----
@@ -865,7 +820,7 @@ void fp4_attention_single_query_nosplit_kernel(
         asm volatile("cp.async.wait_all;");
         __syncwarp();
 
-        if constexpr (HEAD_DIM / MMA_K >= 2) {
+        if constexpr (HEAD_DIM / MMA_K == 2) {
             for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
                 uint32_t addr = K_ld_base + mma_id_kv * MMA_N * HEAD_DIM_2;
                 ldmatrix_x4_sqfp4(K_rmem[mma_id_kv][0], addr);
@@ -1285,7 +1240,7 @@ void fp4_attention_single_query_cta_kernel(
         __syncwarp();
 
         // K → registers
-        if constexpr (HEAD_DIM / MMA_K >= 2) {
+        if constexpr (HEAD_DIM / MMA_K == 2) {
             for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
                 uint32_t addr = K_ld_base + mma_id_kv * MMA_N * HEAD_DIM_2;
                 ldmatrix_x4_sqfp4(K_rmem[mma_id_kv][0], addr);
@@ -1711,7 +1666,7 @@ static void fp4_attention_single_query_split_launch(
                                 + BLOCK_KV * SCALE_DIM * sizeof(__nv_fp8_e4m3)
                                 + HEAD_DIM * (BLOCK_KV / 2) * sizeof(__nv_fp4x2_e2m1)
                                 + HEAD_DIM * (BLOCK_KV / 16) * sizeof(__nv_fp8_e4m3);
-    constexpr int kv_phase_smem = kv_phase_smem_single * 2;  // double-buffer
+    constexpr int kv_phase_smem = kv_phase_smem_single;
     constexpr int smem_size = q_phase_smem > kv_phase_smem ? q_phase_smem : kv_phase_smem;
 
     auto kernel = fp4_attention_single_query_kernel<T, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM>;
@@ -1750,6 +1705,7 @@ static void fp4_attention_single_query_nvfp4_typed(
     auto S_K = reinterpret_cast<const __nv_fp8_e4m3*>(S_K_raw);
     auto S_V = reinterpret_cast<const __nv_fp8_e4m3*>(S_V_raw);
     auto O = reinterpret_cast<T*>(O_raw);
+    auto workspace = reinterpret_cast<float*>(workspace_raw);
 
     constexpr int BLOCK_KV = 64;
     const int total_kv_blocks = cdiv_sqfp4(kv_len, BLOCK_KV);
@@ -1757,13 +1713,19 @@ static void fp4_attention_single_query_nvfp4_typed(
     if (total_kv_blocks <= 4) {
         if (head_dim == 64)
             fp4_attention_single_query_nosplit_launch<T, 64>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
-        else
+        else if (head_dim == 128)
             fp4_attention_single_query_nosplit_launch<T, 128>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+        else
+            fp4_attention_single_query_nosplit_launch<T, 256>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+    } else if (head_dim == 256 && total_kv_blocks >= 128) {
+        fp4_attention_single_query_split_launch<T, 256>(Q, K, V, S_Q, S_K, S_V, O, workspace, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
     } else {
         if (head_dim == 64)
             fp4_attention_single_query_cta_launch<T, 64>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
-        else
+        else if (head_dim == 128)
             fp4_attention_single_query_cta_launch<T, 128>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+        else
+            fp4_attention_single_query_cta_launch<T, 256>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
     }
 }
 

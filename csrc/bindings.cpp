@@ -62,17 +62,6 @@ void fp4_attention_noncausal_nvfp4(
     const void* S_Q, const void* S_K, const void* S_V,
     void* O, int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
-// Implemented in csrc/cuda/sm120/nvfp4/hd256_fp4_attention.cu.
-void fp4_attention_causal_nvfp4_hd256(
-    const void* Q, const void* K, const void* V,
-    const void* S_Q, const void* S_K, const void* S_V,
-    void* O, int bs, int q_len, int kv_len, int kv_capacity,
-    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
-void fp4_attention_noncausal_nvfp4_hd256(
-    const void* Q, const void* K, const void* V,
-    const void* S_Q, const void* S_K, const void* S_V,
-    void* O, int bs, int q_len, int kv_len, int kv_capacity,
-    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
 // Implemented in csrc/cuda/sm120/mxfp4/fp4_attention.cu.
 void fp4_attention_causal_mxfp4(
     const void* Q, const void* K, const void* V,
@@ -84,17 +73,6 @@ void fp4_attention_noncausal_mxfp4(
     const void* S_Q, const void* S_K, const void* S_V,
     void* O, int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
-// Implemented in csrc/cuda/sm120/mxfp4/hd256_fp4_attention.cu.
-void fp4_attention_causal_mxfp4_hd256(
-    const void* Q, const void* K, const void* V,
-    const void* S_Q, const void* S_K, const void* S_V,
-    void* O, int bs, int q_len, int kv_len, int kv_capacity,
-    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
-void fp4_attention_noncausal_mxfp4_hd256(
-    const void* Q, const void* K, const void* V,
-    const void* S_Q, const void* S_K, const void* S_V,
-    void* O, int bs, int q_len, int kv_len, int kv_capacity,
-    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
 // Implemented in csrc/cuda/sm120/nvfp4/single_query_fp4_attention.cu.
 void fp4_attention_single_query_nvfp4(
     const void* Q, const void* K, const void* V,
@@ -102,22 +80,8 @@ void fp4_attention_single_query_nvfp4(
     void* O, void* workspace,
     int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
-// Implemented in csrc/cuda/sm120/nvfp4/hd256_single_query_fp4_attention.cu.
-void fp4_attention_single_query_nvfp4_hd256(
-    const void* Q, const void* K, const void* V,
-    const void* S_Q, const void* S_K, const void* S_V,
-    void* O, void* workspace,
-    int bs, int q_len, int kv_len, int kv_capacity,
-    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
 // Implemented in csrc/cuda/sm120/mxfp4/single_query_fp4_attention.cu.
 void fp4_attention_single_query_mxfp4(
-    const void* Q, const void* K, const void* V,
-    const void* S_Q, const void* S_K, const void* S_V,
-    void* O, void* workspace,
-    int bs, int q_len, int kv_len, int kv_capacity,
-    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
-// Implemented in csrc/cuda/sm120/mxfp4/hd256_single_query_fp4_attention.cu.
-void fp4_attention_single_query_mxfp4_hd256(
     const void* Q, const void* K, const void* V,
     const void* S_Q, const void* S_K, const void* S_V,
     void* O, void* workspace,
@@ -135,25 +99,6 @@ void thrift_attention_causal_nvfp4(
     int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
 void thrift_attention_noncausal_nvfp4(
-    const void* Q_fp16, const void* K_fp16, const void* V_fp16,
-    const void* selected_blocks, int topk_count,
-    const void* topk_mask, int topk_word_count,
-    const void* Q, const void* K, const void* V,
-    const void* S_Q, const void* S_K, const void* S_V,
-    void* O, void* rowmax_state, void* rowsum_state,
-    int bs, int q_len, int kv_len, int kv_capacity,
-    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
-// Implemented in csrc/cuda/sm120/nvfp4/hd256_thrift_attention.cu.
-void thrift_attention_causal_nvfp4_hd256(
-    const void* Q_fp16, const void* K_fp16, const void* V_fp16,
-    const void* selected_blocks, int topk_count,
-    const void* topk_mask, int topk_word_count,
-    const void* Q, const void* K, const void* V,
-    const void* S_Q, const void* S_K, const void* S_V,
-    void* O, void* rowmax_state, void* rowsum_state,
-    int bs, int q_len, int kv_len, int kv_capacity,
-    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
-void thrift_attention_noncausal_nvfp4_hd256(
     const void* Q_fp16, const void* K_fp16, const void* V_fp16,
     const void* selected_blocks, int topk_count,
     const void* topk_mask, int topk_word_count,
@@ -181,25 +126,6 @@ void thrift_attention_noncausal_mxfp4(
     void* O, void* rowmax_state, void* rowsum_state,
     int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
-// Implemented in csrc/cuda/sm120/mxfp4/hd256_thrift_attention.cu.
-void thrift_attention_causal_mxfp4_hd256(
-    const void* Q_fp16, const void* K_fp16, const void* V_fp16,
-    const void* selected_blocks, int topk_count,
-    const void* topk_mask, int topk_word_count,
-    const void* Q, const void* K, const void* V,
-    const void* S_Q, const void* S_K, const void* S_V,
-    void* O, void* rowmax_state, void* rowsum_state,
-    int bs, int q_len, int kv_len, int kv_capacity,
-    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
-void thrift_attention_noncausal_mxfp4_hd256(
-    const void* Q_fp16, const void* K_fp16, const void* V_fp16,
-    const void* selected_blocks, int topk_count,
-    const void* topk_mask, int topk_word_count,
-    const void* Q, const void* K, const void* V,
-    const void* S_Q, const void* S_K, const void* S_V,
-    void* O, void* rowmax_state, void* rowsum_state,
-    int bs, int q_len, int kv_len, int kv_capacity,
-    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
 // Implemented in csrc/cuda/sm120/nvfp4/single_query_attention.cu.
 void thrift_attention_single_query_nvfp4(
     const void* Q_fp16, const void* K_fp16, const void* V_fp16,
@@ -209,26 +135,8 @@ void thrift_attention_single_query_nvfp4(
     void* O, void* workspace,
     int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
-// Implemented in csrc/cuda/sm120/nvfp4/hd256_single_query_attention.cu.
-void thrift_attention_single_query_nvfp4_hd256(
-    const void* Q_fp16, const void* K_fp16, const void* V_fp16,
-    const int32_t* selected_blocks, int topk_count,
-    const void* Q, const void* K, const void* V,
-    const void* S_Q, const void* S_K, const void* S_V,
-    void* O, void* workspace,
-    int bs, int q_len, int kv_len, int kv_capacity,
-    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
 // Implemented in csrc/cuda/sm120/mxfp4/single_query_attention.cu.
 void thrift_attention_single_query_mxfp4(
-    const void* Q_fp16, const void* K_fp16, const void* V_fp16,
-    const int32_t* selected_blocks, int topk_count,
-    const void* Q, const void* K, const void* V,
-    const void* S_Q, const void* S_K, const void* S_V,
-    void* O, void* workspace,
-    int bs, int q_len, int kv_len, int kv_capacity,
-    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
-// Implemented in csrc/cuda/sm120/mxfp4/hd256_single_query_attention.cu.
-void thrift_attention_single_query_mxfp4_hd256(
     const void* Q_fp16, const void* K_fp16, const void* V_fp16,
     const int32_t* selected_blocks, int topk_count,
     const void* Q, const void* K, const void* V,
@@ -348,19 +256,13 @@ static at::Tensor fp4_attention_nvfp4_packed(
         at::TensorOptions().dtype(out_dtype).device(q_packed.device()));
 
     if (causal) {
-        auto kernel = (head_dim == 256)
-            ? fp4_attention_causal_nvfp4_hd256
-            : fp4_attention_causal_nvfp4;
-        kernel(
+        fp4_attention_causal_nvfp4(
             q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
             q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
             out.data_ptr(), flat_q_heads, q_len, kv_len, kv_capacity,
             num_q_heads, num_kv_heads, head_dim, is_bf16);
     } else {
-        auto kernel = (head_dim == 256)
-            ? fp4_attention_noncausal_nvfp4_hd256
-            : fp4_attention_noncausal_nvfp4;
-        kernel(
+        fp4_attention_noncausal_nvfp4(
             q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
             q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
             out.data_ptr(), flat_q_heads, q_len, kv_len, kv_capacity,
@@ -419,19 +321,13 @@ static at::Tensor fp4_attention_mxfp4_packed(
         at::TensorOptions().dtype(out_dtype).device(q_packed.device()));
 
     if (causal) {
-        auto kernel = (head_dim == 256)
-            ? fp4_attention_causal_mxfp4_hd256
-            : fp4_attention_causal_mxfp4;
-        kernel(
+        fp4_attention_causal_mxfp4(
             q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
             q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
             out.data_ptr(), flat_q_heads, q_len, kv_len, kv_capacity,
             num_q_heads, num_kv_heads, head_dim, is_bf16);
     } else {
-        auto kernel = (head_dim == 256)
-            ? fp4_attention_noncausal_mxfp4_hd256
-            : fp4_attention_noncausal_mxfp4;
-        kernel(
+        fp4_attention_noncausal_mxfp4(
             q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
             q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
             out.data_ptr(), flat_q_heads, q_len, kv_len, kv_capacity,
@@ -496,21 +392,12 @@ static at::Tensor fp4_attention_single_query_nvfp4_packed(
     const bool use_split = total_kv_blocks >= 128;
 
     auto dispatch = [&](void* workspace) {
-        if (head_dim == 256) {
-            fp4_attention_single_query_nvfp4_hd256(
-                q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
-                q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
-                out.data_ptr(), workspace,
-                flat_q_heads, q_len, kv_len, kv_capacity,
-                num_q_heads, num_kv_heads, head_dim, is_bf16);
-        } else {
-            fp4_attention_single_query_nvfp4(
-                q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
-                q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
-                out.data_ptr(), workspace,
-                flat_q_heads, q_len, kv_len, kv_capacity,
-                num_q_heads, num_kv_heads, head_dim, is_bf16);
-        }
+        fp4_attention_single_query_nvfp4(
+            q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+            q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+            out.data_ptr(), workspace,
+            flat_q_heads, q_len, kv_len, kv_capacity,
+            num_q_heads, num_kv_heads, head_dim, is_bf16);
     };
 
     if (!use_split) {
@@ -559,21 +446,12 @@ static at::Tensor fp4_attention_single_query_mxfp4_packed(
     const bool use_split = total_kv_blocks >= 128;
 
     auto dispatch = [&](void* workspace) {
-        if (head_dim == 256) {
-            fp4_attention_single_query_mxfp4_hd256(
-                q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
-                q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
-                out.data_ptr(), workspace,
-                flat_q_heads, q_len, kv_len, kv_capacity,
-                num_q_heads, num_kv_heads, head_dim, is_bf16);
-        } else {
-            fp4_attention_single_query_mxfp4(
-                q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
-                q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
-                out.data_ptr(), workspace,
-                flat_q_heads, q_len, kv_len, kv_capacity,
-                num_q_heads, num_kv_heads, head_dim, is_bf16);
-        }
+        fp4_attention_single_query_mxfp4(
+            q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+            q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+            out.data_ptr(), workspace,
+            flat_q_heads, q_len, kv_len, kv_capacity,
+            num_q_heads, num_kv_heads, head_dim, is_bf16);
     };
 
     if (!use_split) {
@@ -655,10 +533,7 @@ static at::Tensor thrift_attention_nvfp4_packed(
     at::Tensor rowsum_state = at::empty({batch, num_q_heads, q_len}, state_opts);
 
     if (causal) {
-        auto kernel = (head_dim == 256)
-            ? thrift_attention_causal_nvfp4_hd256
-            : thrift_attention_causal_nvfp4;
-        kernel(
+        thrift_attention_causal_nvfp4(
             q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
             selected_blocks.data_ptr(), topk_count,
             topk_mask.data_ptr(), topk_word_count,
@@ -668,10 +543,7 @@ static at::Tensor thrift_attention_nvfp4_packed(
             flat_q_heads, q_len, kv_len, kv_capacity,
             num_q_heads, num_kv_heads, head_dim, is_bf16);
     } else {
-        auto kernel = (head_dim == 256)
-            ? thrift_attention_noncausal_nvfp4_hd256
-            : thrift_attention_noncausal_nvfp4;
-        kernel(
+        thrift_attention_noncausal_nvfp4(
             q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
             selected_blocks.data_ptr(), topk_count,
             topk_mask.data_ptr(), topk_word_count,
@@ -783,10 +655,7 @@ static at::Tensor thrift_attention_mxfp4_packed(
     at::Tensor rowsum_state = at::empty({batch, num_q_heads, q_len}, state_opts);
 
     if (causal) {
-        auto kernel = (head_dim == 256)
-            ? thrift_attention_causal_mxfp4_hd256
-            : thrift_attention_causal_mxfp4;
-        kernel(
+        thrift_attention_causal_mxfp4(
             q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
             selected_blocks.data_ptr(), topk_count,
             topk_mask.data_ptr(), topk_word_count,
@@ -796,10 +665,7 @@ static at::Tensor thrift_attention_mxfp4_packed(
             flat_q_heads, q_len, kv_len, kv_capacity,
             num_q_heads, num_kv_heads, head_dim, is_bf16);
     } else {
-        auto kernel = (head_dim == 256)
-            ? thrift_attention_noncausal_mxfp4_hd256
-            : thrift_attention_noncausal_mxfp4;
-        kernel(
+        thrift_attention_noncausal_mxfp4(
             q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
             selected_blocks.data_ptr(), topk_count,
             topk_mask.data_ptr(), topk_word_count,
@@ -901,27 +767,15 @@ static at::Tensor thrift_attention_single_query_nvfp4_packed(
     const bool use_split = total_kv_blocks >= 64;
 
     auto dispatch = [&](void* workspace) {
-        if (head_dim == 256) {
-            thrift_attention_single_query_nvfp4_hd256(
-                q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
-                static_cast<const int32_t*>(selected_blocks.data_ptr()),
-                topk_count,
-                q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
-                q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
-                out.data_ptr(), workspace,
-                flat_q_heads, q_len, kv_len, kv_capacity,
-                num_q_heads, num_kv_heads, head_dim, is_bf16);
-        } else {
-            thrift_attention_single_query_nvfp4(
-                q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
-                static_cast<const int32_t*>(selected_blocks.data_ptr()),
-                topk_count,
-                q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
-                q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
-                out.data_ptr(), workspace,
-                flat_q_heads, q_len, kv_len, kv_capacity,
-                num_q_heads, num_kv_heads, head_dim, is_bf16);
-        }
+        thrift_attention_single_query_nvfp4(
+            q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
+            static_cast<const int32_t*>(selected_blocks.data_ptr()),
+            topk_count,
+            q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+            q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+            out.data_ptr(), workspace,
+            flat_q_heads, q_len, kv_len, kv_capacity,
+            num_q_heads, num_kv_heads, head_dim, is_bf16);
     };
 
     if (!use_split) {
@@ -995,25 +849,14 @@ static at::Tensor thrift_attention_single_query_mxfp4_packed(
     const bool use_split = total_kv_blocks >= 64;
 
     auto dispatch = [&](void* workspace) {
-        if (head_dim == 256) {
-            thrift_attention_single_query_mxfp4_hd256(
-                q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
-                static_cast<const int32_t*>(selected_blocks.data_ptr()), topk_count,
-                q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
-                q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
-                out.data_ptr(), workspace,
-                flat_q_heads, q_len, kv_len, kv_capacity,
-                num_q_heads, num_kv_heads, head_dim, is_bf16);
-        } else {
-            thrift_attention_single_query_mxfp4(
-                q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
-                static_cast<const int32_t*>(selected_blocks.data_ptr()), topk_count,
-                q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
-                q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
-                out.data_ptr(), workspace,
-                flat_q_heads, q_len, kv_len, kv_capacity,
-                num_q_heads, num_kv_heads, head_dim, is_bf16);
-        }
+        thrift_attention_single_query_mxfp4(
+            q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
+            static_cast<const int32_t*>(selected_blocks.data_ptr()), topk_count,
+            q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+            q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+            out.data_ptr(), workspace,
+            flat_q_heads, q_len, kv_len, kv_capacity,
+            num_q_heads, num_kv_heads, head_dim, is_bf16);
     };
 
     if (!use_split) {
