@@ -19,6 +19,13 @@ import torch
 from run_fp4_attention import build_extension
 
 try:
+    # flash-attn is installed with FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE, so the
+    # compiled FA2 extension that the top-level __init__ imports is absent.
+    # Stub it: only the pure-Python cute path is used here.
+    import sys
+    import types
+
+    sys.modules.setdefault("flash_attn_2_cuda", types.ModuleType("flash_attn_2_cuda"))
     from flash_attn.cute import flash_attn_func
     HAVE_FA4 = True
 except Exception as exc:  # noqa: BLE001 - any import failure just drops the column
