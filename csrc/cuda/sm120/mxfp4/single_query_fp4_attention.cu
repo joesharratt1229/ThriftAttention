@@ -565,30 +565,6 @@ void fp4_attention_single_query_kernel(
         }
 
         for (int g = 0; g < BLOCK_KV / MMA_N / 4; g++) {
-            for (int r = 0; r < 4; r++) {
-                float send = (qid & 1) ? S_rmem[g*4 + 0][r] : S_rmem[g*4 + 1][r];
-                float recv = __shfl_xor_sync(0xFFFFFFFF, send, 1);
-                if (qid & 1) S_rmem[g*4 + 0][r] = recv;
-                else         S_rmem[g*4 + 1][r] = recv;
-
-                send = (qid & 1) ? S_rmem[g*4 + 2][r] : S_rmem[g*4 + 3][r];
-                recv = __shfl_xor_sync(0xFFFFFFFF, send, 1);
-                if (qid & 1) S_rmem[g*4 + 2][r] = recv;
-                else         S_rmem[g*4 + 3][r] = recv;
-
-                send = (qid & 2) ? S_rmem[g*4 + 0][r] : S_rmem[g*4 + 2][r];
-                recv = __shfl_xor_sync(0xFFFFFFFF, send, 2);
-                if (qid & 2) S_rmem[g*4 + 0][r] = recv;
-                else         S_rmem[g*4 + 2][r] = recv;
-
-                send = (qid & 2) ? S_rmem[g*4 + 1][r] : S_rmem[g*4 + 3][r];
-                recv = __shfl_xor_sync(0xFFFFFFFF, send, 2);
-                if (qid & 2) S_rmem[g*4 + 1][r] = recv;
-                else         S_rmem[g*4 + 3][r] = recv;
-            }
-        }
-
-        for (int g = 0; g < BLOCK_KV / MMA_N / 4; g++) {
             float *r0 = S_rmem[g*4];
             float *r1 = S_rmem[g*4 + 1];
             float *r2 = S_rmem[g*4 + 2];

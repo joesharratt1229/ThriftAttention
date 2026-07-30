@@ -49,9 +49,9 @@ def test_single_query_mxfp4_attention_matches_sdpa(dtype: torch.dtype, kv_len: i
     batch, q_heads, kv_heads, head_dim = 1, 4, 2, 64
     groups = q_heads // kv_heads
 
-    q = (torch.randn(batch, q_heads, 1, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
-    k = (torch.randn(batch, kv_heads, kv_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
-    v = (torch.randn(batch, kv_heads, kv_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
+    q = (torch.randn(batch, q_heads, 1, head_dim, device=device, dtype=dtype)).contiguous()
+    k = (torch.randn(batch, kv_heads, kv_len, head_dim, device=device, dtype=dtype)).contiguous()
+    v = (torch.randn(batch, kv_heads, kv_len, head_dim, device=device, dtype=dtype)).contiguous()
     q_grouped = q.reshape(batch, kv_heads, groups, head_dim).contiguous()
 
     packed = _mxfp4_quantize_qkv(q_grouped, k, v, is_bf16=is_bf16, permute_k=False)
@@ -83,8 +83,8 @@ def test_single_query_mxfp4_attention_matches_sdpa(dtype: torch.dtype, kv_len: i
     torch.cuda.synchronize()
     assert fp4_out.dtype == dtype
     assert thrift_out.dtype == dtype
-    assert _cosine(fp4_out, ref) > 0.95
-    assert _cosine(thrift_out, ref) > 0.95
+    assert _cosine(fp4_out, ref) > 0.98
+    assert _cosine(thrift_out, ref) > 0.98
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -97,9 +97,9 @@ def test_tiled_mxfp4_attention_matches_sdpa(dtype: torch.dtype, kv_len: int) -> 
     batch, q_heads, kv_heads, seq_len, head_dim = 1, 2, 1, kv_len, 64
     groups = q_heads // kv_heads
 
-    q = (torch.randn(batch, q_heads, seq_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
-    k = (torch.randn(batch, kv_heads, seq_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
-    v = (torch.randn(batch, kv_heads, seq_len, head_dim, device=device, dtype=dtype) * 0.25).contiguous()
+    q = (torch.randn(batch, q_heads, seq_len, head_dim, device=device, dtype=dtype)).contiguous()
+    k = (torch.randn(batch, kv_heads, seq_len, head_dim, device=device, dtype=dtype)).contiguous()
+    v = (torch.randn(batch, kv_heads, seq_len, head_dim, device=device, dtype=dtype)).contiguous()
 
     packed = _mxfp4_quantize_qkv(q, k, v, is_bf16=is_bf16)
     fp4_out = _C.fp4_attention_causal_mxfp4_packed(*packed, is_bf16)
@@ -121,5 +121,5 @@ def test_tiled_mxfp4_attention_matches_sdpa(dtype: torch.dtype, kv_len: int) -> 
     torch.cuda.synchronize()
     assert fp4_out.dtype == dtype
     assert thrift_out.dtype == dtype
-    assert _cosine(fp4_out, ref) > 0.95
-    assert _cosine(thrift_out, ref) > 0.95
+    assert _cosine(fp4_out, ref) > 0.98
+    assert _cosine(thrift_out, ref) > 0.98

@@ -126,8 +126,8 @@ def test_tiled_nvfp4_hd256_matches_sdpa(dtype: torch.dtype, kv_len: int, batch: 
 	torch.cuda.synchronize()
 	assert fp4_out.dtype == dtype
 	assert thrift_out.dtype == dtype
-	assert _cosine(thrift_out, ref) > 0.95
-	assert _cosine(fp4_out, ref) > 0.95
+	assert _cosine(thrift_out, ref) > 0.98
+	assert _cosine(fp4_out, ref) > 0.98
 	
 
 @pytest.mark.parametrize("dtype", DTYPES)

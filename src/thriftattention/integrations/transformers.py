@@ -48,7 +48,7 @@ class TransformersAttentionConfig:
         return AttentionConfig(
             method=_validate_choice("method", self.method, ("thrift", "fp4")),
             causal=bool(self.causal),
-            selection=_validate_choice("selection", self.selection, ("block_mean",)),
+            selection=_validate_choice("selection", self.selection, ("block_mean", "quest", "local")),
             fraction=_validate_fraction(self.fraction),
             top_k=_validate_top_k(self.top_k),
             block_size=_validate_block_size(self.block_size),
@@ -224,10 +224,13 @@ def _get_attention_registry() -> Any:
 def _register_attention_mask(name: str = DEFAULT_TRANSFORMERS_ATTENTION_NAME) -> None:
     try:
         from transformers import AttentionMaskInterface
-        from transformers.masking_utils import sdpa_mask
+        from transformers.masking_utils import flash_attention_mask
     except Exception:
         return
-    _register_once(AttentionMaskInterface, name, sdpa_mask)
+    # FA2-style mask semantics: None unless the input has real padding. sdpa_mask
+    # materialises a full 4D mask on no-cache forwards (transformers>=4.56 treats
+    # any position_ids as potential sequence packing), which the fast path rejects.
+    _register_once(AttentionMaskInterface, name, flash_attention_mask)
 
 
 def _register_once(registry: Any, name: str, fn: Callable[..., Any]) -> None:
