@@ -44,8 +44,7 @@ image = (
     # (first Modal run failed here: ModuleNotFoundError -> fa4 column skipped).
     .pip_install("psutil", "packaging", "einops")
     .run_commands(
-        "pip install nvidia-cutlass-dsl || true",
-        "FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE pip install --no-build-isolation flash-attn || true",
+        "pip install --pre 'flash-attn-4[cu13]'",
     )
     .add_local_dir(
         ROOT,
