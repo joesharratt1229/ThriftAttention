@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--length", type=int, default=16384)
     parser.add_argument(
         "--methods",
-        default="fp16,local,quest,block_mean,quest_drop,block_mean_drop,fp4",
+        default="fp16,fp4",
         help="comma list of fp16, local, quest, block_mean, quest_drop, block_mean_drop, local_drop, fp4",
     )
     parser.add_argument("--budgets", default="0.05,0.10,0.25", help="fp16 block budgets for the thrift methods")
@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
         default=4.0,
         help="assumed fp4:fp16 attention throughput ratio used to compute-match the *_drop budgets; inf runs them at --budgets as-is",
     )
-    parser.add_argument("--num-docs", type=int, default=1)
+    parser.add_argument("--num-docs", type=int, default=100)
     parser.add_argument("--ce-chunk", type=int, default=1024)
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--baseline-impl", default="flash_attention_2", help="use sdpa if flash-attn is unavailable")
