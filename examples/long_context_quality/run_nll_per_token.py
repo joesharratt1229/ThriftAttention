@@ -17,12 +17,31 @@ Methods:
 
 Budgets apply to the thrift/drop methods only. Smoke test on one RTX 6000 Pro:
   python run_nll_per_token.py --length 16384
+
+Long contexts need tensor parallelism: a 36B model is 67 GiB of bf16 weights, and at
+131072 tokens the MLP alone peaks at 21.5 GiB of activations, which does not fit
+alongside them on one 96 GiB card. Launch under torchrun to shard attention heads and
+the MLP intermediate dimension across GPUs -- halving both weights and activations, and
+roughly halving wall-clock (attention is ~70% of the FLOPs at this length):
+  torchrun --nproc_per_node=2 run_nll_per_token.py --length 131072
+
+Block selection is per-head and per-query-block, so each rank picks exactly the blocks
+it would have picked on one GPU: the sparsity pattern under test is unchanged. What does
+change is float summation order, in the o_proj/down_proj all-reduces. Measured against a
+single-GPU run of the same tokens: hidden states agree to 2e-6 relative in fp32, but only
+2e-2 in bf16, because bf16 rounding compounds over the depth of the model. That lands as
+~5e-5 on a document's mean NLL and ~0.03 on any individual token's.
+
+So treat absolute per-token NLL as comparable only within one tp size -- summary.md
+records it in the heading. Deltas against the fp16 baseline are unaffected, since both
+sides of the subtraction run under the same sharding.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import math
+import os
 import time
 from datetime import datetime, timezone
 from functools import partial
@@ -31,9 +50,10 @@ from statistics import fmean
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from thriftattention.integrations.transformers import (
     TransformersAttentionConfig,
@@ -52,6 +72,47 @@ DROP_SELECT = {
     "block_mean": select_block_pairs,
     "local": select_local_block_pairs,
 }
+
+RANK, LOCAL_RANK, WORLD_SIZE = (
+    int(os.environ.get("RANK", 0)),
+    int(os.environ.get("LOCAL_RANK", 0)),
+    int(os.environ.get("WORLD_SIZE", 1)),
+)
+
+
+def log(*args: object, **kwargs: object) -> None:
+    """Print from rank 0 only; every rank computes the same numbers."""
+    if RANK == 0:
+        print(*args, **kwargs, flush=True)
+
+
+def setup_distributed() -> torch.device:
+    device = torch.device("cuda", LOCAL_RANK)
+    if WORLD_SIZE > 1:
+        torch.cuda.set_device(device)
+        if not dist.is_initialized():
+            # device_id binds NCCL eagerly, so barrier() does not have to guess
+            dist.init_process_group("nccl", device_id=device)
+    return device
+
+
+def check_tp_divisible(model_name: str) -> None:
+    """Colwise q/k/v splits the head axis, so both head counts must divide the mesh."""
+    if WORLD_SIZE == 1:
+        return
+    config = AutoConfig.from_pretrained(model_name)
+    for attr in ("num_attention_heads", "num_key_value_heads"):
+        heads = getattr(config, attr, None)
+        if heads is not None and heads % WORLD_SIZE:
+            raise SystemExit(f"{attr}={heads} is not divisible by world size {WORLD_SIZE}")
+
+
+def broadcast_max(value: float, device: torch.device) -> float:
+    if WORLD_SIZE == 1:
+        return value
+    tensor = torch.tensor([value], dtype=torch.float64, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return float(tensor.item())
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,7 +148,7 @@ def load_pg19_docs(tokenizer, *, dataset: str, length: int, num_docs: int, seed:
     eos = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.bos_token_id
     buffer: list[int] = []
 
-    print(f"Loading {num_docs} x {length} tokens from {dataset}")
+    log(f"Loading {num_docs} x {length} tokens from {dataset}")
     ds = load_dataset(dataset, split="train", streaming=True).shuffle(seed=seed, buffer_size=200)
     for sample in ds:
         buffer.extend(tokenizer(sample["text"], add_special_tokens=False)["input_ids"])
@@ -98,6 +159,28 @@ def load_pg19_docs(tokenizer, *, dataset: str, length: int, num_docs: int, seed:
     if len(buffer) < required:
         raise SystemExit(f"{dataset} only yielded {len(buffer)} tokens, but this run needs {required}.")
     return [buffer[i * length : (i + 1) * length] for i in range(num_docs)]
+
+
+def load_docs(args: argparse.Namespace, device: torch.device) -> list[list[int]]:
+    """Tokenise on rank 0 and broadcast, so every rank scores byte-identical documents."""
+    docs = None
+    if RANK == 0:
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        docs = load_pg19_docs(
+            tokenizer,
+            dataset=args.dataset,
+            length=args.length,
+            num_docs=args.num_docs,
+            seed=args.seed,
+        )
+    if WORLD_SIZE == 1:
+        return docs
+
+    tokens = torch.empty(args.num_docs, args.length, dtype=torch.int32, device=device)
+    if RANK == 0:
+        tokens.copy_(torch.tensor(docs, dtype=torch.int32))
+    dist.broadcast(tokens, src=0)
+    return tokens.cpu().tolist()
 
 
 def build_runs(methods: list[str], budgets: list[float]) -> list[tuple[str, float | None]]:
@@ -222,10 +305,23 @@ def attention_impl(method: str, budget: float | None, args: argparse.Namespace) 
     )
 
 
+def load_model(args: argparse.Namespace):
+    """Tensor-parallel under torchrun (SeedOssConfig ships a base_model_tp_plan), else one GPU."""
+    kwargs = dict(dtype=getattr(torch, args.dtype), attn_implementation=args.baseline_impl)
+    if WORLD_SIZE > 1:
+        from transformers.distributed import DistributedConfig
+
+        # distributed_config and device_map are mutually exclusive; TP places the shards.
+        kwargs["distributed_config"] = DistributedConfig(tp_size=WORLD_SIZE)
+    else:
+        kwargs["device_map"] = "cuda"
+    return AutoModelForCausalLM.from_pretrained(args.model, **kwargs).eval()
+
+
 @torch.no_grad()  # not inference_mode: torch.compile'd flex_attention rejects inference tensors
-def per_token_nll(model, body, doc: list[int], ce_chunk: int) -> torch.Tensor:
+def per_token_nll(model, body, doc: list[int], ce_chunk: int, device: torch.device) -> torch.Tensor:
     """NLL of tokens 1..n-1 from a single forward pass, lm_head applied in chunks."""
-    input_ids = torch.tensor([doc], dtype=torch.long, device=model.device)
+    input_ids = torch.tensor([doc], dtype=torch.long, device=device)
     hidden = body(input_ids=input_ids, use_cache=False).last_hidden_state[:, :-1]
     targets = input_ids[0, 1:]
     lm_head = model.get_output_embeddings()
@@ -250,25 +346,24 @@ def main() -> None:
     runs = build_runs(methods, budgets)
     if any(m.endswith("_drop") for m in methods):
         kept = ", ".join(f"{equivalent_fraction(b, args.fp4_speedup):g}" for b in budgets)
-        print(f"drop methods keep fractions [{kept}] (compute-equivalent to {budgets} at {args.fp4_speedup:g}x fp4 speedup)")
+        log(f"drop methods keep fractions [{kept}] (compute-equivalent to {budgets} at {args.fp4_speedup:g}x fp4 speedup)")
     torch.manual_seed(args.seed)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    docs = load_pg19_docs(tokenizer, dataset=args.dataset, length=args.length, num_docs=args.num_docs, seed=args.seed)
+    device = setup_distributed()
+    check_tp_divisible(args.model)  # before the dataset download, so a bad mesh fails fast
+    docs = load_docs(args, device)
 
-    print(f"Loading {args.model} in {args.dtype}")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        dtype=getattr(torch, args.dtype),
-        device_map="cuda",
-        attn_implementation=args.baseline_impl,
-    ).eval()
+    log(f"Loading {args.model} in {args.dtype}" + (f" (tensor parallel over {WORLD_SIZE} GPUs)" if WORLD_SIZE > 1 else ""))
+    model = load_model(args)
     body = getattr(model, model.base_model_prefix)
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    out_dir = args.output / f"{stamp}-{args.model.rsplit('/', 1)[-1]}-{args.length}"
-    out_dir.mkdir(parents=True)
-    (out_dir / "environment.json").write_text(json.dumps(vars(args), indent=2, default=str) + "\n")
+    out_dir = None
+    if RANK == 0:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        out_dir = args.output / f"{stamp}-{args.model.rsplit('/', 1)[-1]}-{args.length}"
+        out_dir.mkdir(parents=True)
+        environment = vars(args) | {"tp_size": WORLD_SIZE}
+        (out_dir / "environment.json").write_text(json.dumps(environment, indent=2, default=str) + "\n")
 
     arrays = {f"tokens/doc{i}": np.asarray(doc, dtype=np.int32) for i, doc in enumerate(docs)}
     rows = []
@@ -278,14 +373,22 @@ def main() -> None:
         torch.cuda.reset_peak_memory_stats()
         seconds = []
         for i, doc in enumerate(docs):
+            if WORLD_SIZE > 1:
+                dist.barrier()  # exclude rank skew from the per-doc timing
             torch.cuda.synchronize()
             start_time = time.perf_counter()
-            nll = per_token_nll(model, body, doc, args.ce_chunk)
+            nll = per_token_nll(model, body, doc, args.ce_chunk, device)
             torch.cuda.synchronize()
             seconds.append(time.perf_counter() - start_time)
-            arrays[f"nll/{label}/doc{i}"] = nll.float().cpu().numpy()
+            # TP replicates hidden states and gathers lm_head, so every rank holds the
+            # same NLL; only rank 0 keeps it.
+            if RANK == 0:
+                arrays[f"nll/{label}/doc{i}"] = nll.float().cpu().numpy()
         torch.cuda.empty_cache()
 
+        peak_gb = broadcast_max(torch.cuda.max_memory_allocated() / 1e9, device)
+        if RANK != 0:
+            continue
         mean_nll = float(np.mean([arrays[f"nll/{label}/doc{i}"].mean() for i in range(len(docs))]))
         rows.append(
             {
@@ -296,10 +399,14 @@ def main() -> None:
                 "mean_nll": mean_nll,
                 "ppl": math.exp(mean_nll) if mean_nll < 50 else float("inf"),
                 "forward_s": fmean(seconds),
-                "peak_gb": torch.cuda.max_memory_allocated() / 1e9,
+                "peak_gb": peak_gb,
             }
         )
-        print(f"{label:>14}: nll={mean_nll:.4f}  {fmean(seconds):.1f}s/doc")
+        log(f"{label:>14}: nll={mean_nll:.4f}  {fmean(seconds):.1f}s/doc  peak={peak_gb:.1f}GB/gpu")
+
+    if RANK != 0:
+        dist.destroy_process_group()
+        return
 
     # per-token deltas vs the fp16 baseline
     base = [arrays.get(f"nll/{BASELINE}/doc{i}") for i in range(len(docs))]
@@ -318,14 +425,17 @@ def main() -> None:
         cells = [f"{v:.4g}" if isinstance(v, float) else str(v) for v in (row.get(c, "-") for c in columns)]
         lines.append("| " + " | ".join(cells) + " |")
     table = "\n".join(lines)
-    print("\n" + table)
+    log("\n" + table)
 
     np.savez_compressed(out_dir / "per_token_nll.npz", **arrays)
     with (out_dir / "metrics.jsonl").open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
-    (out_dir / "summary.md").write_text(f"# Per-token NLL ({args.model}, {args.length} tokens)\n\n{table}\n", encoding="utf-8")
-    print(f"\nWrote {out_dir}")
+    heading = f"# Per-token NLL ({args.model}, {args.length} tokens, tp={WORLD_SIZE})"
+    (out_dir / "summary.md").write_text(f"{heading}\n\n{table}\n", encoding="utf-8")
+    log(f"\nWrote {out_dir}")
+    if WORLD_SIZE > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

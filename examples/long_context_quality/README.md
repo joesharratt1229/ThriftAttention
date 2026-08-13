@@ -15,6 +15,44 @@ Runs forward pass of chosen model and records mean NLL across token positions be
 python examples/long_context_quality/run_nll_mini.py --lengths 65536 --methods fp16,fp4,thrift
 ```
 
+### Per-token NLL at long context
+
+`run_nll_per_token.py` records the NLL of every token rather than a mean, and supports
+tensor parallelism for lengths that do not fit on one GPU. Launch it under `torchrun`
+and it shards attention heads and the MLP intermediate dimension across the mesh:
+
+```bash
+torchrun --nproc_per_node=2 examples/long_context_quality/run_nll_per_token.py --length 131072
+```
+
+Without `torchrun` it runs single-GPU exactly as before. Sizing for a 36B model in
+bf16: weights are 67 GiB and the MLP activation peak is 21.5 GiB at 131072 tokens, so
+that length needs at least two 96 GiB cards. Both `num_attention_heads` and
+`num_key_value_heads` must divide the number of GPUs.
+
+Block selection is per-head, so each rank selects exactly the blocks it would have
+selected on one GPU and the sparsity pattern under test is unchanged. What does change is
+float summation order, in the `o_proj` and `down_proj` all-reduces. Measured on the same
+tokens against a single-GPU run, hidden states agree to `2e-6` relative in fp32 but only
+`2e-2` in bf16, since bf16 rounding compounds over the depth of the model — worth about
+`5e-5` on a document's mean NLL and `0.03` on any individual token's.
+
+Absolute per-token NLL is therefore comparable only within one `tp` size, which
+`summary.md` records in its heading. Deltas against the fp16 baseline are unaffected,
+because both sides of the subtraction run under the same sharding.
+
+Note that the thrift kernels cap at 2048 KV blocks, which at `block_size=64` makes
+131072 the longest supported context.
+
+If `torchrun` hangs at the first collective with the GPUs pinned at 100%, NCCL is stuck
+on peer-to-peer. Workstation cards without NVLink advertise P2P (`can_device_access_peer`
+returns `True`) but deadlock on it, especially when `nvidia-smi topo -m` reports `SYS`
+between the GPUs. Route collectives through host shared memory instead:
+
+```bash
+export NCCL_P2P_DISABLE=1
+```
+
 ## Ruler
 
 Runs mini evaluation of fp4 vs fp16 vs ThriftAttention across ruler tasks.
