@@ -4,46 +4,91 @@ Version: 0.0.1
 Summary: Selective mixed-precision attention kernels for long-context FP4 inference.
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
-Requires-Dist: torch
-Provides-Extra: hf
-Requires-Dist: transformers>=4.52; extra == "hf"
+License-File: LICENSE
+Requires-Dist: torch>=2.8.0
+Requires-Dist: transformers>=4.52
+Dynamic: license-file
 
 # ThriftAttention
 
-ThriftAttention is a CUDA/Python library for selective mixed-precision causal attention.
+**ThriftAttention: Selective Mixed Precision for Long-Context FP4 Attention**
 
-Current scope:
+[arxiv.org/abs/2605.23081](https://arxiv.org/pdf/2605.23081)
 
-- SM120 NVIDIA kernels under `csrc/cuda/sm120/`.
-- NVFP4 quantization with FP8 scales.
-- Block-mean top-k selection kept separate from quantization.
-- A Python API around the kept causal attention path.
+<figure>
+  <img width="1414" height="987" alt="pareto_frontier_131072" src="https://github.com/user-attachments/assets/25599d12-a851-4147-8e1a-36201eff4b04" />
 
-The fused quantize-and-mean experiment is intentionally not part of this library API.
+  <figcaption>
+    <strong>Figure 1:</strong> Pareto frontier of NLL recovery vs inference efficiency at 131k context length.
+  </figcaption>
+</figure>
 
-## Install
 
-```bash
-pip install -e .
-```
+## Average long-context performance
 
-Install the optional Hugging Face Transformers integration with:
+| Method | Mean score | Avg. recovery |
+|---|---:|---:|
+| FP4 | 0.247 | 0.0 |
+| FP16 | 0.469 | 100.0 |
+| Top-k = 5% | 0.452 | 94.2 |
+| Top-k = 10% | 0.458 | 97.6 |
+| Top-k = 25% | 0.459 | 96.5 |
 
-```bash
-pip install -e ".[hf]"
-```
+Average performance of Qwen3-8B, Ministral3-8B and Llama3-8B on Helmet, Ruler and LongBench-V1 long context benchmarks
 
-The current CUDA extension targets SM120 (`TORCH_CUDA_ARCH_LIST=12.0a`).
-
-## API Sketch
+## Usage
 
 ```python
+import torch
 import thriftattention as ta
 
-out = ta.attention(q, k, v, top_k=4)
-baseline = ta.fp4_attention(q, k, v)
-selected = ta.select_block_pairs(q, k, top_k=4)
+q = torch.randn(1, 32, 32768, 128, device="cuda", dtype=torch.float16)
+k = torch.randn(1, 32, 32768, 128, device="cuda", dtype=torch.float16)
+v = torch.randn(1, 32, 32768, 128, device="cuda", dtype=torch.float16)
+
+out = ta.attention(q, k, v)
 ```
 
-Inputs are `torch.float16` CUDA tensors shaped `[batch, heads, seq, head_dim]`.
-Supported `head_dim` values are `64` and `128`.
+Q is shaped `[batch, query_heads, query_len, head_dim]`; K and V are shaped `[batch, kv_heads, kv_len, head_dim]`.
+
+## Integration with Transformers library
+```python
+import torch
+from transformers import AutoModelForCausalLM
+from thriftattention.integrations.transformers import register_transformers_attention
+attn = register_transformers_attention()
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", attn_implementation=attn, torch_dtype=torch.float16)
+```
+
+
+## Installation
+
+Prerequisites:
+
+- Python >=3.10
+- CUDA toolkit >=12.8
+- PyTorch >=2.8.0 built with CUDA >=12.8
+- Transformers >=4.52
+
+```bash
+python -m pip install 'torch>=2.8.0'
+python -m pip install -e . --no-build-isolation
+```
+
+## Contributing
+
+Please see `Contributing.md`
+
+## Citation
+If you use ThriftAttention library in your research please cite as:
+```
+@misc{sharratt2026thriftattention,
+  title         = {{ThriftAttention}: Selective Mixed Precision for Long-Context {FP4} Attention},
+  author        = {Sharratt, Joe},
+  year          = {2026},
+  eprint        = {2605.23081},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2605.23081},
+}
+```

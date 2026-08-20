@@ -1,4 +1,2 @@
-torch
-
-[hf]
+torch>=2.8.0
 transformers>=4.52

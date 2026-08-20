@@ -14,6 +14,12 @@ Methods:
               kept fraction f + (1-f)/--fp4-speedup so the FLOP budget matches the
               thrift run at fraction f.
   fp4         everything in fp4
+  probe       fp16 forward pass (NLL should match the fp16 row) that additionally
+              records, per layer/head/64x64 tile, the softmax quantisation error
+              ||P_fp16 - P_fp4||_1, how much of it block_mean selection captures at
+              each budget, the true mixed-precision residual, and cumulative
+              error-concentration curves. See block_error_probe.py; analyse the
+              saved probe/* arrays with analyze_block_error.py.
 
 Budgets apply to the thrift/drop methods only. Smoke test on one RTX 6000 Pro:
   python run_nll_per_token.py --length 16384
@@ -55,6 +61,7 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+import block_error_probe
 from thriftattention.integrations.transformers import (
     TransformersAttentionConfig,
     register_transformers_attention,
@@ -123,7 +130,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--methods",
         default="fp16,fp4",
-        help="comma list of fp16, local, quest, block_mean, quest_drop, block_mean_drop, local_drop, fp4",
+        help="comma list of fp16, local, quest, block_mean, quest_drop, block_mean_drop, local_drop, fp4, probe",
     )
     parser.add_argument("--budgets", default="0.05,0.10,0.25", help="fp16 block budgets for the thrift methods")
     parser.add_argument(
@@ -138,6 +145,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-impl", default="flash_attention_2", help="use sdpa if flash-attn is unavailable")
     parser.add_argument("--output", type=Path, default=Path("results/nll_per_token"))
     parser.add_argument("--seed", type=int, default=1234)
+    probe = parser.add_argument_group("probe method")
+    probe.add_argument("--probe-head-chunk", type=int, default=8, help="heads scored per score-matrix chunk")
+    probe.add_argument("--probe-row-chunk", type=int, default=256, help="query rows per score-matrix chunk")
+    probe.add_argument("--probe-layer-stride", type=int, default=1, help="measure every n-th layer")
+    probe.add_argument("--probe-row-stride", type=int, default=1, help="measure every n-th row chunk")
+    probe.add_argument(
+        "--probe-save-tiles",
+        action="store_true",
+        help="save the full per-tile error map for the first document (large at long context)",
+    )
+    probe.add_argument("--probe-no-compile", action="store_true", help="disable torch.compile in the probe")
+    probe.add_argument(
+        "--probe-resid",
+        action="store_true",
+        help="also measure the mixed-precision residual (~1/3 slower; capture alone predicts recovery "
+        "just as well while the capture-residual gap stays flat)",
+    )
     return parser.parse_args()
 
 
@@ -186,7 +210,7 @@ def load_docs(args: argparse.Namespace, device: torch.device) -> list[list[int]]
 def build_runs(methods: list[str], budgets: list[float]) -> list[tuple[str, float | None]]:
     runs: list[tuple[str, float | None]] = []
     for method in methods:
-        if method in ("fp16", "fp4"):
+        if method in ("fp16", "fp4", "probe"):
             runs.append((method, None))
         elif method in ("local", "quest", "block_mean") or (method.endswith("_drop") and method[:-5] in DROP_SELECT):
             runs.extend((method, budget) for budget in budgets)
@@ -290,9 +314,16 @@ def drop_attention_forward(
     return out.transpose(1, 2).contiguous(), None
 
 
-def attention_impl(method: str, budget: float | None, args: argparse.Namespace) -> str:
+def attention_impl(
+    method: str,
+    budget: float | None,
+    args: argparse.Namespace,
+    probe_state: block_error_probe.ProbeState | None = None,
+) -> str:
     if method == BASELINE:
         return args.baseline_impl
+    if method == "probe":
+        return block_error_probe.register_probe_attention(probe_state)
     if method.endswith("_drop"):
         return register_drop_attention(method[:-5], equivalent_fraction(budget, args.fp4_speedup))
     return register_transformers_attention(
@@ -316,6 +347,38 @@ def load_model(args: argparse.Namespace):
     else:
         kwargs["device_map"] = "cuda"
     return AutoModelForCausalLM.from_pretrained(args.model, **kwargs).eval()
+
+
+def summarize_probe(arrays: dict, budgets: list[float], num_docs: int, rows: list[dict]) -> list[dict]:
+    """Pool the probe accumulators over docs, layers, and heads into per-budget fractions.
+
+    `rows` supplies the NLL recovery each budget achieved, so the run prints the
+    prediction (captured error) next to the outcome it should predict. The probe
+    selects with block_mean, so it pairs with the block_mean rows; recovery is
+    omitted unless those ran alongside fp16 and fp4.
+    """
+    def pooled(name: str, index=slice(None)) -> float:
+        return float(sum(arrays[f"probe/{name}/doc{i}"][..., index].sum() for i in range(num_docs)))
+
+    err_total = pooled("err_total")
+    mass_total = pooled("mass_total")
+    has_resid = pooled("err_resid") > 0
+    nll = {row["label"]: row["mean_nll"] for row in rows}
+    gap = nll["fp4"] - nll[BASELINE] if {"fp4", BASELINE} <= nll.keys() else 0.0
+    summary = []
+    for bi, budget in enumerate(budgets):
+        entry = {
+            "budget": budget,
+            "err_capture": pooled("err_captured", bi) / err_total,
+            "mass_capture": pooled("mass_captured", bi) / mass_total,
+        }
+        thrift = nll.get(run_label("block_mean", budget))
+        if thrift is not None and gap:
+            entry["nll_recovery"] = (nll["fp4"] - thrift) / gap
+        if has_resid:
+            entry["err_removed"] = 1.0 - pooled("err_resid", bi) / err_total
+        summary.append(entry)
+    return summary
 
 
 @torch.no_grad()  # not inference_mode: torch.compile'd flex_attention rejects inference tensors
@@ -357,6 +420,22 @@ def main() -> None:
     model = load_model(args)
     body = getattr(model, model.base_model_prefix)
 
+    probe_state = None
+    if any(method == "probe" for method, _ in runs):
+        probe_state = block_error_probe.ProbeState(
+            block_error_probe.ProbeConfig(
+                budgets=tuple(budgets),
+                baseline_impl=args.baseline_impl,
+                num_layers=model.config.num_hidden_layers,
+                head_chunk=args.probe_head_chunk,
+                row_chunk=args.probe_row_chunk,
+                layer_stride=args.probe_layer_stride,
+                row_stride=args.probe_row_stride,
+                compile=not args.probe_no_compile,
+                resid=args.probe_resid,
+            )
+        )
+
     out_dir = None
     if RANK == 0:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -369,10 +448,12 @@ def main() -> None:
     rows = []
     for method, budget in runs:
         label = run_label(method, budget)
-        model.set_attn_implementation(attention_impl(method, budget, args))
+        model.set_attn_implementation(attention_impl(method, budget, args, probe_state))
         torch.cuda.reset_peak_memory_stats()
         seconds = []
         for i, doc in enumerate(docs):
+            if method == "probe":
+                probe_state.config.save_tiles = args.probe_save_tiles and i == 0
             if WORLD_SIZE > 1:
                 dist.barrier()  # exclude rank skew from the per-doc timing
             torch.cuda.synchronize()
@@ -384,6 +465,11 @@ def main() -> None:
             # same NLL; only rank 0 keeps it.
             if RANK == 0:
                 arrays[f"nll/{label}/doc{i}"] = nll.float().cpu().numpy()
+            if method == "probe":
+                # collective (all-gathers TP-sharded heads): every rank participates
+                for key, arr in probe_state.finish_doc().items():
+                    if RANK == 0:
+                        arrays[f"probe/{key}/doc{i}"] = arr
         torch.cuda.empty_cache()
 
         peak_gb = broadcast_max(torch.cuda.max_memory_allocated() / 1e9, device)
@@ -403,6 +489,15 @@ def main() -> None:
             }
         )
         log(f"{label:>14}: nll={mean_nll:.4f}  {fmean(seconds):.1f}s/doc  peak={peak_gb:.1f}GB/gpu")
+        if method == "probe":
+            rows[-1]["probe"] = summarize_probe(arrays, budgets, len(docs), rows)
+            for entry in rows[-1]["probe"]:
+                removed = f"  err removed={entry['err_removed']:.3f}" if "err_removed" in entry else ""
+                recovered = f"  nll recovery={entry['nll_recovery']:.3f}" if "nll_recovery" in entry else ""
+                log(
+                    f"{'':>14}  @{entry['budget'] * 100:g}%: err capture={entry['err_capture']:.3f}"
+                    f"{removed}{recovered}  mass capture={entry['mass_capture']:.3f}"
+                )
 
     if RANK != 0:
         dist.destroy_process_group()
