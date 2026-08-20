@@ -288,7 +288,17 @@ def probe_attention_forward(
 ):
     if query.shape[2] > 1:  # measure prefill only; decode steps pass straight through
         state.record(module.layer_idx, query, key, scaling if scaling is not None else query.shape[-1] ** -0.5)
-    return state.baseline_fn(module, query, key, value, attention_mask, scaling=scaling, **kwargs)
+    # The attention interface dispatches on `config._attn_implementation`, so it holds this probe's
+    # name here -- but the flash baseline re-reads that same field to resolve its *kernel*, and the
+    # probe is not a kernel. Point it back at the baseline for the delegated call only. Writes go to
+    # the backing field to skip the property setter's recursion into sub-configs on every layer.
+    config = module.config
+    probe_name = config._attn_implementation
+    config._attn_implementation_internal = state.config.baseline_impl
+    try:
+        return state.baseline_fn(module, query, key, value, attention_mask, scaling=scaling, **kwargs)
+    finally:
+        config._attn_implementation_internal = probe_name
 
 
 def register_probe_attention(state: ProbeState) -> str:
