@@ -35,16 +35,12 @@ class TimingStats:
 
 @dataclass(frozen=True)
 class ErrorStats:
-    max_abs: float
-    mean_abs: float
-    max_rel: float
-    exact_approx_cosine: float
-    exact_vanilla_cosine: float
-    approx_vanilla_cosine: float
-    vanilla_nan: int
-    vanilla_inf: int
-    exact_nan: int
-    exact_inf: int
+    exp_sdpa_cosine: float
+    approx_sdpa_cosine: float
+    sdpa_nan: int
+    sdpa_inf: int
+    exp_nan: int
+    exp_inf: int
     approx_nan: int
     approx_inf: int
 
@@ -146,60 +142,48 @@ def measure_one(fn: TensorFn) -> float:
     return start.elapsed_time(end)
 
 
-def run_vanilla_attention(
+def make_sdpa_fn(
     args: argparse.Namespace,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-) -> torch.Tensor:
+) -> TensorFn:
+    # Convert once, outside timing, so SDPA always uses FP16 even when the
+    # FP4 paths start from BF16 inputs. QKV quantization is also untimed.
+    q_fp16, k_fp16, v_fp16 = (x.to(torch.float16) for x in (q, k, v))
     enable_gqa = q.size(1) != k.size(1)
-    with torch.no_grad():
-        try:
-            return torch.nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                dropout_p=0.0,
-                is_causal=args.causal,
-                enable_gqa=enable_gqa,
-            )
-        except TypeError:
-            if enable_gqa:
-                repeats = q.size(1) // k.size(1)
-                k = k.repeat_interleave(repeats, dim=1)
-                v = v.repeat_interleave(repeats, dim=1)
-            return torch.nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                dropout_p=0.0,
-                is_causal=args.causal,
-            )
+
+    def run_sdpa() -> torch.Tensor:
+        return torch.nn.functional.scaled_dot_product_attention(
+            q_fp16,
+            k_fp16,
+            v_fp16,
+            dropout_p=0.0,
+            is_causal=args.causal,
+            enable_gqa=enable_gqa,
+        )
+
+    return run_sdpa
 
 
-def measure_pair(
-    run_exp: TensorFn,
-    run_exp_approx: TensorFn,
-    *,
+def measure_kernels(
+    *kernels: TensorFn,
     warmup: int,
     repeat: int,
-) -> tuple[TimingStats, TimingStats]:
+) -> tuple[TimingStats, ...]:
     for _ in range(warmup):
-        run_exp()
-        run_exp_approx()
+        for fn in kernels:
+            fn()
     torch.cuda.synchronize()
 
-    exp_times: list[float] = []
-    approx_times: list[float] = []
+    times: list[list[float]] = [[] for _ in kernels]
     for i in range(repeat):
-        if i % 2 == 0:
-            exp_times.append(measure_one(run_exp))
-            approx_times.append(measure_one(run_exp_approx))
-        else:
-            approx_times.append(measure_one(run_exp_approx))
-            exp_times.append(measure_one(run_exp))
+        # Rotate which implementation runs first to reduce ordering bias.
+        for offset in range(len(kernels)):
+            index = (i + offset) % len(kernels)
+            times[index].append(measure_one(kernels[index]))
 
-    return summarize(exp_times), summarize(approx_times)
+    return tuple(summarize(values) for values in times)
 
 
 def cosine(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -208,34 +192,22 @@ def cosine(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def compare_outputs(
-    args: argparse.Namespace,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    run_sdpa: TensorFn,
     run_exp: TensorFn,
     run_exp_approx: TensorFn,
 ) -> ErrorStats:
-    out_vanilla = run_vanilla_attention(args, q, k, v)
-    out_exp = run_exp()
-    out_approx = run_exp_approx()
+    sdpa = run_sdpa().float()
+    exp = run_exp().float()
+    approx = run_exp_approx().float()
     torch.cuda.synchronize()
 
-    vanilla = out_vanilla.float()
-    exact = out_exp.float()
-    approx = out_approx.float()
-    diff = (exact - approx).abs()
-    denom = exact.abs().clamp_min(1.0e-6)
     return ErrorStats(
-        max_abs=float(diff.max().item()),
-        mean_abs=float(diff.mean().item()),
-        max_rel=float((diff / denom).max().item()),
-        exact_approx_cosine=cosine(exact, approx),
-        exact_vanilla_cosine=cosine(exact, vanilla),
-        approx_vanilla_cosine=cosine(approx, vanilla),
-        vanilla_nan=int(torch.isnan(vanilla).sum().item()),
-        vanilla_inf=int(torch.isinf(vanilla).sum().item()),
-        exact_nan=int(torch.isnan(exact).sum().item()),
-        exact_inf=int(torch.isinf(exact).sum().item()),
+        exp_sdpa_cosine=cosine(exp, sdpa),
+        approx_sdpa_cosine=cosine(approx, sdpa),
+        sdpa_nan=int(torch.isnan(sdpa).sum().item()),
+        sdpa_inf=int(torch.isinf(sdpa).sum().item()),
+        exp_nan=int(torch.isnan(exp).sum().item()),
+        exp_inf=int(torch.isinf(exp).sum().item()),
         approx_nan=int(torch.isnan(approx).sum().item()),
         approx_inf=int(torch.isinf(approx).sum().item()),
     )
@@ -263,7 +235,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare NVFP4 FP4 attention using __expf against exp_approx.",
+        description="Compare NVFP4 exp and exp_approx latency, speedup, and cosine similarity against FP16 SDPA.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("seq_lens", nargs="+", help="KV sequence lengths, as spaces or comma-separated values.")
@@ -273,89 +245,87 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kv-heads", type=int, default=16)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
-    parser.add_argument("--input-scale", type=float, default=0.25)
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--repeat", type=int, default=50)
+    parser.add_argument("--input-scale", type=float, default=1.0)
+    parser.add_argument("--warmup", type=int, default=100)
+    parser.add_argument("--repeat", type=int, default=300)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--non-causal", dest="causal", action="store_false")
     parser.add_argument(
         "--microblock-p",
         action="store_true",
-        help="Benchmark the exp_approx kernel variant that uses microblock P scales.",
+        help="Compatibility option; both kernels always use microblock P scales.",
     )
-    parser.add_argument("--skip-error", action="store_true", help="Skip output-difference metrics.")
+    parser.add_argument("--skip-error", action="store_true", help="Skip cosine similarity and nonfinite checks; still time FP16 SDPA.")
     args = parser.parse_args()
     args.seq_lens = parse_int_list(args.seq_lens)
     args.torch_dtype = parse_dtype(args.dtype)
     return args
 
 
-def print_header(approx_label: str) -> None:
-    print(
-        f"seq  q_len  exp_ms  {approx_label}_ms  speedup  "
-        "max_abs  mean_abs  max_rel  exp_app_cos  exp_van_cos  app_van_cos"
+def print_header() -> None:
+    print("Median CUDA timings; speedups = SDPA FP16 time / FP4 time; cosine reference = SDPA FP16.")
+    print("QKV quantization and FP16 conversion are excluded from timings.")
+    columns = (
+        ("seq", 6), ("q_len", 6), ("sdpa_fp16_ms", 12),
+        ("exp_ms", 9), ("exp_approx_ms", 13),
+        ("exp_speedup", 11), ("approx_speedup", 14),
+        ("exp_sdpa_cos", 12), ("approx_sdpa_cos", 15),
     )
-    print(
-        "---  -----  ------  -------------  -------  "
-        "-------  --------  -------  -----------  -----------  -----------"
-    )
+    print("  ".join(f"{name:>{width}}" for name, width in columns))
+    print("  ".join("-" * width for _, width in columns))
 
 
+@torch.no_grad()
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    device = torch.device(args.device)
+    if device.type != "cuda":
+        raise SystemExit("--device must be a CUDA device")
+    if device.index is not None:
+        torch.cuda.set_device(device)
 
-    approx_label = "microblock_p" if args.microblock_p else "exp_approx"
-    print_header(approx_label)
+    print_header()
     for seq_len in args.seq_lens:
         q, k, v = make_qkv(args, seq_len)
         run_exp, run_exp_approx = make_kernel_fns(args, q, k, v)
-        errors = None if args.skip_error else compare_outputs(args, q, k, v, run_exp, run_exp_approx)
-        exp_stats, approx_stats = measure_pair(
-            run_exp,
+        run_sdpa = make_sdpa_fn(args, q, k, v)
+        errors = None if args.skip_error else compare_outputs(run_sdpa, run_exp, run_exp_approx)
+        sdpa_stats, approx_stats, exp_stats = measure_kernels(
+            run_sdpa,
             run_exp_approx,
+            run_exp,
             warmup=args.warmup,
             repeat=args.repeat,
         )
 
-        speedup = exp_stats.median_ms / approx_stats.median_ms
-        q_len = q.shape[2]
+        exp_speedup = sdpa_stats.median_ms / exp_stats.median_ms
+        approx_speedup = sdpa_stats.median_ms / approx_stats.median_ms
         if errors is None:
-            error_cols = "-        -         -        -          -          -"
+            cosine_cols = f"{'-':>12}  {'-':>15}"
         else:
-            error_cols = (
-                f"{errors.max_abs:.3e}  {errors.mean_abs:.3e}  "
-                f"{errors.max_rel:.3e}  {errors.exact_approx_cosine:.5f}      "
-                f"{errors.exact_vanilla_cosine:.5f}      {errors.approx_vanilla_cosine:.5f}"
-            )
-            if any(
-                count
-                for count in (
-                    errors.vanilla_nan,
-                    errors.vanilla_inf,
-                    errors.exact_nan,
-                    errors.exact_inf,
-                    errors.approx_nan,
-                    errors.approx_inf,
-                )
-            ):
+            cosine_cols = f"{errors.exp_sdpa_cosine:>12.5f}  {errors.approx_sdpa_cosine:>15.5f}"
+            if any((errors.sdpa_nan, errors.sdpa_inf, errors.exp_nan,
+                    errors.exp_inf, errors.approx_nan, errors.approx_inf)):
                 print(
                     "nonfinite: "
-                    f"vanilla nan={errors.vanilla_nan} inf={errors.vanilla_inf}; "
-                    f"exp nan={errors.exact_nan} inf={errors.exact_inf}; "
-                    f"{approx_label} nan={errors.approx_nan} inf={errors.approx_inf}"
+                    f"sdpa_fp16 nan={errors.sdpa_nan} inf={errors.sdpa_inf}; "
+                    f"exp nan={errors.exp_nan} inf={errors.exp_inf}; "
+                    f"exp_approx nan={errors.approx_nan} inf={errors.approx_inf}"
                 )
 
         print(
-            f"{seq_len:<3}  {q_len:<5}  "
-            f"{exp_stats.median_ms:>6.3f}  "
+            f"{seq_len:>6}  {q.shape[2]:>6}  "
+            f"{sdpa_stats.median_ms:>12.3f}  "
+            f"{exp_stats.median_ms:>9.3f}  "
             f"{approx_stats.median_ms:>13.3f}  "
-            f"{speedup:>7.3f}  "
-            f"{error_cols}"
+            f"{exp_speedup:>10.3f}x  "
+            f"{approx_speedup:>13.3f}x  "
+            f"{cosine_cols}"
         )
 
-        del q, k, v
+        del run_sdpa, run_exp, run_exp_approx, q, k, v
         torch.cuda.empty_cache()
 
 

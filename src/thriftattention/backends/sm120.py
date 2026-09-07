@@ -131,6 +131,8 @@ class Sm120Nvfp4Backend:
                     if config.causal
                     else ext.thrift_attention_noncausal_nvfp4_packed
                 )
+            if quant_format.name == "nvfp4":
+                return fn(q, k, v, selection, *packed, is_bf16, config.exp_approx)
             return fn(q, k, v, selection, *packed, is_bf16)
         raise ValueError(f"unsupported attention method {config.method!r}")
 

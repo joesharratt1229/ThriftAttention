@@ -44,7 +44,8 @@ class TransformersAttentionConfig:
     implementation: AttentionImplementation = "auto"
     fallback: FallbackBackend = "error"
     exp_approx: bool = False
-    microblock_p: bool = False
+    # Compatibility option: tiled NVFP4 P always uses microblock scaling.
+    microblock_p: bool = True
 
     def attention_config(self) -> AttentionConfig:
         return AttentionConfig(

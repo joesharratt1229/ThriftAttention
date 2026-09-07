@@ -40,6 +40,35 @@ out = ta.attention(q, k, v)
 
 Q is shaped `[batch, query_heads, query_len, head_dim]`; K and V are shaped `[batch, kv_heads, kv_len, head_dim]`.
 
+Tiled NVFP4 attention (`method="fp4"`) always uses a separate P scale for each 16-entry microblock, with either setting of `exp_approx`. The `microblock_p` argument remains accepted for compatibility; setting it to `False` does not disable scaling.
+
+## Profiling
+
+```bash
+python benchmarks/e2e_profiling.py
+```
+
+Runs FP16 SDPA, NVFP4, and Thrift at 5%, 10%, and 25% FP16 budgets for
+4096, 8192, 16384, 32768, 65536, and 131072 tokens. Each run compares both
+ordinary exp and exp-approx for NVFP4 and every Thrift budget, using the same
+inputs and selected blocks, against one FP16 SDPA baseline. Reports packed attention
+and end-to-end attention timings, speedups over FP16 SDPA, and cosine
+similarity to FP16 SDPA. End-to-end timings include quantization and block
+selection. Results are saved to a timestamped CSV in `benchmarks/results/`.
+Use `--fractions`, positional sequence lengths, or `--output` to customize
+the run. The table and CSV label each row with its `exp_mode`.
+
+To compare ordinary and approximate exponentials at the same Thrift budget:
+
+```bash
+python benchmarks/compare_thrift_exp_approx.py 4096 8192 16384 32768 --fraction 0.05
+```
+
+Both paths share the same selected blocks. `--top-k` selects a fixed number
+of FP16 blocks instead. Approximation applies to the FP4 pass; selected
+FP16/BF16 blocks keep ordinary exponentials. The public tiled NVFP4 API also
+accepts `AttentionConfig(method="thrift", exp_approx=True)`.
+
 ## Integration with Transformers library
 ```python
 import torch

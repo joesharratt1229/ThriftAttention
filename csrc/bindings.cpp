@@ -99,7 +99,7 @@ void thrift_attention_causal_nvfp4(
     const void* S_Q, const void* S_K, const void* S_V,
     void* O, void* rowmax_state, void* rowsum_state,
     int bs, int q_len, int kv_len, int kv_capacity,
-    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
+    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16, bool exp_approx);
 void thrift_attention_noncausal_nvfp4(
     const void* Q_fp16, const void* K_fp16, const void* V_fp16,
     const void* selected_blocks, int topk_count,
@@ -108,7 +108,7 @@ void thrift_attention_noncausal_nvfp4(
     const void* S_Q, const void* S_K, const void* S_V,
     void* O, void* rowmax_state, void* rowsum_state,
     int bs, int q_len, int kv_len, int kv_capacity,
-    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
+    int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16, bool exp_approx);
 // Implemented in csrc/cuda/sm120/mxfp4/thrift_attention.cu.
 void thrift_attention_causal_mxfp4(
     const void* Q_fp16, const void* K_fp16, const void* V_fp16,
@@ -287,7 +287,7 @@ static at::Tensor fp4_attention_causal_nvfp4_packed(
     const at::Tensor& v_scale_t,
     bool is_bf16 = false,
     bool exp_approx = false,
-    bool microblock_p = false) {
+    bool microblock_p = true) {
     return fp4_attention_nvfp4_packed(
         q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t,
         true, is_bf16, exp_approx, microblock_p);
@@ -302,7 +302,7 @@ static at::Tensor fp4_attention_noncausal_nvfp4_packed(
     const at::Tensor& v_scale_t,
     bool is_bf16 = false,
     bool exp_approx = false,
-    bool microblock_p = false) {
+    bool microblock_p = true) {
     return fp4_attention_nvfp4_packed(
         q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t,
         false, is_bf16, exp_approx, microblock_p);
@@ -493,7 +493,8 @@ static at::Tensor thrift_attention_nvfp4_packed(
     const at::Tensor& k_scale,
     const at::Tensor& v_scale_t,
     bool causal,
-    bool is_bf16) {
+    bool is_bf16,
+    bool exp_approx) {
     check_hi_qkv(q_hi, k_hi, v_hi);
     check_packed_qkv(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t);
     TORCH_CHECK(selected_blocks.is_cuda(), "selected_blocks must be a CUDA tensor");
@@ -522,7 +523,7 @@ static at::Tensor thrift_attention_nvfp4_packed(
     if (topk_count == 0) {
         return fp4_attention_nvfp4_packed(
             q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t,
-            causal, is_bf16, false, false);
+            causal, is_bf16, exp_approx, true);
     }
 
     constexpr int topk_unit_tokens = 64;
@@ -554,7 +555,7 @@ static at::Tensor thrift_attention_nvfp4_packed(
             q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
             out.data_ptr(), rowmax_state.data_ptr(), rowsum_state.data_ptr(),
             flat_q_heads, q_len, kv_len, kv_capacity,
-            num_q_heads, num_kv_heads, head_dim, is_bf16);
+            num_q_heads, num_kv_heads, head_dim, is_bf16, exp_approx);
     } else {
         thrift_attention_noncausal_nvfp4(
             q_hi.data_ptr(), k_hi.data_ptr(), v_hi.data_ptr(),
@@ -564,7 +565,7 @@ static at::Tensor thrift_attention_nvfp4_packed(
             q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
             out.data_ptr(), rowmax_state.data_ptr(), rowsum_state.data_ptr(),
             flat_q_heads, q_len, kv_len, kv_capacity,
-            num_q_heads, num_kv_heads, head_dim, is_bf16);
+            num_q_heads, num_kv_heads, head_dim, is_bf16, exp_approx);
     }
 
     return out;
@@ -581,10 +582,11 @@ static at::Tensor thrift_attention_causal_nvfp4_packed(
     const at::Tensor& q_scale,
     const at::Tensor& k_scale,
     const at::Tensor& v_scale_t,
-    bool is_bf16 = false) {
+    bool is_bf16 = false,
+    bool exp_approx = false) {
     return thrift_attention_nvfp4_packed(
         q_hi, k_hi, v_hi, selected_blocks,
-        q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, true, is_bf16);
+        q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, true, is_bf16, exp_approx);
 }
 
 static at::Tensor thrift_attention_noncausal_nvfp4_packed(
@@ -598,10 +600,11 @@ static at::Tensor thrift_attention_noncausal_nvfp4_packed(
     const at::Tensor& q_scale,
     const at::Tensor& k_scale,
     const at::Tensor& v_scale_t,
-    bool is_bf16 = false) {
+    bool is_bf16 = false,
+    bool exp_approx = false) {
     return thrift_attention_nvfp4_packed(
         q_hi, k_hi, v_hi, selected_blocks,
-        q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, false, is_bf16);
+        q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, false, is_bf16, exp_approx);
 }
 
 static at::Tensor thrift_attention_mxfp4_packed(
@@ -1396,8 +1399,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("v_scale_t"),
           pybind11::arg("is_bf16") = false,
           pybind11::arg("exp_approx") = false,
-          pybind11::arg("microblock_p") = false,
-          "Pure NVFP4 causal attention over packed tensors");
+          pybind11::arg("microblock_p") = true,
+          "Pure NVFP4 causal attention over packed tensors; P microblock scaling is always enabled");
     m.def("fp4_attention_noncausal_nvfp4_packed", &fp4_attention_noncausal_nvfp4_packed,
           pybind11::arg("q_packed"),
           pybind11::arg("k_packed"),
@@ -1407,8 +1410,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("v_scale_t"),
           pybind11::arg("is_bf16") = false,
           pybind11::arg("exp_approx") = false,
-          pybind11::arg("microblock_p") = false,
-          "Pure NVFP4 non-causal attention over packed tensors");
+          pybind11::arg("microblock_p") = true,
+          "Pure NVFP4 non-causal attention over packed tensors; P microblock scaling is always enabled");
     m.def("fp4_attention_single_query_nvfp4_packed", &fp4_attention_single_query_nvfp4_packed,
           pybind11::arg("q_packed"),
           pybind11::arg("k_packed"),
@@ -1457,6 +1460,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("k_scale"),
           pybind11::arg("v_scale_t"),
           pybind11::arg("is_bf16") = false,
+          pybind11::arg("exp_approx") = false,
           "ThriftAttention causal attention over packed tensors");
     m.def("thrift_attention_noncausal_nvfp4_packed", &thrift_attention_noncausal_nvfp4_packed,
           pybind11::arg("q_hi"),
@@ -1470,6 +1474,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("k_scale"),
           pybind11::arg("v_scale_t"),
           pybind11::arg("is_bf16") = false,
+          pybind11::arg("exp_approx") = false,
           "ThriftAttention non-causal attention over packed tensors");
     m.def("thrift_attention_single_query_nvfp4_packed", &thrift_attention_single_query_nvfp4_packed,
           pybind11::arg("q_hi"),

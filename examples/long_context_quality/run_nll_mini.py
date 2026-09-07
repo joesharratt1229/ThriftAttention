@@ -153,7 +153,8 @@ def main() -> None:
 
         method = method_spec["method"]
         exp_approx = bool(method_spec["exp_approx"])
-        microblock_p = bool(method_spec.get("microblock_p", False))
+        # Tiled NVFP4 always scales P per microblock, for both exp paths.
+        microblock_p = method == "fp4"
         run_fractions = fractions if method == "thrift" else [None]
 
         for fraction in run_fractions:

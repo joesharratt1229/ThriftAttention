@@ -689,6 +689,7 @@ def cached_prefill_attention(
         k_scale,
         v_scale_t,
         is_bf16,
+        config.exp_approx,
     )
 
 
