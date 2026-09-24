@@ -286,7 +286,7 @@ static at::Tensor fp4_attention_causal_nvfp4_packed(
     const at::Tensor& k_scale,
     const at::Tensor& v_scale_t,
     bool is_bf16 = false,
-    bool exp_approx = false,
+    bool exp_approx = true,
     bool microblock_p = true) {
     return fp4_attention_nvfp4_packed(
         q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t,
@@ -301,7 +301,7 @@ static at::Tensor fp4_attention_noncausal_nvfp4_packed(
     const at::Tensor& k_scale,
     const at::Tensor& v_scale_t,
     bool is_bf16 = false,
-    bool exp_approx = false,
+    bool exp_approx = true,
     bool microblock_p = true) {
     return fp4_attention_nvfp4_packed(
         q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t,
@@ -583,7 +583,7 @@ static at::Tensor thrift_attention_causal_nvfp4_packed(
     const at::Tensor& k_scale,
     const at::Tensor& v_scale_t,
     bool is_bf16 = false,
-    bool exp_approx = false) {
+    bool exp_approx = true) {
     return thrift_attention_nvfp4_packed(
         q_hi, k_hi, v_hi, selected_blocks,
         q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, true, is_bf16, exp_approx);
@@ -601,7 +601,7 @@ static at::Tensor thrift_attention_noncausal_nvfp4_packed(
     const at::Tensor& k_scale,
     const at::Tensor& v_scale_t,
     bool is_bf16 = false,
-    bool exp_approx = false) {
+    bool exp_approx = true) {
     return thrift_attention_nvfp4_packed(
         q_hi, k_hi, v_hi, selected_blocks,
         q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, false, is_bf16, exp_approx);
@@ -1398,7 +1398,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("k_scale"),
           pybind11::arg("v_scale_t"),
           pybind11::arg("is_bf16") = false,
-          pybind11::arg("exp_approx") = false,
+          pybind11::arg("exp_approx") = true,
           pybind11::arg("microblock_p") = true,
           "Pure NVFP4 causal attention over packed tensors; P microblock scaling is always enabled");
     m.def("fp4_attention_noncausal_nvfp4_packed", &fp4_attention_noncausal_nvfp4_packed,
@@ -1409,7 +1409,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("k_scale"),
           pybind11::arg("v_scale_t"),
           pybind11::arg("is_bf16") = false,
-          pybind11::arg("exp_approx") = false,
+          pybind11::arg("exp_approx") = true,
           pybind11::arg("microblock_p") = true,
           "Pure NVFP4 non-causal attention over packed tensors; P microblock scaling is always enabled");
     m.def("fp4_attention_single_query_nvfp4_packed", &fp4_attention_single_query_nvfp4_packed,
@@ -1460,7 +1460,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("k_scale"),
           pybind11::arg("v_scale_t"),
           pybind11::arg("is_bf16") = false,
-          pybind11::arg("exp_approx") = false,
+          pybind11::arg("exp_approx") = true,
           "ThriftAttention causal attention over packed tensors");
     m.def("thrift_attention_noncausal_nvfp4_packed", &thrift_attention_noncausal_nvfp4_packed,
           pybind11::arg("q_hi"),
@@ -1474,7 +1474,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("k_scale"),
           pybind11::arg("v_scale_t"),
           pybind11::arg("is_bf16") = false,
-          pybind11::arg("exp_approx") = false,
+          pybind11::arg("exp_approx") = true,
           "ThriftAttention non-causal attention over packed tensors");
     m.def("thrift_attention_single_query_nvfp4_packed", &thrift_attention_single_query_nvfp4_packed,
           pybind11::arg("q_hi"),

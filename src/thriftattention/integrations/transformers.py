@@ -43,7 +43,7 @@ class TransformersAttentionConfig:
     backend: AttentionBackendName = "auto"
     implementation: AttentionImplementation = "auto"
     fallback: FallbackBackend = "error"
-    exp_approx: bool = False
+    exp_approx: bool = True
     # Compatibility option: tiled NVFP4 P always uses microblock scaling.
     microblock_p: bool = True
 

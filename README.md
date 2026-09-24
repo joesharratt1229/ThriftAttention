@@ -40,6 +40,8 @@ out = ta.attention(q, k, v)
 
 Q is shaped `[batch, query_heads, query_len, head_dim]`; K and V are shaped `[batch, kv_heads, kv_len, head_dim]`.
 
+Approximate exponentials are enabled by default (`exp_approx=True`) for tiled NVFP4 attention, including the Transformers integration. Set `AttentionConfig(exp_approx=False)` (or `TransformersAttentionConfig(exp_approx=False)`) to use ordinary exponentials.
+
 Tiled NVFP4 attention (`method="fp4"`) always uses a separate P scale for each 16-entry microblock, with either setting of `exp_approx`. The `microblock_p` argument remains accepted for compatibility; setting it to `False` does not disable scaling.
 
 ## Profiling
@@ -66,8 +68,8 @@ python benchmarks/compare_thrift_exp_approx.py 4096 8192 16384 32768 --fraction 
 
 Both paths share the same selected blocks. `--top-k` selects a fixed number
 of FP16 blocks instead. Approximation applies to the FP4 pass; selected
-FP16/BF16 blocks keep ordinary exponentials. The public tiled NVFP4 API also
-accepts `AttentionConfig(method="thrift", exp_approx=True)`.
+FP16/BF16 blocks keep ordinary exponentials. The public tiled NVFP4 API uses
+`exp_approx=True` by default.
 
 ## Integration with Transformers library
 ```python
