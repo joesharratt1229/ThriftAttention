@@ -222,6 +222,7 @@ def build_specs(
                         causal=args.causal,
                         implementation=impl,
                         quant_format=args.quant_format,
+                        
                     ),
                 ),
             )
@@ -404,7 +405,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--coverages",
         type=parse_fraction_list,
-        default=parse_fraction_list("1%,5%,10%"),
+        default=parse_fraction_list("0.5%,1%,2%,5%,10%,20%,25%,50%"),
         help="Comma-separated ThriftAttention coverages. Values may be fractions or percentages.",
     )
     parser.add_argument("--batch-size", type=int, default=1)

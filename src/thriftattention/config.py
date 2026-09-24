@@ -15,7 +15,7 @@ FallbackBackend = Literal["error"]
 @dataclass(frozen=True)
 class AttentionConfig:
     method: AttentionMethod = "thrift"
-    causal: bool = True
+    causal: bool =  False
     selection: SelectionMethod = "block_mean"
     fraction: float | None = 0.05
     top_k: int | None = None
