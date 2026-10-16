@@ -5,6 +5,9 @@
 #include <vector>
 
 #include <cuda_runtime_api.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 
 namespace {
 
@@ -39,6 +42,50 @@ void check_packed_qkv(
     TORCH_CHECK(q_packed.size(3) == k_packed.size(3), "packed Q/K head dimensions must match");
 }
 
+// The packed inputs of the varlen kernels: every sequence starts at a multiple of 64 tokens of one batch row, and
+// Q, K and V hold the same tokens (V padded to a multiple of 128 by nvfp4_quantize_transposed) on one device.
+void check_varlen_inputs(
+    const at::Tensor& q_packed,
+    const at::Tensor& k_packed,
+    const at::Tensor& v_packed_t,
+    const at::Tensor& q_scale,
+    const at::Tensor& k_scale,
+    const at::Tensor& v_scale_t,
+    const at::Tensor& cu_seqlens,
+    const at::Tensor& cu_seqlens_padded) {
+    check_packed_qkv(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t);
+    for (const at::Tensor* t : {&k_packed, &v_packed_t, &q_scale, &k_scale, &v_scale_t, &cu_seqlens,
+                                &cu_seqlens_padded}) {
+        TORCH_CHECK(t->device() == q_packed.device(), "all varlen inputs must be on the device of q_packed");
+    }
+    for (const at::Tensor* t : {&q_packed, &k_packed, &v_packed_t}) {
+        TORCH_CHECK(t->scalar_type() == at::kByte && t->is_contiguous(), "packed Q/K/V must be contiguous uint8");
+    }
+    for (const at::Tensor* t : {&q_scale, &k_scale, &v_scale_t}) {
+        TORCH_CHECK(t->scalar_type() == at::kFloat8_e4m3fn && t->is_contiguous(),
+                    "Q/K/V scales must be contiguous float8_e4m3fn");
+    }
+    const int64_t heads = q_packed.size(1);
+    const int64_t kv_heads = k_packed.size(1);
+    const int64_t tokens = q_packed.size(2);
+    const int64_t head_dim = q_packed.size(3) * 2;
+    const int64_t v_tokens = v_packed_t.size(3) * 2;
+    TORCH_CHECK(q_packed.size(0) == 1, "varlen inputs hold all sequences in one batch row");
+    TORCH_CHECK(k_packed.size(2) == tokens && tokens % 64 == 0 && v_tokens >= tokens,
+                "packed Q, K and V must hold the same tokens, a multiple of 64");
+    TORCH_CHECK(v_packed_t.size(1) == kv_heads && v_packed_t.size(2) == head_dim,
+                "packed V must be [1, num_kv_heads, head_dim, v_tokens / 2]");
+    TORCH_CHECK(q_scale.sizes() == at::IntArrayRef({1, heads, tokens, head_dim / 16}) &&
+                k_scale.sizes() == at::IntArrayRef({1, kv_heads, tokens, head_dim / 16}) &&
+                v_scale_t.sizes() == at::IntArrayRef({1, kv_heads, head_dim, v_tokens / 16}),
+                "Q/K/V scales do not match the packed tensors");
+    TORCH_CHECK(cu_seqlens.scalar_type() == at::kInt && cu_seqlens_padded.scalar_type() == at::kInt &&
+                cu_seqlens.dim() == 1 && cu_seqlens.is_contiguous() && cu_seqlens_padded.is_contiguous(),
+                "cu_seqlens and cu_seqlens_padded must be contiguous 1-D int32 tensors");
+    TORCH_CHECK(cu_seqlens.numel() == cu_seqlens_padded.numel() && cu_seqlens.numel() >= 1,
+                "cu_seqlens and cu_seqlens_padded must both have num_seqs + 1 entries");
+}
+
 int single_query_mixed_target_split_ctas(int total_kv_blocks) {
     if (const char* env = std::getenv("SAGE_MIXED_SPLIT_CTAS")) {
         const int value = std::atoi(env);
@@ -64,6 +111,12 @@ void fp4_attention_noncausal_nvfp4(
     const void* S_Q, const void* S_K, const void* S_V,
     void* O, int bs, int q_len, int kv_len, int kv_capacity,
     int num_q_heads, int num_kv_heads, int head_dim, bool is_bf16);
+void fp4_attention_varlen_nvfp4(
+    const void* Q, const void* K, const void* V,
+    const void* S_Q, const void* S_K, const void* S_V,
+    const float* key_bias, void* O, const int* cu_seqlens, const int* cu_seqlens_padded,
+    int num_seqs, int max_seqlen, int q_tokens, int k_tokens, int v_tokens,
+    int num_q_heads, int num_kv_heads, int head_dim, bool causal, bool is_bf16, cudaStream_t stream);
 // Implemented in csrc/cuda/sm120/mxfp4/fp4_attention.cu.
 void fp4_attention_causal_mxfp4(
     const void* Q, const void* K, const void* V,
@@ -309,6 +362,69 @@ static at::Tensor fp4_attention_noncausal_nvfp4_packed(
     bool is_bf16 = false) {
     return fp4_attention_nvfp4_packed(
         q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, false, is_bf16);
+}
+
+// Variable-length NVFP4 self-attention (fp4_attention_varlen_kernel). The FP4 inputs hold all sequences in one
+// batch row, each starting at a multiple of 64 tokens (cu_seqlens_padded); the output is
+// [total_tokens, num_q_heads, head_dim] at the unpadded offsets cu_seqlens. key_bias, if given, is
+// [num_q_heads, tokens] floats added to the logits of each key, in the padded token positions.
+// The kernel reads, without checking, that cu_seqlens_padded[i] is a multiple of 64 with room for
+// round_up(length_i, 64) tokens up to the last entry, at most the token count; that cu_seqlens[-1] is total_tokens;
+// that max_seqlen is at least every length; and that V is zero past each sequence before quantization, since its
+// scales group 16 tokens (Q and K tokens past a sequence are never read into its output).
+static at::Tensor fp4_attention_varlen_nvfp4_packed(
+    const at::Tensor& q_packed,
+    const at::Tensor& k_packed,
+    const at::Tensor& v_packed_t,
+    const at::Tensor& q_scale,
+    const at::Tensor& k_scale,
+    const at::Tensor& v_scale_t,
+    const at::Tensor& cu_seqlens,
+    const at::Tensor& cu_seqlens_padded,
+    int64_t max_seqlen,
+    int64_t total_tokens,
+    bool causal,
+    bool is_bf16,
+    const c10::optional<at::Tensor>& key_bias) {
+    check_varlen_inputs(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, cu_seqlens, cu_seqlens_padded);
+    TORCH_CHECK(max_seqlen >= 0 && total_tokens >= 0, "max_seqlen and total_tokens must not be negative");
+    const c10::cuda::OptionalCUDAGuard device_guard(q_packed.device());
+
+    const int num_seqs = static_cast<int>(cu_seqlens.numel()) - 1;
+    const int num_q_heads = q_packed.size(1);
+    const int num_kv_heads = k_packed.size(1);
+    const int q_tokens = q_packed.size(2);
+    const int k_tokens = k_packed.size(2);
+    const int head_dim = q_packed.size(3) * 2;
+    const int v_tokens = v_packed_t.size(3) * 2;
+    TORCH_CHECK(head_dim == 64 || head_dim == 128, "varlen attention supports head_dim 64 and 128, got ", head_dim);
+
+    const float* bias_ptr = nullptr;
+    if (key_bias.has_value()) {
+        const at::Tensor& bias = key_bias.value();
+        TORCH_CHECK(bias.device() == q_packed.device() && bias.scalar_type() == at::kFloat && bias.is_contiguous(),
+                    "key_bias must be a contiguous float32 tensor on the device of q_packed");
+        TORCH_CHECK(bias.dim() == 2 && bias.size(0) == num_q_heads && bias.size(1) == k_tokens,
+                    "key_bias must be [num_q_heads, tokens]");
+        bias_ptr = bias.data_ptr<float>();
+    }
+
+    const at::ScalarType out_dtype = is_bf16 ? at::kBFloat16 : at::kHalf;
+    at::Tensor out = at::empty({total_tokens, num_q_heads, head_dim},
+        at::TensorOptions().dtype(out_dtype).device(q_packed.device()));
+    if (num_seqs == 0 || total_tokens == 0) {
+        return out;
+    }
+    TORCH_CHECK(max_seqlen > 0, "max_seqlen must be positive for a non-empty batch");
+
+    fp4_attention_varlen_nvfp4(
+        q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
+        q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
+        bias_ptr, out.data_ptr(), cu_seqlens.data_ptr<int>(), cu_seqlens_padded.data_ptr<int>(),
+        num_seqs, static_cast<int>(max_seqlen), q_tokens, k_tokens, v_tokens,
+        num_q_heads, num_kv_heads, head_dim, causal, is_bf16, at::cuda::getCurrentCUDAStream());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
 }
 
 static at::Tensor fp4_attention_mxfp4_packed(
@@ -1471,6 +1587,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("v_scale_t"),
           pybind11::arg("is_bf16") = false,
           "Pure NVFP4 non-causal attention over packed tensors");
+    m.def("fp4_attention_varlen_nvfp4_packed", &fp4_attention_varlen_nvfp4_packed,
+          pybind11::arg("q_packed"),
+          pybind11::arg("k_packed"),
+          pybind11::arg("v_packed_t"),
+          pybind11::arg("q_scale"),
+          pybind11::arg("k_scale"),
+          pybind11::arg("v_scale_t"),
+          pybind11::arg("cu_seqlens"),
+          pybind11::arg("cu_seqlens_padded"),
+          pybind11::arg("max_seqlen"),
+          pybind11::arg("total_tokens"),
+          pybind11::arg("causal"),
+          pybind11::arg("is_bf16") = false,
+          pybind11::arg("key_bias") = pybind11::none(),
+          "Pure NVFP4 variable-length self-attention over sequences packed along the token axis");
     m.def("fp4_attention_single_query_nvfp4_packed", &fp4_attention_single_query_nvfp4_packed,
           pybind11::arg("q_packed"),
           pybind11::arg("k_packed"),
