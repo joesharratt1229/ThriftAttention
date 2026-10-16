@@ -116,7 +116,8 @@ void fp4_attention_varlen_nvfp4(
     const void* S_Q, const void* S_K, const void* S_V,
     const float* key_bias, void* O, const int* cu_seqlens, const int* cu_seqlens_padded,
     int num_seqs, int max_seqlen, int q_tokens, int k_tokens, int v_tokens,
-    int num_q_heads, int num_kv_heads, int head_dim, bool causal, bool is_bf16, cudaStream_t stream);
+    int num_q_heads, int num_kv_heads, int head_dim, bool causal, bool is_bf16,
+    uint8_t* O_fp4, uint8_t* O_sf, const float* out_global_scale, cudaStream_t stream);
 // Implemented in csrc/cuda/sm120/mxfp4/fp4_attention.cu.
 void fp4_attention_causal_mxfp4(
     const void* Q, const void* K, const void* V,
@@ -372,7 +373,11 @@ static at::Tensor fp4_attention_noncausal_nvfp4_packed(
 // round_up(length_i, 64) tokens up to the last entry, at most the token count; that cu_seqlens[-1] is total_tokens;
 // that max_seqlen is at least every length; and that V is zero past each sequence before quantization, since its
 // scales group 16 tokens (Q and K tokens past a sequence are never read into its output).
-static at::Tensor fp4_attention_varlen_nvfp4_packed(
+// With out_global_scale, the output is instead the NVFP4 input of the next Linear: packed E2M1 values
+// [total_tokens, num_q_heads * head_dim / 2] (uint8) and float8_e4m3fn scales in the 128x4 swizzled layout of the
+// block-scaled GEMMs, [round_up(total_tokens, 128), round_up(num_q_heads * head_dim / 16, 4)], as vLLM's
+// scaled_fp4_quant(out, out_global_scale) writes them; the scale rows past total_tokens are zero.
+static std::vector<at::Tensor> fp4_attention_varlen_nvfp4_run(
     const at::Tensor& q_packed,
     const at::Tensor& k_packed,
     const at::Tensor& v_packed_t,
@@ -385,7 +390,8 @@ static at::Tensor fp4_attention_varlen_nvfp4_packed(
     int64_t total_tokens,
     bool causal,
     bool is_bf16,
-    const c10::optional<at::Tensor>& key_bias) {
+    const c10::optional<at::Tensor>& key_bias,
+    const c10::optional<at::Tensor>& out_global_scale) {
     check_varlen_inputs(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, cu_seqlens, cu_seqlens_padded);
     TORCH_CHECK(max_seqlen >= 0 && total_tokens >= 0, "max_seqlen and total_tokens must not be negative");
     const c10::cuda::OptionalCUDAGuard device_guard(q_packed.device());
@@ -409,22 +415,88 @@ static at::Tensor fp4_attention_varlen_nvfp4_packed(
         bias_ptr = bias.data_ptr<float>();
     }
 
-    const at::ScalarType out_dtype = is_bf16 ? at::kBFloat16 : at::kHalf;
-    at::Tensor out = at::empty({total_tokens, num_q_heads, head_dim},
-        at::TensorOptions().dtype(out_dtype).device(q_packed.device()));
+    const auto device = at::TensorOptions().device(q_packed.device());
+    std::vector<at::Tensor> outputs;
+    void* out_ptr = nullptr;
+    uint8_t* fp4_ptr = nullptr;
+    uint8_t* sf_ptr = nullptr;
+    const float* global_scale_ptr = nullptr;
+    if (out_global_scale.has_value()) {
+        const at::Tensor& global_scale = out_global_scale.value();
+        TORCH_CHECK(global_scale.device() == q_packed.device() && global_scale.scalar_type() == at::kFloat &&
+                    global_scale.numel() == 1,
+                    "out_global_scale must be a one-element float32 tensor on the device of q_packed");
+        const int64_t columns = static_cast<int64_t>(num_q_heads) * head_dim;
+        const int64_t sf_rows = (total_tokens + 127) / 128 * 128;
+        const int64_t sf_cols = (columns / 16 + 3) / 4 * 4;
+        outputs.push_back(at::empty({total_tokens, columns / 2}, device.dtype(at::kByte)));
+        outputs.push_back(at::empty({sf_rows, sf_cols}, device.dtype(at::kFloat8_e4m3fn)));
+        fp4_ptr = outputs[0].data_ptr<uint8_t>();
+        sf_ptr = static_cast<uint8_t*>(outputs[1].data_ptr());
+        global_scale_ptr = global_scale.data_ptr<float>();
+        // GEMMs read whole tiles of 128 scale rows, and the kernel writes them only up to total_tokens: zero the last
+        // tile first (a tile is contiguous in the swizzled layout)
+        if (total_tokens % 128 != 0) {
+            outputs[1].view(at::kByte).view(-1).narrow(0, (sf_rows - 128) * sf_cols, 128 * sf_cols).zero_();
+        }
+    } else {
+        outputs.push_back(at::empty({total_tokens, num_q_heads, head_dim},
+                                    device.dtype(is_bf16 ? at::kBFloat16 : at::kHalf)));
+        out_ptr = outputs[0].data_ptr();
+    }
     if (num_seqs == 0 || total_tokens == 0) {
-        return out;
+        return outputs;
     }
     TORCH_CHECK(max_seqlen > 0, "max_seqlen must be positive for a non-empty batch");
 
     fp4_attention_varlen_nvfp4(
         q_packed.data_ptr(), k_packed.data_ptr(), v_packed_t.data_ptr(),
         q_scale.data_ptr(), k_scale.data_ptr(), v_scale_t.data_ptr(),
-        bias_ptr, out.data_ptr(), cu_seqlens.data_ptr<int>(), cu_seqlens_padded.data_ptr<int>(),
+        bias_ptr, out_ptr, cu_seqlens.data_ptr<int>(), cu_seqlens_padded.data_ptr<int>(),
         num_seqs, static_cast<int>(max_seqlen), q_tokens, k_tokens, v_tokens,
-        num_q_heads, num_kv_heads, head_dim, causal, is_bf16, at::cuda::getCurrentCUDAStream());
+        num_q_heads, num_kv_heads, head_dim, causal, is_bf16, fp4_ptr, sf_ptr, global_scale_ptr,
+        at::cuda::getCurrentCUDAStream());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return out;
+    return outputs;
+}
+
+static at::Tensor fp4_attention_varlen_nvfp4_packed(
+    const at::Tensor& q_packed,
+    const at::Tensor& k_packed,
+    const at::Tensor& v_packed_t,
+    const at::Tensor& q_scale,
+    const at::Tensor& k_scale,
+    const at::Tensor& v_scale_t,
+    const at::Tensor& cu_seqlens,
+    const at::Tensor& cu_seqlens_padded,
+    int64_t max_seqlen,
+    int64_t total_tokens,
+    bool causal,
+    bool is_bf16,
+    const c10::optional<at::Tensor>& key_bias) {
+    return fp4_attention_varlen_nvfp4_run(
+        q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, cu_seqlens, cu_seqlens_padded,
+        max_seqlen, total_tokens, causal, is_bf16, key_bias, c10::nullopt)[0];
+}
+
+static std::vector<at::Tensor> fp4_attention_varlen_nvfp4_packed_fp4_out(
+    const at::Tensor& q_packed,
+    const at::Tensor& k_packed,
+    const at::Tensor& v_packed_t,
+    const at::Tensor& q_scale,
+    const at::Tensor& k_scale,
+    const at::Tensor& v_scale_t,
+    const at::Tensor& cu_seqlens,
+    const at::Tensor& cu_seqlens_padded,
+    int64_t max_seqlen,
+    int64_t total_tokens,
+    bool causal,
+    bool is_bf16,
+    const c10::optional<at::Tensor>& key_bias,
+    const at::Tensor& out_global_scale) {
+    return fp4_attention_varlen_nvfp4_run(
+        q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, cu_seqlens, cu_seqlens_padded,
+        max_seqlen, total_tokens, causal, is_bf16, key_bias, out_global_scale);
 }
 
 static at::Tensor fp4_attention_mxfp4_packed(
@@ -1602,6 +1674,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("is_bf16") = false,
           pybind11::arg("key_bias") = pybind11::none(),
           "Pure NVFP4 variable-length self-attention over sequences packed along the token axis");
+    m.def("fp4_attention_varlen_nvfp4_packed_fp4_out", &fp4_attention_varlen_nvfp4_packed_fp4_out,
+          pybind11::arg("q_packed"),
+          pybind11::arg("k_packed"),
+          pybind11::arg("v_packed_t"),
+          pybind11::arg("q_scale"),
+          pybind11::arg("k_scale"),
+          pybind11::arg("v_scale_t"),
+          pybind11::arg("cu_seqlens"),
+          pybind11::arg("cu_seqlens_padded"),
+          pybind11::arg("max_seqlen"),
+          pybind11::arg("total_tokens"),
+          pybind11::arg("causal"),
+          pybind11::arg("is_bf16"),
+          pybind11::arg("key_bias"),
+          pybind11::arg("out_global_scale"),
+          "Variable-length NVFP4 self-attention whose output is the NVFP4 input of the next Linear "
+          "(packed values and swizzled scales)");
     m.def("fp4_attention_single_query_nvfp4_packed", &fp4_attention_single_query_nvfp4_packed,
           pybind11::arg("q_packed"),
           pybind11::arg("k_packed"),

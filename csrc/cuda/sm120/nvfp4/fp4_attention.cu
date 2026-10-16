@@ -522,6 +522,73 @@ void fp4_attention_kernel(
         }
 }
 
+// Writes 16 output columns (two m16n8 accumulator tiles) of two rows, token and token + 8, as the NVFP4 input of
+// the next Linear, bit for bit as vLLM's scaled_fp4_quant would write the 16-bit output: each value is rounded to T,
+// the 16 values share the scale sf = e4m3(global_scale * amax / 6), stored in the swizzled 128x4 layout of the
+// block-scaled GEMMs, and each value becomes e2m1(v * rcp(sf * rcp(global_scale))), the lower column in the low
+// nibble. The four lanes of a quad hold the 16 columns (columns 2p, 2p + 1 of each tile in lane p); they share the
+// amax by shuffles, regroup the bytes by shuffles, and each lane stores one 4-byte word.
+template<typename T>
+__device__ __forceinline__ void store_nvfp4_output_group(
+    const float (&left)[4], const float (&right)[4], float norm_upper, float norm_lower, float global_scale,
+    uint8_t* out, uint8_t* out_sf, int token, bool upper_valid, bool lower_valid, int64_t row_bytes,
+    int byte_col, int sf_col, int num_k_tiles, int lane_id)
+{
+    using Traits = PrecisionTraits<T>;
+    const float upper[4] = {
+        Traits::to_float(Traits::from_float(left[0] * norm_upper)),
+        Traits::to_float(Traits::from_float(left[1] * norm_upper)),
+        Traits::to_float(Traits::from_float(right[0] * norm_upper)),
+        Traits::to_float(Traits::from_float(right[1] * norm_upper))};
+    const float lower[4] = {
+        Traits::to_float(Traits::from_float(left[2] * norm_lower)),
+        Traits::to_float(Traits::from_float(left[3] * norm_lower)),
+        Traits::to_float(Traits::from_float(right[2] * norm_lower)),
+        Traits::to_float(Traits::from_float(right[3] * norm_lower))};
+
+    float amax_upper = fmaxf(fmaxf(fabsf(upper[0]), fabsf(upper[1])), fmaxf(fabsf(upper[2]), fabsf(upper[3])));
+    float amax_lower = fmaxf(fmaxf(fabsf(lower[0]), fabsf(lower[1])), fmaxf(fabsf(lower[2]), fabsf(lower[3])));
+    amax_upper = fmaxf(amax_upper, __shfl_xor_sync(0xffffffffu, amax_upper, 1));
+    amax_upper = fmaxf(amax_upper, __shfl_xor_sync(0xffffffffu, amax_upper, 2));
+    amax_lower = fmaxf(amax_lower, __shfl_xor_sync(0xffffffffu, amax_lower, 1));
+    amax_lower = fmaxf(amax_lower, __shfl_xor_sync(0xffffffffu, amax_lower, 2));
+
+    const __nv_fp8_e4m3 sf_upper(global_scale * (amax_upper * ta_rcp_approx_ftz(6.0f)));
+    const __nv_fp8_e4m3 sf_lower(global_scale * (amax_lower * ta_rcp_approx_ftz(6.0f)));
+    const float sf_upper_value = static_cast<float>(sf_upper);
+    const float sf_lower_value = static_cast<float>(sf_lower);
+    const float scale_upper = sf_upper_value != 0.0f
+        ? ta_rcp_approx_ftz(sf_upper_value * ta_rcp_approx_ftz(global_scale)) : 0.0f;
+    const float scale_lower = sf_lower_value != 0.0f
+        ? ta_rcp_approx_ftz(sf_lower_value * ta_rcp_approx_ftz(global_scale)) : 0.0f;
+
+    // bytes, low to high: upper columns 2p/2p+1 of the left tile, of the right tile, then the same for lower
+    const uint32_t packed = ta_cvt_8xf32_to_e2m1_packed(
+        upper[1] * scale_upper, upper[0] * scale_upper, upper[3] * scale_upper, upper[2] * scale_upper,
+        lower[1] * scale_lower, lower[0] * scale_lower, lower[3] * scale_lower, lower[2] * scale_lower);
+
+    // word w gathers byte w of the four lanes in lane order: the row's bytes 0-3 (left tile) or 4-7 (right tile)
+    const int quad_lane = lane_id % 4;
+    uint32_t words[4];
+    for (int w = 0; w < 4; w++) {
+        uint32_t part = ((packed >> (8 * w)) & 0xFFu) << (8 * quad_lane);
+        part |= __shfl_xor_sync(0xffffffffu, part, 1);
+        part |= __shfl_xor_sync(0xffffffffu, part, 2);
+        words[w] = part;
+    }
+    const uint32_t word = quad_lane == 0 ? words[0] : quad_lane == 1 ? words[1] : quad_lane == 2 ? words[2] : words[3];
+    const bool is_lower = quad_lane >= 2;
+    const int my_token = token + (is_lower ? 8 : 0);
+    if (is_lower ? lower_valid : upper_valid) {
+        *reinterpret_cast<uint32_t*>(out + my_token * row_bytes + byte_col + 4 * (quad_lane % 2)) = word;
+        if (quad_lane % 2 == 0) {
+            const int64_t sf_offset = ((static_cast<int64_t>(my_token >> 7) * num_k_tiles + (sf_col >> 2)) << 9)
+                                    | ((my_token & 31) << 4) | (((my_token >> 5) & 3) << 2) | (sf_col & 3);
+            out_sf[sf_offset] = is_lower ? sf_lower.__x : sf_upper.__x;
+        }
+    }
+}
+
 // Variable-length self-attention over sequences packed along the token axis, one CTA per (sequence, query head,
 // query block). Every sequence starts at a multiple of 64 tokens in the FP4 inputs (cu_seqlens_padded):
 //   Q, S_Q: [num_q_heads, q_tokens, HEAD_DIM / 2], [num_q_heads, q_tokens, HEAD_DIM / 16]
@@ -529,10 +596,13 @@ void fp4_attention_kernel(
 //   V, S_V: transposed, [num_kv_heads, HEAD_DIM, v_tokens / 2], [num_kv_heads, HEAD_DIM, v_tokens / 16]
 //   key_bias: [num_q_heads, tokens] floats added to the logits of each key (or null)
 // O is [total_tokens, num_q_heads, HEAD_DIM] at the unpadded offsets cu_seqlens; rows past a sequence are not written.
+// With FP4_OUT, O is written as the NVFP4 input of the next Linear instead (store_nvfp4_output_group).
 template<typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
          int HEAD_DIM_2, int SCALE_DIM,
-         int NUM_WARPS, int WARP_Q>
-__launch_bounds__(NUM_WARPS * TA_WARP_SIZE)
+         int NUM_WARPS, int WARP_Q, bool FP4_OUT = false>
+// Keeps the CTAs per SM that the 16-bit epilogue reaches (4 at head_dim 64, 3 at 128), which the FP4 epilogue
+// would otherwise lower.
+__launch_bounds__(NUM_WARPS * TA_WARP_SIZE, HEAD_DIM == 64 ? 4 : 3)
 __global__
 void fp4_attention_varlen_kernel(
     const __nv_fp4x2_e2m1* Q,
@@ -550,7 +620,10 @@ void fp4_attention_varlen_kernel(
     int v_tokens,
     int max_q_blocks,
     int num_q_heads,
-    int num_kv_heads)
+    int num_kv_heads,
+    uint8_t* O_fp4 = nullptr,
+    uint8_t* O_sf = nullptr,
+    const float* out_global_scale = nullptr)
 {
     using Traits = PrecisionTraits<T>;
     constexpr int TB_SIZE = NUM_WARPS * TA_WARP_SIZE;
@@ -708,6 +781,23 @@ void fp4_attention_varlen_kernel(
     }
 
     constexpr float FP4_RANGE_INV = 1.0f / (448.0f * 6.0f);
+
+    if constexpr (FP4_OUT) {
+        const float global_scale = __ldg(out_global_scale);
+        const int64_t row_bytes = static_cast<int64_t>(num_q_heads) * HEAD_DIM_2;
+        const int num_k_tiles = ta_cdiv(num_q_heads * HEAD_DIM, 64);
+        for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+            const int row = q_block_start + warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+            const float norm0 = FP4_RANGE_INV / rowsum[mma_id_q][0];
+            const float norm1 = FP4_RANGE_INV / rowsum[mma_id_q][1];
+            for (int group = 0; group < HEAD_DIM / 16; group++)
+                store_nvfp4_output_group<T>(
+                    O_rmem[mma_id_q][2 * group], O_rmem[mma_id_q][2 * group + 1], norm0, norm1, global_scale,
+                    O_fp4, O_sf, seq_start + row, row < seq_len, row + 8 < seq_len, row_bytes,
+                    q_head * HEAD_DIM_2 + 8 * group, q_head * (HEAD_DIM / 16) + group, num_k_tiles, lane_id);
+        }
+        return;
+    }
 
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
         for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
@@ -1035,7 +1125,8 @@ static void launch_fp4_attention_varlen(
     const __nv_fp8_e4m3* S_Q, const __nv_fp8_e4m3* S_K, const __nv_fp8_e4m3* S_V,
     const float* key_bias, T* O, const int* cu_seqlens, const int* cu_seqlens_padded,
     int num_seqs, int max_seqlen, int q_tokens, int k_tokens, int v_tokens,
-    int num_q_heads, int num_kv_heads, cudaStream_t stream) {
+    int num_q_heads, int num_kv_heads, uint8_t* O_fp4, uint8_t* O_sf, const float* out_global_scale,
+    cudaStream_t stream) {
 
     constexpr int HEAD_DIM_2 = HEAD_DIM / 2;
     constexpr int SCALE_DIM = HEAD_DIM / 16;
@@ -1057,14 +1148,16 @@ static void launch_fp4_attention_varlen(
     constexpr int smem_size = q_phase_smem + v_phase_smem > k_phase_smem
                             ? q_phase_smem + v_phase_smem : k_phase_smem;
 
-    auto kernel = fp4_attention_varlen_kernel<T, CAUSAL, BLOCK_Q, BLOCK_KV, HEAD_DIM,
-                                              HEAD_DIM_2, SCALE_DIM,
-                                              NUM_WARPS, WARP_Q>;
+    auto kernel = O_fp4 != nullptr
+        ? fp4_attention_varlen_kernel<T, CAUSAL, BLOCK_Q, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM,
+                                      NUM_WARPS, WARP_Q, true>
+        : fp4_attention_varlen_kernel<T, CAUSAL, BLOCK_Q, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM,
+                                      NUM_WARPS, WARP_Q, false>;
 
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     kernel<<<num_blocks, TB_SIZE, smem_size, stream>>>(
         Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
-        q_tokens, k_tokens, v_tokens, max_q_blocks, num_q_heads, num_kv_heads);
+        q_tokens, k_tokens, v_tokens, max_q_blocks, num_q_heads, num_kv_heads, O_fp4, O_sf, out_global_scale);
 }
 
 template<typename T, bool CAUSAL>
@@ -1187,7 +1280,8 @@ static void fp4_attention_varlen_nvfp4_typed(
     const void* S_Q_raw, const void* S_K_raw, const void* S_V_raw,
     const float* key_bias, void* O_raw, const int* cu_seqlens, const int* cu_seqlens_padded,
     int num_seqs, int max_seqlen, int q_tokens, int k_tokens, int v_tokens,
-    int num_q_heads, int num_kv_heads, int head_dim, cudaStream_t stream) {
+    int num_q_heads, int num_kv_heads, int head_dim, uint8_t* O_fp4, uint8_t* O_sf,
+    const float* out_global_scale, cudaStream_t stream) {
     auto Q = reinterpret_cast<const __nv_fp4x2_e2m1*>(Q_raw);
     auto K = reinterpret_cast<const __nv_fp4x2_e2m1*>(K_raw);
     auto V = reinterpret_cast<const __nv_fp4x2_e2m1*>(V_raw);
@@ -1198,11 +1292,13 @@ static void fp4_attention_varlen_nvfp4_typed(
     if (head_dim == 64) {
         launch_fp4_attention_varlen<T, CAUSAL, 64>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
-            num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, stream);
+            num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads,
+            O_fp4, O_sf, out_global_scale, stream);
     } else {
         launch_fp4_attention_varlen<T, CAUSAL, 128>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
-            num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, stream);
+            num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads,
+            O_fp4, O_sf, out_global_scale, stream);
     }
 }
 
@@ -1211,22 +1307,27 @@ void fp4_attention_varlen_nvfp4(
     const void* S_Q, const void* S_K, const void* S_V,
     const float* key_bias, void* O, const int* cu_seqlens, const int* cu_seqlens_padded,
     int num_seqs, int max_seqlen, int q_tokens, int k_tokens, int v_tokens,
-    int num_q_heads, int num_kv_heads, int head_dim, bool causal, bool is_bf16, cudaStream_t stream) {
+    int num_q_heads, int num_kv_heads, int head_dim, bool causal, bool is_bf16,
+    uint8_t* O_fp4, uint8_t* O_sf, const float* out_global_scale, cudaStream_t stream) {
     if (is_bf16 && causal) {
         fp4_attention_varlen_nvfp4_typed<__nv_bfloat16, true>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
-            num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, head_dim, stream);
+            num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, head_dim,
+            O_fp4, O_sf, out_global_scale, stream);
     } else if (is_bf16) {
         fp4_attention_varlen_nvfp4_typed<__nv_bfloat16, false>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
-            num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, head_dim, stream);
+            num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, head_dim,
+            O_fp4, O_sf, out_global_scale, stream);
     } else if (causal) {
         fp4_attention_varlen_nvfp4_typed<half, true>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
-            num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, head_dim, stream);
+            num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, head_dim,
+            O_fp4, O_sf, out_global_scale, stream);
     } else {
         fp4_attention_varlen_nvfp4_typed<half, false>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
-            num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, head_dim, stream);
+            num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, head_dim,
+            O_fp4, O_sf, out_global_scale, stream);
     }
 }
