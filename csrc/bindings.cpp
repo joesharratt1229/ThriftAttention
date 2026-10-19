@@ -86,6 +86,17 @@ void check_varlen_inputs(
                 "cu_seqlens and cu_seqlens_padded must both have num_seqs + 1 entries");
 }
 
+// A caller's buffer that a kernel writes in place: its device, dtype, rows and size, contiguous and 16-byte aligned
+// (the epilogues store whole words).
+void check_output_buffer(const at::Tensor& buffer, const at::Tensor& like, at::ScalarType dtype, int64_t rows,
+                         int64_t numel, const char* name) {
+    TORCH_CHECK(buffer.device() == like.device() && buffer.scalar_type() == dtype && buffer.dim() >= 1 &&
+                buffer.size(0) == rows && buffer.numel() == numel && buffer.is_contiguous() &&
+                reinterpret_cast<uintptr_t>(buffer.data_ptr()) % 16 == 0,
+                name, " must be a contiguous, 16-byte aligned ", c10::toString(dtype), " tensor with ", rows,
+                " rows and ", numel, " elements on the device of q_packed");
+}
+
 int single_query_mixed_target_split_ctas(int total_kv_blocks) {
     if (const char* env = std::getenv("SAGE_MIXED_SPLIT_CTAS")) {
         const int value = std::atoi(env);
@@ -117,7 +128,8 @@ void fp4_attention_varlen_nvfp4(
     const float* key_bias, void* O, const int* cu_seqlens, const int* cu_seqlens_padded,
     int num_seqs, int max_seqlen, int q_tokens, int k_tokens, int v_tokens,
     int num_q_heads, int num_kv_heads, int head_dim, bool causal, bool is_bf16,
-    uint8_t* O_fp4, uint8_t* O_sf, const float* out_global_scale, cudaStream_t stream);
+    uint8_t* O_fp4, uint8_t* O_sf, const float* out_global_scale,
+    const int* q_start, const int* out_start, float* lse_out, int out_tokens, cudaStream_t stream);
 // Implemented in csrc/cuda/sm120/mxfp4/fp4_attention.cu.
 void fp4_attention_causal_mxfp4(
     const void* Q, const void* K, const void* V,
@@ -391,7 +403,13 @@ static std::vector<at::Tensor> fp4_attention_varlen_nvfp4_run(
     bool causal,
     bool is_bf16,
     const c10::optional<at::Tensor>& key_bias,
-    const c10::optional<at::Tensor>& out_global_scale) {
+    const c10::optional<at::Tensor>& out_global_scale,
+    const c10::optional<at::Tensor>& q_start = c10::nullopt,
+    const c10::optional<at::Tensor>& out_start = c10::nullopt,
+    bool return_lse = false,
+    const c10::optional<at::Tensor>& out_buffer = c10::nullopt,
+    const c10::optional<at::Tensor>& out_scales_buffer = c10::nullopt,
+    const c10::optional<at::Tensor>& lse_buffer = c10::nullopt) {
     check_varlen_inputs(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, cu_seqlens, cu_seqlens_padded);
     TORCH_CHECK(max_seqlen >= 0 && total_tokens >= 0, "max_seqlen and total_tokens must not be negative");
     const c10::cuda::OptionalCUDAGuard device_guard(q_packed.device());
@@ -415,6 +433,21 @@ static std::vector<at::Tensor> fp4_attention_varlen_nvfp4_run(
         bias_ptr = bias.data_ptr<float>();
     }
 
+    const int* q_start_ptr = nullptr;
+    const int* out_start_ptr = nullptr;
+    if (q_start.has_value()) {
+        const at::Tensor& t = q_start.value();
+        TORCH_CHECK(t.device() == q_packed.device() && t.scalar_type() == at::kInt && t.is_contiguous() &&
+                    t.numel() >= num_seqs, "q_start must be a contiguous int32 tensor with one entry per sequence");
+        q_start_ptr = t.data_ptr<int>();
+    }
+    if (out_start.has_value()) {
+        const at::Tensor& t = out_start.value();
+        TORCH_CHECK(t.device() == q_packed.device() && t.scalar_type() == at::kInt && t.is_contiguous() &&
+                    t.numel() >= num_seqs, "out_start must be a contiguous int32 tensor with one entry per sequence");
+        out_start_ptr = t.data_ptr<int>();
+    }
+
     const auto device = at::TensorOptions().device(q_packed.device());
     std::vector<at::Tensor> outputs;
     void* out_ptr = nullptr;
@@ -429,8 +462,20 @@ static std::vector<at::Tensor> fp4_attention_varlen_nvfp4_run(
         const int64_t columns = static_cast<int64_t>(num_q_heads) * head_dim;
         const int64_t sf_rows = (total_tokens + 127) / 128 * 128;
         const int64_t sf_cols = (columns / 16 + 3) / 4 * 4;
-        outputs.push_back(at::empty({total_tokens, columns / 2}, device.dtype(at::kByte)));
-        outputs.push_back(at::empty({sf_rows, sf_cols}, device.dtype(at::kFloat8_e4m3fn)));
+        if (out_buffer.has_value()) {  // written in place (a buffer the caller's CUDA graph owns)
+            TORCH_CHECK(out_scales_buffer.has_value(), "an NVFP4 output buffer needs a scale buffer");
+            const at::Tensor& values = out_buffer.value();
+            const at::Tensor& scales = out_scales_buffer.value();
+            check_output_buffer(values, q_packed, at::kByte, total_tokens, total_tokens * columns / 2, "out");
+            TORCH_CHECK(scales.scalar_type() == at::kFloat8_e4m3fn || scales.scalar_type() == at::kByte,
+                        "out_scales must be float8_e4m3fn (or its bytes, uint8)");
+            check_output_buffer(scales, q_packed, scales.scalar_type(), sf_rows, sf_rows * sf_cols, "out_scales");
+            outputs.push_back(values);
+            outputs.push_back(scales);
+        } else {
+            outputs.push_back(at::empty({total_tokens, columns / 2}, device.dtype(at::kByte)));
+            outputs.push_back(at::empty({sf_rows, sf_cols}, device.dtype(at::kFloat8_e4m3fn)));
+        }
         fp4_ptr = outputs[0].data_ptr<uint8_t>();
         sf_ptr = static_cast<uint8_t*>(outputs[1].data_ptr());
         global_scale_ptr = global_scale.data_ptr<float>();
@@ -440,9 +485,27 @@ static std::vector<at::Tensor> fp4_attention_varlen_nvfp4_run(
             outputs[1].view(at::kByte).view(-1).narrow(0, (sf_rows - 128) * sf_cols, 128 * sf_cols).zero_();
         }
     } else {
-        outputs.push_back(at::empty({total_tokens, num_q_heads, head_dim},
-                                    device.dtype(is_bf16 ? at::kBFloat16 : at::kHalf)));
+        TORCH_CHECK(!out_scales_buffer.has_value(), "out_scales is only for the NVFP4 output (out_global_scale)");
+        if (out_buffer.has_value()) {
+            const at::Tensor& out = out_buffer.value();
+            check_output_buffer(out, q_packed, is_bf16 ? at::kBFloat16 : at::kHalf, total_tokens,
+                                total_tokens * num_q_heads * head_dim, "out");
+            outputs.push_back(out);
+        } else {
+            outputs.push_back(at::empty({total_tokens, num_q_heads, head_dim},
+                                        device.dtype(is_bf16 ? at::kBFloat16 : at::kHalf)));
+        }
         out_ptr = outputs[0].data_ptr();
+    }
+    float* lse_ptr = nullptr;
+    if (lse_buffer.has_value()) {
+        const at::Tensor& lse = lse_buffer.value();
+        check_output_buffer(lse, q_packed, at::kFloat, num_q_heads, num_q_heads * total_tokens, "lse");
+        outputs.push_back(lse);
+        lse_ptr = lse.data_ptr<float>();
+    } else if (return_lse) {
+        outputs.push_back(at::empty({num_q_heads, total_tokens}, device.dtype(at::kFloat)));
+        lse_ptr = outputs.back().data_ptr<float>();
     }
     if (num_seqs == 0 || total_tokens == 0) {
         return outputs;
@@ -455,7 +518,7 @@ static std::vector<at::Tensor> fp4_attention_varlen_nvfp4_run(
         bias_ptr, out_ptr, cu_seqlens.data_ptr<int>(), cu_seqlens_padded.data_ptr<int>(),
         num_seqs, static_cast<int>(max_seqlen), q_tokens, k_tokens, v_tokens,
         num_q_heads, num_kv_heads, head_dim, causal, is_bf16, fp4_ptr, sf_ptr, global_scale_ptr,
-        at::cuda::getCurrentCUDAStream());
+        q_start_ptr, out_start_ptr, lse_ptr, static_cast<int>(total_tokens), at::cuda::getCurrentCUDAStream());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return outputs;
 }
@@ -497,6 +560,44 @@ static std::vector<at::Tensor> fp4_attention_varlen_nvfp4_packed_fp4_out(
     return fp4_attention_varlen_nvfp4_run(
         q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, cu_seqlens, cu_seqlens_padded,
         max_seqlen, total_tokens, causal, is_bf16, key_bias, out_global_scale);
+}
+
+// The varlen kernel for queries that come after keys a cache holds: the FP4 inputs hold whole sequences (cu_seqlens,
+// cu_seqlens_padded: their full lengths), but only the query rows from q_start[seq] on are computed, and row
+// q_start[seq] + i is written to output row out_start[seq] + i (out_tokens rows in all). The rows that are written
+// are those of fp4_attention_varlen_nvfp4_packed(_fp4_out) on the same inputs. max_seqlen is the most rows a
+// sequence computes (its length minus q_start), which sizes the grid; the kernel reads, without checking, that
+// 0 <= q_start[seq] <= length and that the output rows fit in out_tokens.
+// Returns the output (or the NVFP4 values and scales, with out_global_scale), then, with return_lse or lse, the
+// log-sum-exp [num_q_heads, out_tokens] of the logits the kernel computes, key_bias included: when Q and K were
+// smoothed (q - c_q, k - c_k, key_bias c_q . (k - c_k)), the row constant scale * q . c_k is not part of it.
+// out (and out_scales for the NVFP4 output) and lse, if given, are written in place instead of allocated, so that a
+// captured CUDA graph can reuse them.
+static std::vector<at::Tensor> fp4_attention_varlen_nvfp4_cached(
+    const at::Tensor& q_packed,
+    const at::Tensor& k_packed,
+    const at::Tensor& v_packed_t,
+    const at::Tensor& q_scale,
+    const at::Tensor& k_scale,
+    const at::Tensor& v_scale_t,
+    const at::Tensor& cu_seqlens,
+    const at::Tensor& cu_seqlens_padded,
+    int64_t max_seqlen,
+    int64_t out_tokens,
+    bool causal,
+    bool is_bf16,
+    const c10::optional<at::Tensor>& key_bias,
+    const at::Tensor& q_start,
+    const at::Tensor& out_start,
+    const c10::optional<at::Tensor>& out_global_scale,
+    bool return_lse,
+    const c10::optional<at::Tensor>& out,
+    const c10::optional<at::Tensor>& out_scales,
+    const c10::optional<at::Tensor>& lse) {
+    return fp4_attention_varlen_nvfp4_run(
+        q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, cu_seqlens, cu_seqlens_padded,
+        max_seqlen, out_tokens, causal, is_bf16, key_bias, out_global_scale, q_start, out_start, return_lse, out,
+        out_scales, lse);
 }
 
 static at::Tensor fp4_attention_mxfp4_packed(
@@ -1691,6 +1792,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("out_global_scale"),
           "Variable-length NVFP4 self-attention whose output is the NVFP4 input of the next Linear "
           "(packed values and swizzled scales)");
+    m.def("fp4_attention_varlen_nvfp4_cached", &fp4_attention_varlen_nvfp4_cached,
+          pybind11::arg("q_packed"),
+          pybind11::arg("k_packed"),
+          pybind11::arg("v_packed_t"),
+          pybind11::arg("q_scale"),
+          pybind11::arg("k_scale"),
+          pybind11::arg("v_scale_t"),
+          pybind11::arg("cu_seqlens"),
+          pybind11::arg("cu_seqlens_padded"),
+          pybind11::arg("max_seqlen"),
+          pybind11::arg("out_tokens"),
+          pybind11::arg("causal"),
+          pybind11::arg("is_bf16"),
+          pybind11::arg("key_bias"),
+          pybind11::arg("q_start"),
+          pybind11::arg("out_start"),
+          pybind11::kw_only(),
+          pybind11::arg("out_global_scale") = pybind11::none(),
+          pybind11::arg("return_lse") = false,
+          pybind11::arg("out") = pybind11::none(),
+          pybind11::arg("out_scales") = pybind11::none(),
+          pybind11::arg("lse") = pybind11::none(),
+          "Variable-length NVFP4 attention for the query rows from q_start on (keys before them come from a "
+          "cache), optionally with NVFP4 output and the log-sum-exp of each row");
     m.def("fp4_attention_single_query_nvfp4_packed", &fp4_attention_single_query_nvfp4_packed,
           pybind11::arg("q_packed"),
           pybind11::arg("k_packed"),

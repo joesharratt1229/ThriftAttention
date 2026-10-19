@@ -597,6 +597,13 @@ __device__ __forceinline__ void store_nvfp4_output_group(
 //   key_bias: [num_q_heads, tokens] floats added to the logits of each key (or null)
 // O is [total_tokens, num_q_heads, HEAD_DIM] at the unpadded offsets cu_seqlens; rows past a sequence are not written.
 // With FP4_OUT, O is written as the NVFP4 input of the next Linear instead (store_nvfp4_output_group).
+// q_start (or null): per sequence, the first query row; the rows before it (keys that a cache holds, whose queries
+// were computed in an earlier call) are not written, and the grid starts at the query block that holds q_start.
+// Every row's result depends only on its own query and the keys, so the rows that are written are those of a call
+// without it.
+// out_start (or null): per sequence, the output row of query row q_start (default: cu_seqlens + q_start).
+// lse_out (or null): [num_q_heads, out_tokens] floats at the rows' output indices, the natural log-sum-exp of each
+// written row's scaled logits as the kernel computes them, key_bias included (rowmax + log(rowsum)).
 template<typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
          int HEAD_DIM_2, int SCALE_DIM,
          int NUM_WARPS, int WARP_Q, bool FP4_OUT = false>
@@ -623,7 +630,11 @@ void fp4_attention_varlen_kernel(
     int num_kv_heads,
     uint8_t* O_fp4 = nullptr,
     uint8_t* O_sf = nullptr,
-    const float* out_global_scale = nullptr)
+    const float* out_global_scale = nullptr,
+    const int* q_start = nullptr,
+    const int* out_start = nullptr,
+    float* lse_out = nullptr,
+    int out_tokens = 0)
 {
     using Traits = PrecisionTraits<T>;
     constexpr int TB_SIZE = NUM_WARPS * TA_WARP_SIZE;
@@ -638,12 +649,16 @@ void fp4_attention_varlen_kernel(
     const int warp_id = tid / TA_WARP_SIZE;
     const int lane_id = tid % TA_WARP_SIZE;
 
-    const int q_block_id = bid % max_q_blocks;
     const int q_head = (bid / max_q_blocks) % num_q_heads;
     const int seq = bid / (max_q_blocks * num_q_heads);
     const int seq_start = cu_seqlens[seq];
     const int seq_len = cu_seqlens[seq + 1] - seq_start;
+    const int first_row = q_start == nullptr ? 0 : q_start[seq];
+    // the grid covers the query blocks from the one that holds row q_start on
+    const int q_block_id = bid % max_q_blocks + first_row / BLOCK_Q;
     if (q_block_id * BLOCK_Q >= seq_len) return;
+    // query row r of this sequence goes to output row out_base + r
+    const int out_base = (out_start == nullptr ? seq_start + first_row : out_start[seq]) - first_row;
     const int padded_start = cu_seqlens_padded[seq];
     const int kv_head = q_head / (num_q_heads / num_kv_heads);
 
@@ -782,6 +797,17 @@ void fp4_attention_varlen_kernel(
 
     constexpr float FP4_RANGE_INV = 1.0f / (448.0f * 6.0f);
 
+    if (lse_out != nullptr && lane_id % 4 == 0) {  // the four lanes of a quad hold the same rowmax and rowsum
+        float* lse_head = lse_out + static_cast<int64_t>(q_head) * out_tokens + out_base;
+        for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+            const int row = q_block_start + warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+            if (row >= first_row && row < seq_len)
+                lse_head[row] = rowmax[mma_id_q][0] + logf(rowsum[mma_id_q][0]);
+            if (row + 8 >= first_row && row + 8 < seq_len)
+                lse_head[row + 8] = rowmax[mma_id_q][1] + logf(rowsum[mma_id_q][1]);
+        }
+    }
+
     if constexpr (FP4_OUT) {
         const float global_scale = __ldg(out_global_scale);
         const int64_t row_bytes = static_cast<int64_t>(num_q_heads) * HEAD_DIM_2;
@@ -793,7 +819,8 @@ void fp4_attention_varlen_kernel(
             for (int group = 0; group < HEAD_DIM / 16; group++)
                 store_nvfp4_output_group<T>(
                     O_rmem[mma_id_q][2 * group], O_rmem[mma_id_q][2 * group + 1], norm0, norm1, global_scale,
-                    O_fp4, O_sf, seq_start + row, row < seq_len, row + 8 < seq_len, row_bytes,
+                    O_fp4, O_sf, out_base + row, row >= first_row && row < seq_len,
+                    row + 8 >= first_row && row + 8 < seq_len, row_bytes,
                     q_head * HEAD_DIM_2 + 8 * group, q_head * (HEAD_DIM / 16) + group, num_k_tiles, lane_id);
         }
         return;
@@ -808,12 +835,12 @@ void fp4_attention_varlen_kernel(
             const float norm0 = FP4_RANGE_INV / rowsum[mma_id_q][0];
             const float norm1 = FP4_RANGE_INV / rowsum[mma_id_q][1];
 
-            if (row < seq_len) {
-                T* out = O + (static_cast<int64_t>(seq_start + row) * num_q_heads + q_head) * HEAD_DIM + col;
+            if (row >= first_row && row < seq_len) {
+                T* out = O + (static_cast<int64_t>(out_base + row) * num_q_heads + q_head) * HEAD_DIM + col;
                 reinterpret_cast<typename Traits::vec2*>(out)[0] = Traits::pack2(regs[0] * norm0, regs[1] * norm0);
             }
-            if (row + 8 < seq_len) {
-                T* out = O + (static_cast<int64_t>(seq_start + row + 8) * num_q_heads + q_head) * HEAD_DIM + col;
+            if (row + 8 >= first_row && row + 8 < seq_len) {
+                T* out = O + (static_cast<int64_t>(out_base + row + 8) * num_q_heads + q_head) * HEAD_DIM + col;
                 reinterpret_cast<typename Traits::vec2*>(out)[0] = Traits::pack2(regs[2] * norm1, regs[3] * norm1);
             }
         }
@@ -1126,7 +1153,7 @@ static void launch_fp4_attention_varlen(
     const float* key_bias, T* O, const int* cu_seqlens, const int* cu_seqlens_padded,
     int num_seqs, int max_seqlen, int q_tokens, int k_tokens, int v_tokens,
     int num_q_heads, int num_kv_heads, uint8_t* O_fp4, uint8_t* O_sf, const float* out_global_scale,
-    cudaStream_t stream) {
+    const int* q_start, const int* out_start, float* lse_out, int out_tokens, cudaStream_t stream) {
 
     constexpr int HEAD_DIM_2 = HEAD_DIM / 2;
     constexpr int SCALE_DIM = HEAD_DIM / 16;
@@ -1136,7 +1163,8 @@ static void launch_fp4_attention_varlen(
     constexpr int NUM_WARPS = BLOCK_Q / WARP_Q;
     constexpr int TB_SIZE = NUM_WARPS * TA_WARP_SIZE;
 
-    const int max_q_blocks = ta_cdiv(max_seqlen, BLOCK_Q);
+    // with q_start, max_seqlen is the most rows a sequence computes, which can start inside a block
+    const int max_q_blocks = ta_cdiv(max_seqlen, BLOCK_Q) + (q_start != nullptr ? 1 : 0);
     const int num_blocks = num_seqs * num_q_heads * max_q_blocks;
 
     constexpr int q_phase_smem = BLOCK_Q * HEAD_DIM_2 * sizeof(__nv_fp4x2_e2m1)
@@ -1157,7 +1185,8 @@ static void launch_fp4_attention_varlen(
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     kernel<<<num_blocks, TB_SIZE, smem_size, stream>>>(
         Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
-        q_tokens, k_tokens, v_tokens, max_q_blocks, num_q_heads, num_kv_heads, O_fp4, O_sf, out_global_scale);
+        q_tokens, k_tokens, v_tokens, max_q_blocks, num_q_heads, num_kv_heads, O_fp4, O_sf, out_global_scale,
+        q_start, out_start, lse_out, out_tokens);
 }
 
 template<typename T, bool CAUSAL>
@@ -1281,7 +1310,8 @@ static void fp4_attention_varlen_nvfp4_typed(
     const float* key_bias, void* O_raw, const int* cu_seqlens, const int* cu_seqlens_padded,
     int num_seqs, int max_seqlen, int q_tokens, int k_tokens, int v_tokens,
     int num_q_heads, int num_kv_heads, int head_dim, uint8_t* O_fp4, uint8_t* O_sf,
-    const float* out_global_scale, cudaStream_t stream) {
+    const float* out_global_scale, const int* q_start, const int* out_start, float* lse_out, int out_tokens,
+    cudaStream_t stream) {
     auto Q = reinterpret_cast<const __nv_fp4x2_e2m1*>(Q_raw);
     auto K = reinterpret_cast<const __nv_fp4x2_e2m1*>(K_raw);
     auto V = reinterpret_cast<const __nv_fp4x2_e2m1*>(V_raw);
@@ -1293,12 +1323,12 @@ static void fp4_attention_varlen_nvfp4_typed(
         launch_fp4_attention_varlen<T, CAUSAL, 64>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
             num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads,
-            O_fp4, O_sf, out_global_scale, stream);
+            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream);
     } else {
         launch_fp4_attention_varlen<T, CAUSAL, 128>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
             num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads,
-            O_fp4, O_sf, out_global_scale, stream);
+            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream);
     }
 }
 
@@ -1308,26 +1338,27 @@ void fp4_attention_varlen_nvfp4(
     const float* key_bias, void* O, const int* cu_seqlens, const int* cu_seqlens_padded,
     int num_seqs, int max_seqlen, int q_tokens, int k_tokens, int v_tokens,
     int num_q_heads, int num_kv_heads, int head_dim, bool causal, bool is_bf16,
-    uint8_t* O_fp4, uint8_t* O_sf, const float* out_global_scale, cudaStream_t stream) {
+    uint8_t* O_fp4, uint8_t* O_sf, const float* out_global_scale,
+    const int* q_start, const int* out_start, float* lse_out, int out_tokens, cudaStream_t stream) {
     if (is_bf16 && causal) {
         fp4_attention_varlen_nvfp4_typed<__nv_bfloat16, true>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
             num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, head_dim,
-            O_fp4, O_sf, out_global_scale, stream);
+            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream);
     } else if (is_bf16) {
         fp4_attention_varlen_nvfp4_typed<__nv_bfloat16, false>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
             num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, head_dim,
-            O_fp4, O_sf, out_global_scale, stream);
+            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream);
     } else if (causal) {
         fp4_attention_varlen_nvfp4_typed<half, true>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
             num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, head_dim,
-            O_fp4, O_sf, out_global_scale, stream);
+            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream);
     } else {
         fp4_attention_varlen_nvfp4_typed<half, false>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
             num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, head_dim,
-            O_fp4, O_sf, out_global_scale, stream);
+            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream);
     }
 }
