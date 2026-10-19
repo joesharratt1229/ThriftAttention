@@ -9,6 +9,8 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include "thriftattention/sm120/paged_bf16_prefix.h"
+
 namespace {
 
 void check_hi_qkv(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
@@ -129,7 +131,8 @@ void fp4_attention_varlen_nvfp4(
     int num_seqs, int max_seqlen, int q_tokens, int k_tokens, int v_tokens,
     int num_q_heads, int num_kv_heads, int head_dim, bool causal, bool is_bf16,
     uint8_t* O_fp4, uint8_t* O_sf, const float* out_global_scale,
-    const int* q_start, const int* out_start, float* lse_out, int out_tokens, cudaStream_t stream);
+    const int* q_start, const int* out_start, float* lse_out, int out_tokens, cudaStream_t stream,
+    const PagedBf16PrefixArgs* paged_prefix = nullptr);
 // Implemented in csrc/cuda/sm120/mxfp4/fp4_attention.cu.
 void fp4_attention_causal_mxfp4(
     const void* Q, const void* K, const void* V,
@@ -409,7 +412,8 @@ static std::vector<at::Tensor> fp4_attention_varlen_nvfp4_run(
     bool return_lse = false,
     const c10::optional<at::Tensor>& out_buffer = c10::nullopt,
     const c10::optional<at::Tensor>& out_scales_buffer = c10::nullopt,
-    const c10::optional<at::Tensor>& lse_buffer = c10::nullopt) {
+    const c10::optional<at::Tensor>& lse_buffer = c10::nullopt,
+    const PagedBf16PrefixArgs* paged_prefix = nullptr) {
     check_varlen_inputs(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, cu_seqlens, cu_seqlens_padded);
     TORCH_CHECK(max_seqlen >= 0 && total_tokens >= 0, "max_seqlen and total_tokens must not be negative");
     const c10::cuda::OptionalCUDAGuard device_guard(q_packed.device());
@@ -518,7 +522,8 @@ static std::vector<at::Tensor> fp4_attention_varlen_nvfp4_run(
         bias_ptr, out_ptr, cu_seqlens.data_ptr<int>(), cu_seqlens_padded.data_ptr<int>(),
         num_seqs, static_cast<int>(max_seqlen), q_tokens, k_tokens, v_tokens,
         num_q_heads, num_kv_heads, head_dim, causal, is_bf16, fp4_ptr, sf_ptr, global_scale_ptr,
-        q_start_ptr, out_start_ptr, lse_ptr, static_cast<int>(total_tokens), at::cuda::getCurrentCUDAStream());
+        q_start_ptr, out_start_ptr, lse_ptr, static_cast<int>(total_tokens), at::cuda::getCurrentCUDAStream(),
+        paged_prefix);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return outputs;
 }
@@ -573,6 +578,13 @@ static std::vector<at::Tensor> fp4_attention_varlen_nvfp4_packed_fp4_out(
 // smoothed (q - c_q, k - c_k, key_bias c_q . (k - c_k)), the row constant scale * q . c_k is not part of it.
 // out (and out_scales for the NVFP4 output) and lse, if given, are written in place instead of allocated, so that a
 // captured CUDA graph can reuse them.
+// With prefix_len (causal bfloat16 only), keys 0 .. prefix_len[seq] - 1 of each sequence come in bfloat16 from a
+// paged cache instead (key_cache and value_cache [blocks, block_size, num_kv_heads, head_dim], block_table
+// [num_seqs, max_blocks]) and are attended after the sequence's FP4 keys, which then start at its key
+// prefix_len[seq], in the same online softmax; q_bf16 holds the rows' queries. key_bias applies to the FP4 keys
+// only; key_mean, the vector subtracted from the keys before FP4 quantization, brings the prefix logits to the FP4
+// logits' frame. The kernel reads, without checking, that prefix_len[seq] <= block_table.size(1) * block_size and
+// that the blocks exist.
 static std::vector<at::Tensor> fp4_attention_varlen_nvfp4_cached(
     const at::Tensor& q_packed,
     const at::Tensor& k_packed,
@@ -593,11 +605,78 @@ static std::vector<at::Tensor> fp4_attention_varlen_nvfp4_cached(
     bool return_lse,
     const c10::optional<at::Tensor>& out,
     const c10::optional<at::Tensor>& out_scales,
-    const c10::optional<at::Tensor>& lse) {
+    const c10::optional<at::Tensor>& lse,
+    const c10::optional<at::Tensor>& q_bf16,
+    const c10::optional<at::Tensor>& key_cache,
+    const c10::optional<at::Tensor>& value_cache,
+    const c10::optional<at::Tensor>& block_table,
+    const c10::optional<at::Tensor>& prefix_len,
+    const c10::optional<at::Tensor>& key_mean) {
+    if (!prefix_len.has_value()) {
+        TORCH_CHECK(!q_bf16.has_value() && !key_cache.has_value() && !value_cache.has_value() &&
+                    !block_table.has_value() && !key_mean.has_value(),
+                    "q_bf16, key_cache, value_cache, block_table and key_mean are only used with prefix_len");
+        return fp4_attention_varlen_nvfp4_run(
+            q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, cu_seqlens, cu_seqlens_padded,
+            max_seqlen, out_tokens, causal, is_bf16, key_bias, out_global_scale, q_start, out_start, return_lse, out,
+            out_scales, lse);
+    }
+    // the bfloat16 prefix: keys 0 .. prefix_len[seq] - 1 of each sequence from the paged cache, after its FP4 keys
+    TORCH_CHECK(is_bf16 && causal, "a bfloat16 prefix is for causal bfloat16 attention");
+    TORCH_CHECK(q_bf16.has_value() && key_cache.has_value() && value_cache.has_value() && block_table.has_value(),
+                "a bfloat16 prefix needs q_bf16, key_cache, value_cache and block_table");
+    const int num_seqs = static_cast<int>(cu_seqlens.numel()) - 1;
+    const int num_q_heads = q_packed.size(1);
+    const int num_kv_heads = k_packed.size(1);
+    const int head_dim = q_packed.size(3) * 2;
+    const at::Tensor& q = q_bf16.value();
+    const at::Tensor& kc = key_cache.value();
+    const at::Tensor& vc = value_cache.value();
+    const at::Tensor& table = block_table.value();
+    const at::Tensor& lengths = prefix_len.value();
+    for (const at::Tensor* t : {&q, &kc, &vc, &table, &lengths}) {
+        TORCH_CHECK(t->device() == q_packed.device(), "the prefix inputs must be on the device of q_packed");
+    }
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16 && q.is_contiguous() && q.dim() == 3 && q.size(0) >= out_tokens &&
+                q.size(1) == num_q_heads && q.size(2) == head_dim &&
+                reinterpret_cast<uintptr_t>(q.data_ptr()) % 16 == 0,
+                "q_bf16 must be [out_tokens, num_q_heads, head_dim] contiguous, 16-byte aligned bfloat16");
+    for (const at::Tensor* cache : {&kc, &vc}) {
+        TORCH_CHECK(cache->scalar_type() == at::kBFloat16 && cache->dim() == 4 && cache->size(1) > 0 &&
+                    cache->size(2) == num_kv_heads && cache->size(3) == head_dim && cache->stride(3) == 1 &&
+                    cache->stride(2) % 8 == 0 && cache->stride(1) % 8 == 0 && cache->stride(0) % 8 == 0 &&
+                    reinterpret_cast<uintptr_t>(cache->data_ptr()) % 16 == 0,
+                    "key_cache and value_cache must be [blocks, block_size, num_kv_heads, head_dim] bfloat16 views "
+                    "with 16-byte aligned rows");
+    }
+    TORCH_CHECK(kc.sizes() == vc.sizes() && kc.strides() == vc.strides(),
+                "key_cache and value_cache must have the same shape and strides");
+    TORCH_CHECK(table.scalar_type() == at::kInt && table.dim() == 2 && table.stride(1) == 1 &&
+                table.size(0) >= num_seqs, "block_table must be [num_seqs, max_blocks] int32 with unit column stride");
+    TORCH_CHECK(lengths.scalar_type() == at::kInt && lengths.is_contiguous() && lengths.numel() >= num_seqs,
+                "prefix_len must be int32 with one entry per sequence");
+    PagedBf16PrefixArgs args;
+    if (key_mean.has_value()) {
+        const at::Tensor& mean = key_mean.value();
+        TORCH_CHECK(mean.device() == q_packed.device() && mean.scalar_type() == at::kFloat && mean.is_contiguous() &&
+                    mean.dim() == 2 && mean.size(0) == num_kv_heads && mean.size(1) == head_dim,
+                    "key_mean must be [num_kv_heads, head_dim] float32");
+        args.key_mean = mean.data_ptr<float>();
+    }
+    args.q_bf16 = q.data_ptr();
+    args.key_cache = kc.data_ptr();
+    args.value_cache = vc.data_ptr();
+    args.block_stride = kc.stride(0);
+    args.token_stride = kc.stride(1);
+    args.head_stride = kc.stride(2);
+    args.block_table = table.data_ptr<int>();
+    args.block_table_stride = static_cast<int>(table.stride(0));
+    args.block_size = static_cast<int>(kc.size(1));
+    args.prefix_len = lengths.data_ptr<int>();
     return fp4_attention_varlen_nvfp4_run(
         q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, cu_seqlens, cu_seqlens_padded,
         max_seqlen, out_tokens, causal, is_bf16, key_bias, out_global_scale, q_start, out_start, return_lse, out,
-        out_scales, lse);
+        out_scales, lse, &args);
 }
 
 static at::Tensor fp4_attention_mxfp4_packed(
@@ -1814,8 +1893,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("out") = pybind11::none(),
           pybind11::arg("out_scales") = pybind11::none(),
           pybind11::arg("lse") = pybind11::none(),
+          pybind11::arg("q_bf16") = pybind11::none(),
+          pybind11::arg("key_cache") = pybind11::none(),
+          pybind11::arg("value_cache") = pybind11::none(),
+          pybind11::arg("block_table") = pybind11::none(),
+          pybind11::arg("prefix_len") = pybind11::none(),
+          pybind11::arg("key_mean") = pybind11::none(),
           "Variable-length NVFP4 attention for the query rows from q_start on (keys before them come from a "
-          "cache), optionally with NVFP4 output and the log-sum-exp of each row");
+          "cache), optionally with NVFP4 output and the log-sum-exp of each row; with prefix_len, keys "
+          "0 .. prefix_len[seq] - 1 of each sequence are attended in bfloat16 from a paged cache after its FP4 keys");
     m.def("fp4_attention_single_query_nvfp4_packed", &fp4_attention_single_query_nvfp4_packed,
           pybind11::arg("q_packed"),
           pybind11::arg("k_packed"),

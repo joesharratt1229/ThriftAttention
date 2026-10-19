@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <float.h>
+#include <type_traits>
 
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
@@ -9,6 +10,7 @@
 #include <cuda_bf16.h>
 
 #include "thriftattention/sm120/cuda_common.cuh"
+#include "thriftattention/sm120/paged_bf16_prefix.h"
 
 // QK^T -> causal mask -> online softmax -> FP4-pack P
 // VARLEN: keys at or past kv_valid (the end of the sequence) are masked, and key_bias (if not null) adds one value
@@ -589,6 +591,190 @@ __device__ __forceinline__ void store_nvfp4_output_group(
     }
 }
 
+// One tile of PREFIX_KV 16-bit prefix keys, from key k0 on, copied from the paged cache into shared memory at buf (K
+// rows, then V rows, HEAD_DIM bfloat16 each, swizzled) as one cp.async group; keys past prefix_len are zero-filled
+// (P is zero there, and V must be finite).
+template<int HEAD_DIM, int TB_SIZE, int PREFIX_KV>
+__device__ __forceinline__ void paged_prefix_load_tile(
+    const PagedBf16PrefixArgs& prefix_args, const int* table, int kv_head, int prefix_len, int k0, uint32_t buf,
+    int tid)
+{
+    constexpr int ROW_BYTES = HEAD_DIM * 2;
+    constexpr int CHUNKS = ROW_BYTES / 16;
+    const auto* key_cache = reinterpret_cast<const __nv_bfloat16*>(prefix_args.key_cache);
+    const auto* value_cache = reinterpret_cast<const __nv_bfloat16*>(prefix_args.value_cache);
+    for (int i = tid; i < PREFIX_KV * CHUNKS; i += TB_SIZE) {
+        const int j = i / CHUNKS;
+        const int chunk = i % CHUNKS;
+        const int key = k0 + j;
+        const bool inside = key < prefix_len;
+        const int block = inside ? __ldg(table + key / prefix_args.block_size) : 0;
+        const int64_t offset = static_cast<int64_t>(block) * prefix_args.block_stride
+                             + static_cast<int64_t>(inside ? key % prefix_args.block_size : 0)
+                               * prefix_args.token_stride
+                             + static_cast<int64_t>(kv_head) * prefix_args.head_stride + chunk * 8;
+        const uint32_t k_dst = ta_swizzle<ROW_BYTES>(buf + j * ROW_BYTES + chunk * 16);
+        const uint32_t v_dst = ta_swizzle<ROW_BYTES>(buf + (PREFIX_KV + j) * ROW_BYTES + chunk * 16);
+        const int bytes = inside ? 16 : 0;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+            :: "r"(k_dst), "l"(key_cache + offset), "r"(bytes));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+            :: "r"(v_dst), "l"(value_cache + offset), "r"(bytes));
+    }
+    asm volatile("cp.async.commit_group;");
+}
+
+// The bfloat16 prefix keys of one sequence for the WARP_Q = 16 query rows of a warp, after the FP4 keys:
+// S = Q16 K16^T in bfloat16 MMAs, brought to the FP4 logits' frame and scaled, folded into the running rowmax, rowsum
+// and O_rmem as the FP4 loop folds its blocks, with P packed in bfloat16 times FP4_RANGE so that O_rmem keeps the FP4
+// loop's units. Tiles of PREFIX_KV keys alternate between two shared-memory buffers: buf0, which the caller filled
+// with tile 0 before the FP4 loop (paged_prefix_load_tile), and buf1, the FP4 loop's memory, free once every warp has
+// left that loop; each tile's copy runs while the previous tile is computed. Key blocks past prefix_len are skipped.
+template<int HEAD_DIM, int TB_SIZE, int PREFIX_KV>
+__device__ __forceinline__ void paged_prefix_attend(
+    float (&rowmax)[1][2], float (&rowsum)[1][2], float (&O_rmem)[1][HEAD_DIM / 8][4],
+    const PagedBf16PrefixArgs& prefix_args, const int* table, int prefix_len, int q_head, int kv_head, int num_q_heads,
+    int out_base, int row_upper, int row_lower, bool valid_upper, bool valid_lower, uint32_t buf0, uint32_t buf1,
+    int tid, int lane_id, float softmax_scale)
+{
+    using Traits = PrecisionTraits<__nv_bfloat16>;
+    constexpr int MMA_N = 8;
+    constexpr int MMA_K = 16;
+    constexpr int ROW_BYTES = HEAD_DIM * 2;
+    constexpr int N_TILES = PREFIX_KV / MMA_N;
+    constexpr float FP4_RANGE = 448.0f * 6.0f;
+
+    // the warp's 16-bit Q as m16n8k16 A fragments (row lane / 4 and + 8, columns 2 * (lane % 4) + {0, 1} and + 8 of
+    // each 16 columns), zero for rows that are not written; and q . key_mean for the two rows (0 without key_mean)
+    uint32_t Q16[HEAD_DIM / MMA_K][4];
+    float shift[2] = {0.0f, 0.0f};
+    const auto* q_bf16 = reinterpret_cast<const __nv_bfloat16*>(prefix_args.q_bf16);
+    const __nv_bfloat16* q_upper =
+        q_bf16 + (static_cast<int64_t>(out_base + row_upper) * num_q_heads + q_head) * HEAD_DIM;
+    const __nv_bfloat16* q_lower =
+        q_bf16 + (static_cast<int64_t>(out_base + row_lower) * num_q_heads + q_head) * HEAD_DIM;
+    const float* key_mean = prefix_args.key_mean == nullptr ? nullptr : prefix_args.key_mean + kv_head * HEAD_DIM;
+    const int col_base = (lane_id % 4) * 2;
+    for (int d = 0; d < HEAD_DIM / MMA_K; d++) {
+        const int col0 = d * MMA_K + col_base;
+        const int col1 = col0 + 8;
+        Q16[d][0] = valid_upper ? *reinterpret_cast<const uint32_t*>(q_upper + col0) : 0u;
+        Q16[d][1] = valid_lower ? *reinterpret_cast<const uint32_t*>(q_lower + col0) : 0u;
+        Q16[d][2] = valid_upper ? *reinterpret_cast<const uint32_t*>(q_upper + col1) : 0u;
+        Q16[d][3] = valid_lower ? *reinterpret_cast<const uint32_t*>(q_lower + col1) : 0u;
+        const float2 u0 = Traits::to_float2(*reinterpret_cast<const Traits::vec2*>(&Q16[d][0]));
+        const float2 l0 = Traits::to_float2(*reinterpret_cast<const Traits::vec2*>(&Q16[d][1]));
+        const float2 u1 = Traits::to_float2(*reinterpret_cast<const Traits::vec2*>(&Q16[d][2]));
+        const float2 l1 = Traits::to_float2(*reinterpret_cast<const Traits::vec2*>(&Q16[d][3]));
+        if (key_mean != nullptr) {
+            const float k00 = __ldg(key_mean + col0), k01 = __ldg(key_mean + col0 + 1);
+            const float k10 = __ldg(key_mean + col1), k11 = __ldg(key_mean + col1 + 1);
+            shift[0] += u0.x * k00 + u0.y * k01 + u1.x * k10 + u1.y * k11;
+            shift[1] += l0.x * k00 + l0.y * k01 + l1.x * k10 + l1.y * k11;
+        }
+    }
+    for (int r = 0; r < 2; r++) {
+        shift[r] += __shfl_xor_sync(0xFFFFFFFF, shift[r], 1);
+        shift[r] += __shfl_xor_sync(0xFFFFFFFF, shift[r], 2);
+    }
+
+    const uint32_t K_lane = ((lane_id % 8) * HEAD_DIM + (lane_id / 8) * 8) * 2;
+    const uint32_t V_lane = (PREFIX_KV * HEAD_DIM + (lane_id % 16) * HEAD_DIM + (lane_id / 16) * 8) * 2;
+    const int tiles = ta_cdiv(prefix_len, PREFIX_KV);
+    __syncthreads();  // every warp has left the FP4 loop, whose memory buf1 is
+    for (int t = 0; t < tiles; t++) {
+        const int k0 = t * PREFIX_KV;
+        const uint32_t buf = t % 2 == 0 ? buf0 : buf1;
+        if (t + 1 < tiles) {  // the next tile into the other buffer, which tile t - 1 was read from before the barrier
+            paged_prefix_load_tile<HEAD_DIM, TB_SIZE, PREFIX_KV>(
+                prefix_args, table, kv_head, prefix_len, k0 + PREFIX_KV, t % 2 == 0 ? buf1 : buf0, tid);
+            asm volatile("cp.async.wait_group 1;");
+        } else {
+            asm volatile("cp.async.wait_group 0;");
+        }
+        __syncthreads();
+        const uint32_t K_ld_base = ta_swizzle<ROW_BYTES>(buf + K_lane);
+        const uint32_t V_ld_base = ta_swizzle<ROW_BYTES>(buf + V_lane);
+
+        // S = Q16 K16^T over the 8-key blocks that hold prefix keys
+        float S[N_TILES][4] = {};
+        for (int n = 0; n < N_TILES; n++) {
+            if (k0 + n * MMA_N >= prefix_len) break;
+            for (int d = 0; d < HEAD_DIM / MMA_K; d++) {
+                uint32_t K_frag[2];
+                uint32_t addr = K_ld_base + n * MMA_N * ROW_BYTES;
+                addr ^= d * MMA_K * 2;
+                ta_ldmatrix_x2(K_frag, addr);
+                Traits::mma(Q16[d], K_frag, S[n]);
+            }
+        }
+
+        // the FP4 logits' frame, scale, keys past the prefix masked; then the running softmax as in the FP4 loop
+        float this_rowmax[2] = {-FLT_MAX, -FLT_MAX};
+        for (int n = 0; n < N_TILES; n++) {
+            const int key0 = k0 + n * MMA_N + col_base;
+            const bool in0 = key0 < prefix_len;
+            const bool in1 = key0 + 1 < prefix_len;
+            S[n][0] = in0 ? (S[n][0] - shift[0]) * softmax_scale : -INFINITY;
+            S[n][1] = in1 ? (S[n][1] - shift[0]) * softmax_scale : -INFINITY;
+            S[n][2] = in0 ? (S[n][2] - shift[1]) * softmax_scale : -INFINITY;
+            S[n][3] = in1 ? (S[n][3] - shift[1]) * softmax_scale : -INFINITY;
+            this_rowmax[0] = max(this_rowmax[0], max(S[n][0], S[n][1]));
+            this_rowmax[1] = max(this_rowmax[1], max(S[n][2], S[n][3]));
+        }
+        for (int r = 0; r < 2; r++) {
+            this_rowmax[r] = max(this_rowmax[r], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[r], 1));
+            this_rowmax[r] = max(this_rowmax[r], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[r], 2));
+            this_rowmax[r] = max(this_rowmax[r], rowmax[0][r]);
+        }
+        const float rescale[2] = {__expf(rowmax[0][0] - this_rowmax[0]), __expf(rowmax[0][1] - this_rowmax[1])};
+        for (int d = 0; d < HEAD_DIM / MMA_N; d++) {
+            O_rmem[0][d][0] *= rescale[0];
+            O_rmem[0][d][1] *= rescale[0];
+            O_rmem[0][d][2] *= rescale[1];
+            O_rmem[0][d][3] *= rescale[1];
+        }
+        rowmax[0][0] = this_rowmax[0];
+        rowmax[0][1] = this_rowmax[1];
+
+        float this_rowsum[2] = {};
+        uint32_t P[N_TILES / 2][4];
+        for (int c = 0; c < N_TILES / 2; c++) {
+            float* r0 = S[2 * c];
+            float* r1 = S[2 * c + 1];
+            for (int i = 0; i < 4; i++) {
+                r0[i] = __expf(r0[i] - rowmax[0][i / 2]);
+                r1[i] = __expf(r1[i] - rowmax[0][i / 2]);
+            }
+            this_rowsum[0] += r0[0] + r0[1] + r1[0] + r1[1];
+            this_rowsum[1] += r0[2] + r0[3] + r1[2] + r1[3];
+            Traits::vec2* p = reinterpret_cast<Traits::vec2*>(P[c]);
+            p[0] = Traits::pack2(r0[0] * FP4_RANGE, r0[1] * FP4_RANGE);
+            p[1] = Traits::pack2(r0[2] * FP4_RANGE, r0[3] * FP4_RANGE);
+            p[2] = Traits::pack2(r1[0] * FP4_RANGE, r1[1] * FP4_RANGE);
+            p[3] = Traits::pack2(r1[2] * FP4_RANGE, r1[3] * FP4_RANGE);
+        }
+        for (int r = 0; r < 2; r++) {
+            this_rowsum[r] += __shfl_xor_sync(0xFFFFFFFF, this_rowsum[r], 1);
+            this_rowsum[r] += __shfl_xor_sync(0xFFFFFFFF, this_rowsum[r], 2);
+            rowsum[0][r] = rowsum[0][r] * rescale[r] + this_rowsum[r];
+        }
+
+        // O += P V16 over the 16-key blocks that hold prefix keys
+        for (int c = 0; c < N_TILES / 2; c++) {
+            if (k0 + c * MMA_K >= prefix_len) break;
+            for (int d = 0; d < HEAD_DIM / MMA_N; d++) {
+                uint32_t V_frag[2];
+                uint32_t addr = V_ld_base + c * MMA_K * ROW_BYTES;
+                addr ^= d * MMA_N * 2;
+                ta_ldmatrix_x2_trans(V_frag, addr);
+                Traits::mma(P[c], V_frag, O_rmem[0][d]);
+            }
+        }
+        __syncthreads();  // every warp is done with this buffer before the next iteration's copy overwrites it
+    }
+}
+
 // Variable-length self-attention over sequences packed along the token axis, one CTA per (sequence, query head,
 // query block). Every sequence starts at a multiple of 64 tokens in the FP4 inputs (cu_seqlens_padded):
 //   Q, S_Q: [num_q_heads, q_tokens, HEAD_DIM / 2], [num_q_heads, q_tokens, HEAD_DIM / 16]
@@ -604,9 +790,10 @@ __device__ __forceinline__ void store_nvfp4_output_group(
 // out_start (or null): per sequence, the output row of query row q_start (default: cu_seqlens + q_start).
 // lse_out (or null): [num_q_heads, out_tokens] floats at the rows' output indices, the natural log-sum-exp of each
 // written row's scaled logits as the kernel computes them, key_bias included (rowmax + log(rowsum)).
+// PAGED_PREFIX (bfloat16 only): the 16-bit prefix of PagedBf16PrefixArgs after the FP4 keys (paged_prefix_attend).
 template<typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
          int HEAD_DIM_2, int SCALE_DIM,
-         int NUM_WARPS, int WARP_Q, bool FP4_OUT = false>
+         int NUM_WARPS, int WARP_Q, bool FP4_OUT = false, bool PAGED_PREFIX = false>
 // Keeps the CTAs per SM that the 16-bit epilogue reaches (4 at head_dim 64, 3 at 128), which the FP4 epilogue
 // would otherwise lower.
 __launch_bounds__(NUM_WARPS * TA_WARP_SIZE, HEAD_DIM == 64 ? 4 : 3)
@@ -634,7 +821,8 @@ void fp4_attention_varlen_kernel(
     const int* q_start = nullptr,
     const int* out_start = nullptr,
     float* lse_out = nullptr,
-    int out_tokens = 0)
+    int out_tokens = 0,
+    PagedBf16PrefixArgs prefix_args = {})
 {
     using Traits = PrecisionTraits<T>;
     constexpr int TB_SIZE = NUM_WARPS * TA_WARP_SIZE;
@@ -732,6 +920,22 @@ void fp4_attention_varlen_kernel(
         }
     }
 
+    // ---- the bfloat16 prefix's first tile (paged_prefix_attend), issued before the FP4 loop's first K/V copy ----
+    // buf0 lies past the FP4 loop's shared memory, which paged_prefix_attend reuses as buf1 afterwards
+    constexpr int PREFIX_KV = 32;
+    int prefix_len = 0;
+    const int* prefix_table = nullptr;
+    uint32_t prefix_buf0 = 0;
+    if constexpr (PAGED_PREFIX) {
+        static_assert(WARP_Q == 16, "paged_prefix_attend holds one m16 tile per warp");
+        prefix_len = prefix_args.prefix_len[seq];
+        prefix_table = prefix_args.block_table + static_cast<int64_t>(seq) * prefix_args.block_table_stride;
+        prefix_buf0 = __cvta_generic_to_shared(smem) + 2 * PREFIX_KV * HEAD_DIM * 2;
+        if (prefix_len > 0)
+            paged_prefix_load_tile<HEAD_DIM, TB_SIZE, PREFIX_KV>(
+                prefix_args, prefix_table, kv_head, prefix_len, 0, prefix_buf0, tid);
+    }
+
     // ---- KV loop over the keys of this sequence ----
     __syncthreads();
 
@@ -793,6 +997,16 @@ void fp4_attention_varlen_kernel(
 
         V  += BLOCK_KV / 2;
         S_V += BLOCK_KV / 16;
+    }
+
+    if constexpr (PAGED_PREFIX) {
+        if (prefix_len > 0)  // the same for every thread of the CTA, so its barriers are uniform
+            paged_prefix_attend<HEAD_DIM, TB_SIZE, PREFIX_KV>(
+                rowmax, rowsum, O_rmem, prefix_args, prefix_table, prefix_len, q_head, kv_head, num_q_heads, out_base,
+                q_row_upper_global, q_row_lower_global,
+                q_row_upper_global >= first_row && q_row_upper_global < seq_len,
+                q_row_lower_global >= first_row && q_row_lower_global < seq_len,
+                prefix_buf0, __cvta_generic_to_shared(smem), tid, lane_id, softmax_scale);
     }
 
     constexpr float FP4_RANGE_INV = 1.0f / (448.0f * 6.0f);
@@ -1153,7 +1367,8 @@ static void launch_fp4_attention_varlen(
     const float* key_bias, T* O, const int* cu_seqlens, const int* cu_seqlens_padded,
     int num_seqs, int max_seqlen, int q_tokens, int k_tokens, int v_tokens,
     int num_q_heads, int num_kv_heads, uint8_t* O_fp4, uint8_t* O_sf, const float* out_global_scale,
-    const int* q_start, const int* out_start, float* lse_out, int out_tokens, cudaStream_t stream) {
+    const int* q_start, const int* out_start, float* lse_out, int out_tokens, cudaStream_t stream,
+    const PagedBf16PrefixArgs& prefix_args = {}) {
 
     constexpr int HEAD_DIM_2 = HEAD_DIM / 2;
     constexpr int SCALE_DIM = HEAD_DIM / 16;
@@ -1176,6 +1391,27 @@ static void launch_fp4_attention_varlen(
     constexpr int smem_size = q_phase_smem + v_phase_smem > k_phase_smem
                             ? q_phase_smem + v_phase_smem : k_phase_smem;
 
+    if (prefix_args.prefix_len != nullptr) {  // the same kernel, with the prefix's key tiles in shared memory
+        // the bindings allow the prefix for causal bfloat16 attention only
+        if constexpr (std::is_same_v<T, __nv_bfloat16> && CAUSAL) {
+            // two buffers of K and V tiles of 32 bfloat16 keys: buf1 over the FP4 loop's memory, buf0 past it
+            constexpr int prefix_buf = 2 * 32 * HEAD_DIM * 2;
+            static_assert(smem_size <= prefix_buf, "the FP4 loop's memory must fit in buf1");
+            constexpr int prefix_smem_size = 2 * prefix_buf;
+            auto kernel = O_fp4 != nullptr
+                ? fp4_attention_varlen_kernel<T, CAUSAL, BLOCK_Q, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM,
+                                              NUM_WARPS, WARP_Q, true, true>
+                : fp4_attention_varlen_kernel<T, CAUSAL, BLOCK_Q, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM,
+                                              NUM_WARPS, WARP_Q, false, true>;
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, prefix_smem_size);
+            kernel<<<num_blocks, TB_SIZE, prefix_smem_size, stream>>>(
+                Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
+                q_tokens, k_tokens, v_tokens, max_q_blocks, num_q_heads, num_kv_heads, O_fp4, O_sf,
+                out_global_scale, q_start, out_start, lse_out, out_tokens, prefix_args);
+        }
+        return;
+    }
+
     auto kernel = O_fp4 != nullptr
         ? fp4_attention_varlen_kernel<T, CAUSAL, BLOCK_Q, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM,
                                       NUM_WARPS, WARP_Q, true>
@@ -1186,7 +1422,7 @@ static void launch_fp4_attention_varlen(
     kernel<<<num_blocks, TB_SIZE, smem_size, stream>>>(
         Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
         q_tokens, k_tokens, v_tokens, max_q_blocks, num_q_heads, num_kv_heads, O_fp4, O_sf, out_global_scale,
-        q_start, out_start, lse_out, out_tokens);
+        q_start, out_start, lse_out, out_tokens, PagedBf16PrefixArgs{});
 }
 
 template<typename T, bool CAUSAL>
@@ -1311,7 +1547,7 @@ static void fp4_attention_varlen_nvfp4_typed(
     int num_seqs, int max_seqlen, int q_tokens, int k_tokens, int v_tokens,
     int num_q_heads, int num_kv_heads, int head_dim, uint8_t* O_fp4, uint8_t* O_sf,
     const float* out_global_scale, const int* q_start, const int* out_start, float* lse_out, int out_tokens,
-    cudaStream_t stream) {
+    cudaStream_t stream, const PagedBf16PrefixArgs& prefix_args) {
     auto Q = reinterpret_cast<const __nv_fp4x2_e2m1*>(Q_raw);
     auto K = reinterpret_cast<const __nv_fp4x2_e2m1*>(K_raw);
     auto V = reinterpret_cast<const __nv_fp4x2_e2m1*>(V_raw);
@@ -1323,12 +1559,12 @@ static void fp4_attention_varlen_nvfp4_typed(
         launch_fp4_attention_varlen<T, CAUSAL, 64>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
             num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads,
-            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream);
+            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream, prefix_args);
     } else {
         launch_fp4_attention_varlen<T, CAUSAL, 128>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
             num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads,
-            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream);
+            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream, prefix_args);
     }
 }
 
@@ -1339,26 +1575,28 @@ void fp4_attention_varlen_nvfp4(
     int num_seqs, int max_seqlen, int q_tokens, int k_tokens, int v_tokens,
     int num_q_heads, int num_kv_heads, int head_dim, bool causal, bool is_bf16,
     uint8_t* O_fp4, uint8_t* O_sf, const float* out_global_scale,
-    const int* q_start, const int* out_start, float* lse_out, int out_tokens, cudaStream_t stream) {
+    const int* q_start, const int* out_start, float* lse_out, int out_tokens, cudaStream_t stream,
+    const PagedBf16PrefixArgs* paged_prefix) {
+    const PagedBf16PrefixArgs prefix_args = paged_prefix != nullptr ? *paged_prefix : PagedBf16PrefixArgs{};
     if (is_bf16 && causal) {
         fp4_attention_varlen_nvfp4_typed<__nv_bfloat16, true>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
             num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, head_dim,
-            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream);
+            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream, prefix_args);
     } else if (is_bf16) {
         fp4_attention_varlen_nvfp4_typed<__nv_bfloat16, false>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
             num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, head_dim,
-            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream);
+            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream, prefix_args);
     } else if (causal) {
         fp4_attention_varlen_nvfp4_typed<half, true>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
             num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, head_dim,
-            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream);
+            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream, prefix_args);
     } else {
         fp4_attention_varlen_nvfp4_typed<half, false>(
             Q, K, V, S_Q, S_K, S_V, key_bias, O, cu_seqlens, cu_seqlens_padded,
             num_seqs, max_seqlen, q_tokens, k_tokens, v_tokens, num_q_heads, num_kv_heads, head_dim,
-            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream);
+            O_fp4, O_sf, out_global_scale, q_start, out_start, lse_out, out_tokens, stream, prefix_args);
     }
 }
