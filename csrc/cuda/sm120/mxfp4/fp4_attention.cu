@@ -453,6 +453,8 @@ void fp4_attention_hd256_kernel(
 
         // Prefetch next tile, then wait for the tile issued last iteration.
         const uint32_t nxt_buf_off = KV_BUF_BYTES - cur_buf_off;
+        // every warp has finished reading the tile this copy overwrites
+        __syncthreads();
         if (kv_iter + 1 < num_kv_iters) {
             start_kv_load(nxt_buf_off, kv_iter + 1);
             asm volatile("cp.async.wait_group 1;");
@@ -653,6 +655,8 @@ void fp4_attention_kernel(
         ta_gmem_to_smem<BLOCK_KV, HEAD_DIM_2, TB_SIZE, __nv_fp4x2_e2m1>(K_smem, K, tid, HEAD_DIM_2);
         ta_load_scales<BLOCK_KV, SCALE_DIM, TB_SIZE, __nv_fp8_e8m0>(K_sf_smem, S_K, SCALE_DIM, tid);
         asm volatile("cp.async.commit_group;");
+        // every warp has finished reading the tile this copy overwrites
+        __syncthreads();
         ta_gmem_to_smem<HEAD_DIM, BLOCK_KV / 2, TB_SIZE, __nv_fp4x2_e2m1>(V_smem, V, tid, v_kv / 2);
         ta_load_scales<HEAD_DIM, BLOCK_KV / 32, TB_SIZE, __nv_fp8_e8m0>(V_sf_smem, S_V, v_kv / 32, tid);
         asm volatile("cp.async.commit_group;");
