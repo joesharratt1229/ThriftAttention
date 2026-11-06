@@ -80,13 +80,16 @@ def _check_build_prerequisites() -> None:
     if toolkit_cuda_version != torch_cuda_version:
         torch_cuda_text = ".".join(str(part) for part in torch_cuda_version)
         toolkit_cuda_text = ".".join(str(part) for part in toolkit_cuda_version)
-        raise RuntimeError(
-            "ThriftAttention builds PyTorch CUDA extensions and requires the local "
-            "CUDA toolkit to match the installed PyTorch CUDA wheel. "
-            f"Found nvcc CUDA {toolkit_cuda_text}, but torch was built with "
-            f"CUDA {torch_cuda_text}. Set CUDA_HOME to a matching toolkit, or "
-            "install a PyTorch wheel matching your local CUDA toolkit."
-        )
+        # Another minor release of the same major one works (CUDA minor version compatibility),
+        # as in torch.utils.cpp_extension, which warns about the difference.
+        if toolkit_cuda_version[0] != torch_cuda_version[0]:
+            raise RuntimeError(
+                "ThriftAttention builds PyTorch CUDA extensions and requires the local "
+                "CUDA toolkit to have the major version of the installed PyTorch CUDA wheel. "
+                f"Found nvcc CUDA {toolkit_cuda_text}, but torch was built with "
+                f"CUDA {torch_cuda_text}. Set CUDA_HOME to a matching toolkit, or "
+                "install a PyTorch wheel matching your local CUDA toolkit."
+            )
 
 
 _check_build_prerequisites()
