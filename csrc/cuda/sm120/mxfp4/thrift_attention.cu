@@ -142,13 +142,12 @@ void thrift_attention_kernel(
         : total_kv_iters;
 
 
-    constexpr int TOPK_UNIT_TOKENS = 64;
-    constexpr int TOPK_UNITS_PER_ITER = BLOCK_KV_FP4 / TOPK_UNIT_TOKENS;
-    static_assert(BLOCK_KV_FP4 == 64 || BLOCK_KV_FP4 == 128,
-                  "attention top-k bitset assumes 64-token top-k units");
-    const int total_topk_units = ta_cdiv(kv_len, TOPK_UNIT_TOKENS);
+    // One bit per selected KV block of BLOCK_KV_FP4 tokens, the unit in which the FP16 pass reads selected_blocks
+    // (functional.py selects 128-token blocks for the head_dim 256 kernels).
+    static_assert(BLOCK_KV_FP4 == 64 || BLOCK_KV_FP4 == 128, "unsupported FP4 KV block");
+    const int total_topk_units = ta_cdiv(kv_len, BLOCK_KV_FP4);
 
-    constexpr int MAX_KV_BLOCK_WORDS = 32;  // 2048 * 64 tokens
+    constexpr int MAX_KV_BLOCK_WORDS = 32;  // 2048 FP4 KV blocks
     const int num_kv_words = min(min(ta_cdiv(total_topk_units, 64), topk_word_count), MAX_KV_BLOCK_WORDS);
     __shared__ unsigned long long topk_mask[MAX_KV_BLOCK_WORDS];
     if (tid < MAX_KV_BLOCK_WORDS) {
@@ -184,14 +183,8 @@ void thrift_attention_kernel(
     const int k_col_base  = (lane_id % 4) * 2;
 
     for (int kv_iter = 0; kv_iter < num_kv_iters; kv_iter++) {
-        bool is_topk = false;
-        #pragma unroll
-        for (int u = 0; u < TOPK_UNITS_PER_ITER; u++) {
-            const int topk_unit = kv_iter * TOPK_UNITS_PER_ITER + u;
-            const int topk_word = topk_unit >> 6;
-            is_topk |= (topk_word < MAX_KV_BLOCK_WORDS) &&
-                       ((topk_mask[topk_word] >> (topk_unit & 63)) & 1ULL);
-        }
+        const int topk_word = kv_iter >> 6;
+        const bool is_topk = topk_word < MAX_KV_BLOCK_WORDS && ((topk_mask[topk_word] >> (kv_iter & 63)) & 1ULL);
         const int k_block_start = kv_iter * BLOCK_KV_FP4;
         const bool needs_causal_mask = CAUSAL && ((k_block_start + BLOCK_KV_FP4 - 1) > q_block_start);
 
