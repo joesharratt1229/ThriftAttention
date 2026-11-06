@@ -109,17 +109,25 @@ void fp4_qk_softmax_pack(
                 for (int reg_id = 0; reg_id < 4; reg_id++)
                     S_rmem[mma_id_q][mma_id_kv][reg_id] *= softmax_scale;
 
-            // rowmax over this KV block
+            // rowmax through the logit maxima of the groups of 32 that share a P scale (the 8-key blocks
+            // 4g..4g+3, which the four lanes of each quad hold)
+            float group_max[BLOCK_KV / MMA_N / 4][2];
             float this_rowmax[2] = {-FLT_MAX, -FLT_MAX};
-            for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
-                float *regs = S_rmem[mma_id_q][mma_id_kv];
-                this_rowmax[0] = max(this_rowmax[0], max(regs[0], regs[1]));
-                this_rowmax[1] = max(this_rowmax[1], max(regs[2], regs[3]));
+            for (int g = 0; g < BLOCK_KV / MMA_N / 4; g++) {
+                group_max[g][0] = -FLT_MAX;
+                group_max[g][1] = -FLT_MAX;
+                for (int t = 4 * g; t < 4 * g + 4; t++) {
+                    const float *regs = S_rmem[mma_id_q][t];
+                    group_max[g][0] = max(group_max[g][0], max(regs[0], regs[1]));
+                    group_max[g][1] = max(group_max[g][1], max(regs[2], regs[3]));
+                }
+                for (int lanes = 1; lanes < 4; lanes *= 2) {
+                    group_max[g][0] = max(group_max[g][0], __shfl_xor_sync(0xFFFFFFFF, group_max[g][0], lanes));
+                    group_max[g][1] = max(group_max[g][1], __shfl_xor_sync(0xFFFFFFFF, group_max[g][1], lanes));
+                }
+                this_rowmax[0] = max(this_rowmax[0], group_max[g][0]);
+                this_rowmax[1] = max(this_rowmax[1], group_max[g][1]);
             }
-            this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[0], 1));
-            this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[0], 2));
-            this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[1], 1));
-            this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[1], 2));
 
             // new rowmax
             this_rowmax[0] = max(this_rowmax[0], rowmax[mma_id_q][0]);
@@ -168,36 +176,22 @@ void fp4_qk_softmax_pack(
             float sf_P_upper[BLOCK_KV / MMA_N / 4];
             float sf_P_lower[BLOCK_KV / MMA_N / 4];
 
-            for (int blk = 0; blk < BLOCK_KV / MMA_N / 4; blk++) {
-                const int t0 = 4 * blk;
-                const int t1 = t0 + 1;
-                const int t2 = t0 + 2;
-                const int t3 = t0 + 3;
-                const float gmax_upper = rowmax[mma_id_q][0];
-                const float gmax_lower = rowmax[mma_id_q][1];
-                const bool valid_upper = gmax_upper > -FLT_MAX * 0.5f;
-                const bool valid_lower = gmax_lower > -FLT_MAX * 0.5f;
-                const float inv_upper = valid_upper ? (FP4_MAX * __expf(rowmax[mma_id_q][0] - gmax_upper)) : 0.0f;
-                const float inv_lower = valid_lower ? (FP4_MAX * __expf(rowmax[mma_id_q][1] - gmax_lower)) : 0.0f;
-                sf_P_upper[blk] = valid_upper ? (FP4_RANGE / FP4_MAX * __expf(gmax_upper - rowmax[mma_id_q][0])) : 1.0f;
-                sf_P_lower[blk] = valid_lower ? (FP4_RANGE / FP4_MAX * __expf(gmax_lower - rowmax[mma_id_q][1])) : 1.0f;
-
-                S_rmem[mma_id_q][t0][0] *= inv_upper;
-                S_rmem[mma_id_q][t0][1] *= inv_upper;
-                S_rmem[mma_id_q][t1][0] *= inv_upper;
-                S_rmem[mma_id_q][t1][1] *= inv_upper;
-                S_rmem[mma_id_q][t0][2] *= inv_lower;
-                S_rmem[mma_id_q][t0][3] *= inv_lower;
-                S_rmem[mma_id_q][t1][2] *= inv_lower;
-                S_rmem[mma_id_q][t1][3] *= inv_lower;
-                S_rmem[mma_id_q][t2][0] *= inv_upper;
-                S_rmem[mma_id_q][t2][1] *= inv_upper;
-                S_rmem[mma_id_q][t3][0] *= inv_upper;
-                S_rmem[mma_id_q][t3][1] *= inv_upper;
-                S_rmem[mma_id_q][t2][2] *= inv_lower;
-                S_rmem[mma_id_q][t2][3] *= inv_lower;
-                S_rmem[mma_id_q][t3][2] *= inv_lower;
-                S_rmem[mma_id_q][t3][3] *= inv_lower;
+            // One UE8M0 scale per 32 probabilities: their largest, rounded up to the power of two it is stored
+            // as, so the values stay within FP4_MAX
+            for (int g = 0; g < BLOCK_KV / MMA_N / 4; g++) {
+                // the largest probability of the group, formed as the probabilities are
+                const float pmax_upper = __expf(group_max[g][0] - rowmax[mma_id_q][0]);
+                const float pmax_lower = __expf(group_max[g][1] - rowmax[mma_id_q][1]);
+                sf_P_upper[g] = pmax_upper > 0.0f ? ta_round_ue8m0_up(FP4_RANGE / FP4_MAX * pmax_upper) : 1.0f;
+                sf_P_lower[g] = pmax_lower > 0.0f ? ta_round_ue8m0_up(FP4_RANGE / FP4_MAX * pmax_lower) : 1.0f;
+                const float inv_upper = pmax_upper > 0.0f ? (FP4_RANGE / sf_P_upper[g]) : 0.0f;
+                const float inv_lower = pmax_lower > 0.0f ? (FP4_RANGE / sf_P_lower[g]) : 0.0f;
+                for (int t = 4 * g; t < 4 * g + 4; t++) {
+                    S_rmem[mma_id_q][t][0] *= inv_upper;
+                    S_rmem[mma_id_q][t][1] *= inv_upper;
+                    S_rmem[mma_id_q][t][2] *= inv_lower;
+                    S_rmem[mma_id_q][t][3] *= inv_lower;
+                }
             }
 
             for (int g = 0; g < BLOCK_KV / MMA_N / 4; g++) {

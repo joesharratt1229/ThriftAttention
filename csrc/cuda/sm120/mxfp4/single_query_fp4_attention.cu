@@ -513,8 +513,8 @@ void fp4_attention_single_query_kernel(
             amax_lower = max(amax_lower, __shfl_xor_sync(0xFFFFFFFF, amax_lower, 1));
             amax_lower = max(amax_lower, __shfl_xor_sync(0xFFFFFFFF, amax_lower, 2));
 
-            sf_P_upper[blk] = amax_upper / FP4_MAX;
-            sf_P_lower[blk] = amax_lower / FP4_MAX;
+            sf_P_upper[blk] = amax_upper > 0.0f ? ta_round_ue8m0_up(amax_upper / FP4_MAX) : 1.0f;
+            sf_P_lower[blk] = amax_lower > 0.0f ? ta_round_ue8m0_up(amax_lower / FP4_MAX) : 1.0f;
 
             float inv_upper = 1.0f / sf_P_upper[blk];
             float inv_lower = 1.0f / sf_P_lower[blk];
@@ -1025,8 +1025,8 @@ void fp4_attention_single_query_nosplit_kernel(
             amax_lower = max(amax_lower, __shfl_xor_sync(0xFFFFFFFF, amax_lower, 1));
             amax_lower = max(amax_lower, __shfl_xor_sync(0xFFFFFFFF, amax_lower, 2));
 
-            sf_P_upper[blk] = amax_upper / FP4_MAX;
-            sf_P_lower[blk] = amax_lower / FP4_MAX;
+            sf_P_upper[blk] = amax_upper > 0.0f ? ta_round_ue8m0_up(amax_upper / FP4_MAX) : 1.0f;
+            sf_P_lower[blk] = amax_lower > 0.0f ? ta_round_ue8m0_up(amax_lower / FP4_MAX) : 1.0f;
         }
 
         for (int blk = 0; blk < BLOCK_KV / MMA_N / 4; blk++) {
@@ -1468,8 +1468,8 @@ void fp4_attention_single_query_cta_kernel(
             amax_lower = max(amax_lower, __shfl_xor_sync(0xFFFFFFFF, amax_lower, 1));
             amax_lower = max(amax_lower, __shfl_xor_sync(0xFFFFFFFF, amax_lower, 2));
 
-            sf_P_upper[blk] = amax_upper / FP4_MAX;
-            sf_P_lower[blk] = amax_lower / FP4_MAX;
+            sf_P_upper[blk] = amax_upper > 0.0f ? ta_round_ue8m0_up(amax_upper / FP4_MAX) : 1.0f;
+            sf_P_lower[blk] = amax_lower > 0.0f ? ta_round_ue8m0_up(amax_lower / FP4_MAX) : 1.0f;
 
             float inv_upper = 1.0f / sf_P_upper[blk];
             float inv_lower = 1.0f / sf_P_lower[blk];

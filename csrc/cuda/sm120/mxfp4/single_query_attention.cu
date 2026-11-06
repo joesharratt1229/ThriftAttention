@@ -639,7 +639,7 @@ void compute_kv_fp4_sqmxfp4mix(
                 max(S_rmem[t3][0], S_rmem[t3][1])));
         amax_upper = max(amax_upper, __shfl_xor_sync(0xFFFFFFFF, amax_upper, 1));
         amax_upper = max(amax_upper, __shfl_xor_sync(0xFFFFFFFF, amax_upper, 2));
-        sf_P_upper[blk] = amax_upper / FP4_MAX;
+        sf_P_upper[blk] = amax_upper > 0.0f ? ta_round_ue8m0_up(amax_upper / FP4_MAX) : 1.0f;
         if constexpr (USE_LOWER_ROWS) {
             float amax_lower = max(
                 max(max(S_rmem[t0][2], S_rmem[t0][3]),
@@ -648,7 +648,7 @@ void compute_kv_fp4_sqmxfp4mix(
                     max(S_rmem[t3][2], S_rmem[t3][3])));
             amax_lower = max(amax_lower, __shfl_xor_sync(0xFFFFFFFF, amax_lower, 1));
             amax_lower = max(amax_lower, __shfl_xor_sync(0xFFFFFFFF, amax_lower, 2));
-            sf_P_lower[blk] = amax_lower / FP4_MAX;
+            sf_P_lower[blk] = amax_lower > 0.0f ? ta_round_ue8m0_up(amax_lower / FP4_MAX) : 1.0f;
         } else {
             sf_P_lower[blk] = 1.0f;
         }

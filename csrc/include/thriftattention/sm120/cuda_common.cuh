@@ -144,6 +144,13 @@ __device__ inline uint32_t ta_ld_shared_u16(uint32_t addr) {
     return static_cast<uint32_t>(value);
 }
 
+// The power of two at or above a positive scale: the value cvt.rp.satfinite.ue8m0x2 stores it as. Dividing by it
+// keeps every value within the E2M1 range.
+__device__ inline float ta_round_ue8m0_up(float x) {
+    const uint32_t bits = __float_as_uint(x);
+    return __uint_as_float(((bits >> 23) + ((bits & 0x7FFFFFu) != 0u)) << 23);
+}
+
 __device__ inline uint32_t ta_cvt_8xf32_to_e2m1_packed(
     float f0, float f1, float f2, float f3,
     float f4, float f5, float f6, float f7) {
@@ -166,10 +173,11 @@ __device__ inline uint32_t ta_cvt_8xf32_to_e2m1_packed(
     return packed;
 }
 
+// f0 goes to the upper byte and f1 to byte 0, as in ta_cvt_4xf32_to_e4m3_packed
 __device__ inline uint32_t ta_cvt_2xf32_to_e8m0_packed(float f0, float f1) {
     uint16_t packed;
     asm volatile(
-        "{cvt.rp.satfinite.ue8m0x2.f32 %0, %2, %1;}"
+        "{cvt.rp.satfinite.ue8m0x2.f32 %0, %1, %2;}"
         : "=h"(packed)
         : "f"(f0), "f"(f1));
     return static_cast<uint32_t>(packed);
