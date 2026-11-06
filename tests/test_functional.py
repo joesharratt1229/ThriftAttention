@@ -171,7 +171,59 @@ def test_sm120_backend_dispatches_fp4_noncausal_extension(monkeypatch):
     )
 
     assert out == "out"
-    assert calls == [("noncausal", ("qp", "kp", "vp", "qs", "ks", "vs", False))]
+    assert calls == [("noncausal", ("qp", "kp", "vp", "qs", "ks", "vs", False, False))]
+
+
+def test_sm120_backend_forwards_exp_approx_to_nvfp4_tiled_extensions(monkeypatch):
+    from thriftattention.backends import sm120 as sm120_backend
+
+    calls = []
+    q = torch.empty(1, 1, 64, 64)
+    k = torch.empty(1, 1, 64, 64)
+    v = torch.empty(1, 1, 64, 64)
+
+    ext = SimpleNamespace(
+        fp4_attention_causal_nvfp4_packed=lambda *args: calls.append(("fp4", args)) or "out",
+        thrift_attention_causal_nvfp4_packed=lambda *args: calls.append(("thrift", args)) or "out",
+    )
+    monkeypatch.setattr(sm120_backend, "check_qkv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sm120_backend, "require_block_aligned", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sm120_backend, "get_extension", lambda: ext)
+    backend = sm120_backend.Sm120Nvfp4Backend()
+
+    backend.attention(
+        q, k, v, selection=None, quant_format=FakeQuantFormat(),
+        config=AttentionConfig(method="fp4", exp_approx=True), is_bf16=False,
+    )
+    backend.attention(
+        q, k, v, selection="selected", quant_format=FakeQuantFormat(),
+        config=AttentionConfig(method="thrift", exp_approx=True), is_bf16=True,
+    )
+
+    assert calls == [
+        ("fp4", ("qp", "kp", "vp", "qs", "ks", "vs", False, True)),
+        ("thrift", (q, k, v, "selected", "qp", "kp", "vp", "qs", "ks", "vs", True, True)),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("quant_format", "head_dim", "message"),
+    [("mxfp4", 64, "NVFP4"), ("nvfp4", 256, "head_dim 256")],
+)
+def test_sm120_backend_rejects_exp_approx_outside_its_kernels(monkeypatch, quant_format, head_dim, message):
+    from thriftattention.backends import sm120 as sm120_backend
+
+    q = torch.empty(1, 1, 128, head_dim)
+    k = torch.empty(1, 1, 128, head_dim)
+    v = torch.empty(1, 1, 128, head_dim)
+    monkeypatch.setattr(sm120_backend, "check_qkv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sm120_backend, "get_extension", lambda: pytest.fail("no kernel should run"))
+
+    with pytest.raises(NotImplementedError, match=message):
+        sm120_backend.Sm120Nvfp4Backend().attention(
+            q, k, v, selection=None, quant_format=FakeQuantFormat(quant_format),
+            config=AttentionConfig(method="fp4", exp_approx=True), is_bf16=False,
+        )
 
 
 def test_sm120_backend_dispatches_fp4_mxfp4_extension(monkeypatch):
@@ -287,7 +339,7 @@ def test_sm120_backend_forwards_bf16_to_quantizer_and_extension(monkeypatch):
             return "qp", "kp", "vp", "qs", "ks", "vs"
 
     def fake_noncausal(*args):
-        calls.append(("noncausal", args[-1]))
+        calls.append(("noncausal", args[-2]))
         return "out"
 
     ext = SimpleNamespace(fp4_attention_noncausal_nvfp4_packed=fake_noncausal)
