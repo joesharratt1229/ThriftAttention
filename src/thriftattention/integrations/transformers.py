@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 import torch
+import torch.nn.functional as F
 
 from ..config import (
     AttentionBackendName,
@@ -183,7 +184,11 @@ def thriftattention_forward(
         output = cached_prefill_attention(query, cache, int(layer_idx), config)
         return output.transpose(1, 2).contiguous(), None
 
-    rejection = _fast_path_rejection_reason(module, query, key, value, attention_mask, config, kwargs)
+    padding = _causal_prefill_padding(query, key, attention_mask, config)
+    padded = (query, key, value)
+    if padding:
+        padded = tuple(F.pad(tensor, (0, 0, 0, padding)) for tensor in padded)
+    rejection = _fast_path_rejection_reason(module, *padded, attention_mask, config, kwargs)
     if rejection is not None:
         return _fallback_attention(
             module,
@@ -196,8 +201,38 @@ def thriftattention_forward(
             **kwargs,
         )
 
-    output = thrift_attention(query, key, value, config=config)
+    output = thrift_attention(*padded, config=config)
+    if padding:
+        output = output[:, :, :-padding]
     return output.transpose(1, 2).contiguous(), None
+
+
+def _causal_prefill_padding(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    config: AttentionConfig,
+) -> int:
+    """Zero rows to append so that a causal prefill without a mask covers whole blocks.
+
+    The rows come after every real token, so the causal mask hides them from all real queries.
+    Non-causal calls, calls with a mask or an active ThriftAttentionCache (which pads with
+    pad_to_block) and calls whose query and key lengths differ are left as they are.
+    """
+    if not config.causal or attention_mask is not None:
+        return 0
+    if get_active_thriftattention_cache() is not None:
+        return 0
+    if not isinstance(query, torch.Tensor) or not isinstance(key, torch.Tensor):
+        return 0
+    if query.ndim != 4 or key.ndim != 4:
+        return 0
+    length = query.shape[2]
+    if length <= 1 or key.shape[2] != length:
+        return 0
+    # the SM120 backend's blocks: 128 for head_dim 256, else 64 for Q and block_size for K/V
+    block = 128 if query.shape[-1] == 256 else math.lcm(64, config.block_size)
+    return (-length) % block
 
 
 def _register_transformers_attention_impl(name: str, config: AttentionConfig) -> None:

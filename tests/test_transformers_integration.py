@@ -275,3 +275,117 @@ def test_adapter_fast_path_passes_noncausal_mode(monkeypatch):
 
     assert output.shape == (1, 64, 2, 64)
     assert weights is None
+
+
+def test_adapter_pads_unaligned_causal_prefill(monkeypatch):
+    from thriftattention.integrations import transformers as hf
+
+    _stub_attention_registry(monkeypatch, hf)
+    hf.register_transformers_attention(hf.TransformersAttentionConfig(name="unit_unaligned_prefill"))
+    module = SimpleNamespace(
+        config=SimpleNamespace(_attn_implementation="unit_unaligned_prefill"),
+        training=False,
+        is_causal=True,
+    )
+    query = torch.randn(1, 2, 100, 64)
+    key = torch.randn(1, 2, 100, 64)
+    value = torch.randn(1, 2, 100, 64)
+    seen = {}
+
+    def fake_attention(q, k, v, **kwargs):
+        seen["shapes"] = (q.shape, k.shape, v.shape)
+        assert torch.equal(q[:, :, :100], query) and torch.count_nonzero(q[:, :, 100:]) == 0
+        assert torch.equal(k[:, :, :100], key) and torch.count_nonzero(k[:, :, 100:]) == 0
+        return torch.arange(q.numel(), dtype=torch.float32).reshape(q.shape)
+
+    monkeypatch.setattr(hf, "_fast_path_rejection_reason", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hf, "thrift_attention", fake_attention)
+
+    output, weights = hf.thriftattention_forward(module, query, key, value, None, scaling=64**-0.5)
+
+    assert seen["shapes"] == ((1, 2, 128, 64),) * 3
+    expected = torch.arange(1 * 2 * 128 * 64, dtype=torch.float32).reshape(1, 2, 128, 64)[:, :, :100]
+    assert torch.equal(output, expected.transpose(1, 2))
+    assert weights is None
+
+
+def test_causal_prefill_padding_only_for_unmasked_causal_self_attention():
+    from thriftattention.integrations import transformers as hf
+
+    causal = AttentionConfig(method="fp4", causal=True, fraction=None)
+    noncausal = AttentionConfig(method="fp4", causal=False, fraction=None)
+    query = torch.randn(1, 2, 100, 64)
+    key = torch.randn(1, 2, 100, 64)
+
+    assert hf._causal_prefill_padding(query, key, None, causal) == 28
+    assert hf._causal_prefill_padding(query[:, :, :64], key[:, :, :64], None, causal) == 0
+    assert hf._causal_prefill_padding(query, key, None, noncausal) == 0
+    assert hf._causal_prefill_padding(query, key, torch.ones(1, 1, 100, 100, dtype=torch.bool), causal) == 0
+    assert hf._causal_prefill_padding(query[:, :, :1], key, None, causal) == 0
+    assert hf._causal_prefill_padding(query, torch.randn(1, 2, 128, 64), None, causal) == 0
+    hd256 = torch.randn(1, 2, 100, 256)
+    assert hf._causal_prefill_padding(hd256, hd256, None, causal) == 28
+    assert hf._causal_prefill_padding(hd256[:, :, :64], hd256[:, :, :64], None, causal) == 64
+
+
+def test_causal_prefill_padding_leaves_an_active_cache_to_pad_to_block(monkeypatch):
+    from thriftattention.integrations import transformers as hf
+
+    monkeypatch.setattr(hf, "get_active_thriftattention_cache", lambda: object())
+    query = torch.randn(1, 2, 100, 64)
+    config = AttentionConfig(method="fp4", causal=True, fraction=None)
+
+    assert hf._causal_prefill_padding(query, query, None, config) == 0
+
+
+def test_rejected_unaligned_prefill_falls_back_on_the_unpadded_inputs(monkeypatch):
+    from thriftattention.integrations import transformers as hf
+
+    _stub_attention_registry(monkeypatch, hf)
+    hf.register_transformers_attention(hf.TransformersAttentionConfig(name="unit_unaligned_fallback"))
+    module = SimpleNamespace(
+        config=SimpleNamespace(_attn_implementation="unit_unaligned_fallback"),
+        training=False,
+        is_causal=True,
+    )
+    query, key, value = (torch.randn(1, 2, 100, 64) for _ in range(3))
+    seen = {}
+
+    def fake_fallback(module, q, k, v, attention_mask, **kwargs):
+        seen["inputs"] = (q, k, v)
+        return q.transpose(1, 2), None
+
+    monkeypatch.setattr(hf, "_fast_path_rejection_reason", lambda *args, **kwargs: "rejected")
+    monkeypatch.setattr(hf, "_fallback_attention", fake_fallback)
+
+    hf.thriftattention_forward(module, query, key, value, None, scaling=64**-0.5)
+
+    assert all(a is b for a, b in zip(seen["inputs"], (query, key, value)))
+
+
+# thrift at head_dim 256 is left to the block-sparse kernels' own tests
+@pytest.mark.parametrize(
+    ("method", "head_dim"), [("fp4", 64), ("fp4", 128), ("fp4", 256), ("thrift", 64), ("thrift", 128)]
+)
+@pytest.mark.parametrize("length", [100, 192])
+def test_unaligned_causal_prefill_matches_sdpa(monkeypatch, method, head_dim, length):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (12, 0):
+        pytest.skip("SM120 CUDA device required")
+    from thriftattention.integrations import transformers as hf
+
+    _stub_attention_registry(monkeypatch, hf)
+    name = f"unit_unaligned_{method}"
+    hf.register_transformers_attention(hf.TransformersAttentionConfig(name=name, method=method))
+    module = SimpleNamespace(config=SimpleNamespace(_attn_implementation=name), training=False, is_causal=True)
+    F = torch.nn.functional
+    torch.manual_seed(0)
+    shape = (1, 4, length, head_dim)
+    query, key, value = (torch.randn(shape, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+
+    output, _ = hf.thriftattention_forward(module, query, key, value, None, scaling=head_dim**-0.5)
+    # the reference sees only the real tokens
+    ref = F.scaled_dot_product_attention(query.float(), key.float(), value.float(), is_causal=True)
+
+    assert output.shape == (1, length, 4, head_dim)
+    cosine = F.cosine_similarity(output.transpose(1, 2).float().flatten(), ref.flatten(), dim=0)
+    assert cosine.item() > 0.95
