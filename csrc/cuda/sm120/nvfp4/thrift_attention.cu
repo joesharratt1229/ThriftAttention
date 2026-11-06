@@ -14,7 +14,9 @@
 // Grid: (batch * heads * query_blocks), one CTA per query tile.
 // ===========================================================================
 
-template<typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV_FP4, int HEAD_DIM,
+// EXP_APPROX: the FP4 pass uses the power-of-two softmax of cuda_common.cuh and sums the quantized P on the
+// tensor core; the FP16 pass is unchanged.
+template<typename T, bool CAUSAL, bool EXP_APPROX, int BLOCK_Q, int BLOCK_KV_FP4, int HEAD_DIM,
          int HEAD_DIM_2, int SCALE_DIM,
          int NUM_WARPS, int WARP_Q>
 __launch_bounds__(NUM_WARPS * TA_WARP_SIZE)
@@ -47,7 +49,8 @@ void thrift_attention_kernel(
     constexpr int MMA_K_FP4 = 64;
     constexpr int MMA_N = 8;
 
-    const float softmax_scale = rsqrtf(static_cast<float>(HEAD_DIM));
+    // EXP_APPROX works in log2 units
+    const float softmax_scale = rsqrtf(static_cast<float>(HEAD_DIM)) * (EXP_APPROX ? TA_LOG2_E : 1.0f);
 
     const int bid = blockIdx.x;
     const int tid = threadIdx.x;
@@ -85,11 +88,12 @@ void thrift_attention_kernel(
 
     float rowmax[WARP_Q / MMA_M][2];
     float rowsum[WARP_Q / MMA_M][2] = {};
+    float rowsum_acc[WARP_Q / MMA_M][4] = {};  // EXP_APPROX: P @ ones row sums
     float O_rmem[WARP_Q / MMA_M][HEAD_DIM / MMA_N][4] = {};
 
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
-        rowmax[mma_id_q][0] = -FLT_MAX;
-        rowmax[mma_id_q][1] = -FLT_MAX;
+        rowmax[mma_id_q][0] = EXP_APPROX ? TA_MAGIC_FLOOR : -FLT_MAX;
+        rowmax[mma_id_q][1] = EXP_APPROX ? TA_MAGIC_FLOOR : -FLT_MAX;
     }
 
     // ==================== PHASE 1: Load Q FP4 + scales -> registers ====================
@@ -295,71 +299,117 @@ void thrift_attention_kernel(
                 this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[0], 2));
                 this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[1], 2));
 
-                this_rowmax[0] = max(this_rowmax[0], rowmax[mma_id_q][0]);
-                this_rowmax[1] = max(this_rowmax[1], rowmax[mma_id_q][1]);
+                float rescale[2];
+                if constexpr (EXP_APPROX) {
+                    // Same rung bookkeeping as fp4_attention.cu: R = TA_MAGIC + n, exact power-of-two rescales
+                    // of O and the P @ ones row sum, skipped by the warp when no lane's rung moved.
+                    const float R_old0 = rowmax[mma_id_q][0];
+                    const float R_old1 = rowmax[mma_id_q][1];
+                    const float R_new0 = fmaxf((this_rowmax[0] + 0.5f) + TA_MAGIC, R_old0);
+                    const float R_new1 = fmaxf((this_rowmax[1] + 0.5f) + TA_MAGIC, R_old1);
+                    rowmax[mma_id_q][0] = R_new0;
+                    rowmax[mma_id_q][1] = R_new1;
+                    rescale[0] = ta_pow2_biased((R_old0 - R_new0) + TA_MAGIC);
+                    rescale[1] = ta_pow2_biased((R_old1 - R_new1) + TA_MAGIC);
+                    if (__any_sync(0xFFFFFFFF, R_new0 != R_old0 || R_new1 != R_old1)) {
+                        for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
+                            O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
+                            O_rmem[mma_id_q][mma_id_d][1] *= rescale[0];
+                            O_rmem[mma_id_q][mma_id_d][2] *= rescale[1];
+                            O_rmem[mma_id_q][mma_id_d][3] *= rescale[1];
+                        }
+                        rowsum_acc[mma_id_q][0] *= rescale[0];
+                        rowsum_acc[mma_id_q][1] *= rescale[0];
+                        rowsum_acc[mma_id_q][2] *= rescale[1];
+                        rowsum_acc[mma_id_q][3] *= rescale[1];
+                    }
+                } else {
+                    this_rowmax[0] = max(this_rowmax[0], rowmax[mma_id_q][0]);
+                    this_rowmax[1] = max(this_rowmax[1], rowmax[mma_id_q][1]);
 
-                float rescale[2] = {
-                    __expf(rowmax[mma_id_q][0] - this_rowmax[0]),
-                    __expf(rowmax[mma_id_q][1] - this_rowmax[1])
-                };
-                for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
-                    O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
-                    O_rmem[mma_id_q][mma_id_d][1] *= rescale[0];
-                    O_rmem[mma_id_q][mma_id_d][2] *= rescale[1];
-                    O_rmem[mma_id_q][mma_id_d][3] *= rescale[1];
+                    rescale[0] = __expf(rowmax[mma_id_q][0] - this_rowmax[0]);
+                    rescale[1] = __expf(rowmax[mma_id_q][1] - this_rowmax[1]);
+                    for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
+                        O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
+                        O_rmem[mma_id_q][mma_id_d][1] *= rescale[0];
+                        O_rmem[mma_id_q][mma_id_d][2] *= rescale[1];
+                        O_rmem[mma_id_q][mma_id_d][3] *= rescale[1];
+                    }
+                    rowmax[mma_id_q][0] = this_rowmax[0];
+                    rowmax[mma_id_q][1] = this_rowmax[1];
                 }
-                rowmax[mma_id_q][0] = this_rowmax[0];
-                rowmax[mma_id_q][1] = this_rowmax[1];
-
-                float this_rowsumexp[2] = {};
-                for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV_FP4 / MMA_N; mma_id_kv++) {
-                    float *r = S_rmem[mma_id_q][mma_id_kv];
-                    r[0] = __expf(r[0] - rowmax[mma_id_q][0]);
-                    r[1] = __expf(r[1] - rowmax[mma_id_q][0]);
-                    r[2] = __expf(r[2] - rowmax[mma_id_q][1]);
-                    r[3] = __expf(r[3] - rowmax[mma_id_q][1]);
-                    this_rowsumexp[0] += r[0] + r[1];
-                    this_rowsumexp[1] += r[2] + r[3];
-                }
-                this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 1);
-                this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 2);
-                this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 1);
-                this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 2);
-                rowsum[mma_id_q][0] = rowsum[mma_id_q][0] * rescale[0] + this_rowsumexp[0];
-                rowsum[mma_id_q][1] = rowsum[mma_id_q][1] * rescale[1] + this_rowsumexp[1];
 
                 constexpr float FP4_RANGE = 448.0f * 6.0f;
                 constexpr float FP4_MAX   = 6.0f;
 
+                // One FP8 scale per 16 probabilities, from their largest (one A-operand register of the P.V MMA)
+                float group_sf[BLOCK_KV_FP4 / MMA_N / 4][2];
+                if constexpr (EXP_APPROX) {
+                    // Each group snaps its maximum to a rung b <= R. Its codes hold 4 * 2^round(s - b) and its
+                    // scale 448 * 2^(b - R), both exact powers of two; masked scores become code 0.
+                    for (int g = 0; g < BLOCK_KV_FP4 / MMA_N / 4; g++) {
+                        float addend[2];
+                        for (int row = 0; row < 2; row++) {
+                            const float b = fminf(fmaxf((group_max[g][row] + 0.5f) + TA_MAGIC, TA_MAGIC_FLOOR),
+                                                  rowmax[mma_id_q][row]);
+                            addend[row] = 2.0f * TA_MAGIC - b;
+                            group_sf[g][row] = 448.0f * ta_pow2_biased((b - rowmax[mma_id_q][row]) + TA_MAGIC);
+                        }
+                        for (int t = 4 * g; t < 4 * g + 4; t++) {
+                            float *r = S_rmem[mma_id_q][t];
+                            r[0] = ta_pow2_biased(r[0] + addend[0], TA_BITS_FOUR);
+                            r[1] = ta_pow2_biased(r[1] + addend[0], TA_BITS_FOUR);
+                            r[2] = ta_pow2_biased(r[2] + addend[1], TA_BITS_FOUR);
+                            r[3] = ta_pow2_biased(r[3] + addend[1], TA_BITS_FOUR);
+                        }
+                    }
+                } else {
+                    float this_rowsumexp[2] = {};
+                    for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV_FP4 / MMA_N; mma_id_kv++) {
+                        float *r = S_rmem[mma_id_q][mma_id_kv];
+                        r[0] = __expf(r[0] - rowmax[mma_id_q][0]);
+                        r[1] = __expf(r[1] - rowmax[mma_id_q][0]);
+                        r[2] = __expf(r[2] - rowmax[mma_id_q][1]);
+                        r[3] = __expf(r[3] - rowmax[mma_id_q][1]);
+                        this_rowsumexp[0] += r[0] + r[1];
+                        this_rowsumexp[1] += r[2] + r[3];
+                    }
+                    this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 1);
+                    this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 2);
+                    this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 1);
+                    this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 2);
+                    rowsum[mma_id_q][0] = rowsum[mma_id_q][0] * rescale[0] + this_rowsumexp[0];
+                    rowsum[mma_id_q][1] = rowsum[mma_id_q][1] * rescale[1] + this_rowsumexp[1];
+
+                    for (int g = 0; g < BLOCK_KV_FP4 / MMA_N / 4; g++) {
+                        // the largest probability of the group, formed as the probabilities are
+                        const float pmax_upper = __expf(group_max[g][0] - rowmax[mma_id_q][0]);
+                        const float pmax_lower = __expf(group_max[g][1] - rowmax[mma_id_q][1]);
+                        group_sf[g][0] = pmax_upper > 0.0f ? (FP4_RANGE / FP4_MAX * pmax_upper) : 1.0f;
+                        group_sf[g][1] = pmax_lower > 0.0f ? (FP4_RANGE / FP4_MAX * pmax_lower) : 1.0f;
+
+                        const float inv_upper = pmax_upper > 0.0f ? (FP4_MAX / pmax_upper) : 0.0f;
+                        const float inv_lower = pmax_lower > 0.0f ? (FP4_MAX / pmax_lower) : 0.0f;
+                        for (int t = 4 * g; t < 4 * g + 4; t++) {
+                            S_rmem[mma_id_q][t][0] *= inv_upper;
+                            S_rmem[mma_id_q][t][1] *= inv_upper;
+                            S_rmem[mma_id_q][t][2] *= inv_lower;
+                            S_rmem[mma_id_q][t][3] *= inv_lower;
+                        }
+                    }
+                }
+
+                // lanes 0, 1 hold the scale of group 2g and lanes 2, 3 that of 2g+1; every lane packs both
                 float sf_P_upper[BLOCK_KV_FP4 / MMA_N / 2];
                 float sf_P_lower[BLOCK_KV_FP4 / MMA_N / 2];
-                // One FP8 scale per 16 probabilities, from their largest (one A-operand register of the P.V MMA)
                 for (int g = 0; g < BLOCK_KV_FP4 / MMA_N / 4; g++) {
-                    // the largest probability of the group, formed as the probabilities are
-                    const float pmax_upper = __expf(group_max[g][0] - rowmax[mma_id_q][0]);
-                    const float pmax_lower = __expf(group_max[g][1] - rowmax[mma_id_q][1]);
-
-                    // lanes 0, 1 hold the maximum of scale 2g and lanes 2, 3 that of 2g+1; every lane packs both
-                    const float other_upper = __shfl_xor_sync(0xFFFFFFFF, pmax_upper, 2);
-                    const float other_lower = __shfl_xor_sync(0xFFFFFFFF, pmax_lower, 2);
+                    const float other_upper = __shfl_xor_sync(0xFFFFFFFF, group_sf[g][0], 2);
+                    const float other_lower = __shfl_xor_sync(0xFFFFFFFF, group_sf[g][1], 2);
                     const bool first = (lane_id % 4) < 2;
-                    const float upper_first = first ? pmax_upper : other_upper;
-                    const float upper_second = first ? other_upper : pmax_upper;
-                    const float lower_first = first ? pmax_lower : other_lower;
-                    const float lower_second = first ? other_lower : pmax_lower;
-                    sf_P_upper[2 * g] = upper_first > 0.0f ? (FP4_RANGE / FP4_MAX * upper_first) : 1.0f;
-                    sf_P_upper[2 * g + 1] = upper_second > 0.0f ? (FP4_RANGE / FP4_MAX * upper_second) : 1.0f;
-                    sf_P_lower[2 * g] = lower_first > 0.0f ? (FP4_RANGE / FP4_MAX * lower_first) : 1.0f;
-                    sf_P_lower[2 * g + 1] = lower_second > 0.0f ? (FP4_RANGE / FP4_MAX * lower_second) : 1.0f;
-
-                    const float inv_upper = pmax_upper > 0.0f ? (FP4_MAX / pmax_upper) : 0.0f;
-                    const float inv_lower = pmax_lower > 0.0f ? (FP4_MAX / pmax_lower) : 0.0f;
-                    for (int t = 4 * g; t < 4 * g + 4; t++) {
-                        S_rmem[mma_id_q][t][0] *= inv_upper;
-                        S_rmem[mma_id_q][t][1] *= inv_upper;
-                        S_rmem[mma_id_q][t][2] *= inv_lower;
-                        S_rmem[mma_id_q][t][3] *= inv_lower;
-                    }
+                    sf_P_upper[2 * g] = first ? group_sf[g][0] : other_upper;
+                    sf_P_upper[2 * g + 1] = first ? other_upper : group_sf[g][0];
+                    sf_P_lower[2 * g] = first ? group_sf[g][1] : other_lower;
+                    sf_P_lower[2 * g + 1] = first ? other_lower : group_sf[g][1];
                 }
 
                 for (int g = 0; g < BLOCK_KV_FP4 / MMA_N / 4; g++) {
@@ -421,12 +471,39 @@ void thrift_attention_kernel(
                             sfV_rmem[mma_id_kv][mma_id_d],
                             O_rmem[mma_id_q][mma_id_d]);
 
+            if constexpr (EXP_APPROX) {
+                // Row sums of the quantized P on the tensor core: with B = ones (E2M1 code 2 = 1.0 in every
+                // nibble, E4M3 scale 1.0 = 0x38) every column of the tile holds the row's sum of codes times
+                // scales.
+                uint32_t ones_b[2] = {0x22222222u, 0x22222222u};
+                for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
+                    for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV_FP4 / MMA_K_FP4; mma_id_kv++)
+                        ta_mma_m16n8k64_nvfp4(
+                            S_fp4_rmem[mma_id_q][mma_id_kv],
+                            ones_b,
+                            S_fp4_s_rmem[mma_id_q][mma_id_kv],
+                            0x38383838u,
+                            rowsum_acc[mma_id_q]);
+            }
+
             __syncthreads();
         }
     }
 
     // ==================== PHASE 3: Save FP4 partial state + output ====================
     constexpr float FP4_RANGE_INV = 1.0f / (448.0f * 6.0f);
+
+    if constexpr (EXP_APPROX) {
+        // Hand the FP16 pass what the baseline saves: a natural-log row maximum and an unscaled denominator.
+        // The P @ ones sum holds 448 * 4 times the weights relative to the rung; O is stored normalized by it.
+        for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+            for (int row = 0; row < 2; row++) {
+                const float sum = rowsum_acc[mma_id_q][2 * row];
+                rowsum[mma_id_q][row] = sum / (448.0f * 4.0f);
+                rowmax[mma_id_q][row] = sum > 0.0f ? (rowmax[mma_id_q][row] - TA_MAGIC) * TA_LN_2 : -FLT_MAX;
+            }
+        }
+    }
 
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
         if ((lane_id & 3) == 0) {
@@ -445,12 +522,14 @@ void thrift_attention_kernel(
             const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
             float *regs = O_rmem[mma_id_q][mma_id_d];
 
-            const float norm0 = rowsum[mma_id_q][0] > 0.0f
-                ? FP4_RANGE_INV / rowsum[mma_id_q][0]
-                : 0.0f;
-            const float norm1 = rowsum[mma_id_q][1] > 0.0f
-                ? FP4_RANGE_INV / rowsum[mma_id_q][1]
-                : 0.0f;
+            float norm0, norm1;
+            if constexpr (EXP_APPROX) {
+                norm0 = rowsum_acc[mma_id_q][0] > 0.0f ? 1.0f / rowsum_acc[mma_id_q][0] : 0.0f;
+                norm1 = rowsum_acc[mma_id_q][2] > 0.0f ? 1.0f / rowsum_acc[mma_id_q][2] : 0.0f;
+            } else {
+                norm0 = rowsum[mma_id_q][0] > 0.0f ? FP4_RANGE_INV / rowsum[mma_id_q][0] : 0.0f;
+                norm1 = rowsum[mma_id_q][1] > 0.0f ? FP4_RANGE_INV / rowsum[mma_id_q][1] : 0.0f;
+            }
 
             regs[0] *= norm0;  regs[1] *= norm0;
             regs[2] *= norm1;  regs[3] *= norm1;
@@ -1126,7 +1205,7 @@ static void dispatch_thrift_attention_fp16_finalize(
         rowmax_state, rowsum_state, bs, q_len, kv_len, num_q_heads, num_kv_heads);
 }
 
-template<typename T, bool CAUSAL, int HEAD_DIM, int BLOCK_Q, int BLOCK_KV_FP4>
+template<typename T, bool CAUSAL, bool EXP_APPROX, int HEAD_DIM, int BLOCK_Q, int BLOCK_KV_FP4>
 static void launch_thrift_attention(
     const T* Q_fp16,
     const T* K_fp16,
@@ -1170,7 +1249,7 @@ static void launch_thrift_attention(
     constexpr int fp4_kv_smem = q_phase_smem + v_phase_smem;
 
     auto fp4_state_kernel = thrift_attention_kernel<
-        T, CAUSAL, BLOCK_Q, BLOCK_KV_FP4, HEAD_DIM,
+        T, CAUSAL, EXP_APPROX, BLOCK_Q, BLOCK_KV_FP4, HEAD_DIM,
         HEAD_DIM_2, SCALE_DIM, NUM_WARPS, WARP_Q>;
 
     cudaFuncSetAttribute(fp4_state_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, fp4_kv_smem);
@@ -1213,16 +1292,24 @@ static void dispatch_thrift_attention(
     int kv_len,
     int kv_capacity,
     int num_q_heads,
-    int num_kv_heads)
+    int num_kv_heads,
+    bool exp_approx)
 {
     if constexpr (HEAD_DIM == 256) {
-        return launch_thrift_attention<T, CAUSAL, HEAD_DIM, 128, 128>(
+        // head_dim 256 has no EXP_APPROX path; the binding rejects that combination
+        return launch_thrift_attention<T, CAUSAL, false, HEAD_DIM, 128, 128>(
+            Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count,
+            topk_mask, topk_word_count, Q_fp4, K_fp4, V_fp4,
+            S_Q, S_K, S_V, O, rowmax_state, rowsum_state,
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+    } else if (exp_approx) {
+        return launch_thrift_attention<T, CAUSAL, true, HEAD_DIM, 64, 64>(
             Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count,
             topk_mask, topk_word_count, Q_fp4, K_fp4, V_fp4,
             S_Q, S_K, S_V, O, rowmax_state, rowsum_state,
             bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
     } else {
-        return launch_thrift_attention<T, CAUSAL, HEAD_DIM, 64, 64>(
+        return launch_thrift_attention<T, CAUSAL, false, HEAD_DIM, 64, 64>(
             Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count,
             topk_mask, topk_word_count, Q_fp4, K_fp4, V_fp4,
             S_Q, S_K, S_V, O, rowmax_state, rowsum_state,
@@ -1254,7 +1341,8 @@ static void thrift_attention_nvfp4_typed(
     int kv_capacity,
     int num_q_heads,
     int num_kv_heads,
-    int head_dim)
+    int head_dim,
+    bool exp_approx)
 {
     auto Q_fp16 = reinterpret_cast<const T*>(Q_fp16_raw);
     auto K_fp16 = reinterpret_cast<const T*>(K_fp16_raw);
@@ -1280,7 +1368,7 @@ static void thrift_attention_nvfp4_typed(
             topk_mask, topk_word_count,
             Q, K, V, S_Q, S_K, S_V, O,
             rowmax_state, rowsum_state,
-            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, exp_approx);
     else if (head_dim == 128)
         dispatch_thrift_attention<T, CAUSAL, 128>(
             Q_fp16, K_fp16, V_fp16,
@@ -1288,7 +1376,7 @@ static void thrift_attention_nvfp4_typed(
             topk_mask, topk_word_count,
             Q, K, V, S_Q, S_K, S_V, O,
             rowmax_state, rowsum_state,
-            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, exp_approx);
     else
         dispatch_thrift_attention<T, CAUSAL, 256>(
             Q_fp16, K_fp16, V_fp16,
@@ -1296,7 +1384,7 @@ static void thrift_attention_nvfp4_typed(
             topk_mask, topk_word_count,
             Q, K, V, S_Q, S_K, S_V, O,
             rowmax_state, rowsum_state,
-            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, exp_approx);
 }
 
 void thrift_attention_causal_nvfp4(
@@ -1323,20 +1411,21 @@ void thrift_attention_causal_nvfp4(
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
-    bool is_bf16)
+    bool is_bf16,
+    bool exp_approx)
 {
     if (is_bf16) {
         thrift_attention_nvfp4_typed<__nv_bfloat16, true>(
             Q_fp16_raw, K_fp16_raw, V_fp16_raw, selected_blocks_raw, topk_count,
             topk_mask_raw, topk_word_count, Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw,
             S_V_raw, O_raw, rowmax_state_raw, rowsum_state_raw, bs, q_len,
-            kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+            kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim, exp_approx);
     } else {
         thrift_attention_nvfp4_typed<half, true>(
             Q_fp16_raw, K_fp16_raw, V_fp16_raw, selected_blocks_raw, topk_count,
             topk_mask_raw, topk_word_count, Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw,
             S_V_raw, O_raw, rowmax_state_raw, rowsum_state_raw, bs, q_len,
-            kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+            kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim, exp_approx);
     }
 }
 
@@ -1364,19 +1453,20 @@ void thrift_attention_noncausal_nvfp4(
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
-    bool is_bf16)
+    bool is_bf16,
+    bool exp_approx)
 {
     if (is_bf16) {
         thrift_attention_nvfp4_typed<__nv_bfloat16, false>(
             Q_fp16_raw, K_fp16_raw, V_fp16_raw, selected_blocks_raw, topk_count,
             topk_mask_raw, topk_word_count, Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw,
             S_V_raw, O_raw, rowmax_state_raw, rowsum_state_raw, bs, q_len,
-            kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+            kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim, exp_approx);
     } else {
         thrift_attention_nvfp4_typed<half, false>(
             Q_fp16_raw, K_fp16_raw, V_fp16_raw, selected_blocks_raw, topk_count,
             topk_mask_raw, topk_word_count, Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw,
             S_V_raw, O_raw, rowmax_state_raw, rowsum_state_raw, bs, q_len,
-            kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+            kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim, exp_approx);
     }
 }
