@@ -380,3 +380,21 @@ struct PrecisionTraits<__nv_bfloat16> {
         ta_mma_m16n8k16_bf16(a, b, acc);
     }
 };
+
+// ---------------------------------------------------------------------------
+// Approximate exponential (the EXP_APPROX kernels)
+// ---------------------------------------------------------------------------
+// Adding TA_MAGIC = 1.5 * 2^23 to a float x with |x| < 2^22 rounds x to the nearest integer n and leaves n in the
+// low mantissa bits. ta_pow2_biased shifts n into the exponent field, giving 2^n times the value whose bits are
+// `base` (1.0 by default) with integer arithmetic only. TA_MAGIC_FLOOR keeps n >= -126 so the result is a normal
+// float; it also turns masked -INF scores into 2^-126, which quantizes to zero.
+constexpr float TA_MAGIC = 12582912.0f;
+constexpr float TA_MAGIC_FLOOR = TA_MAGIC - 126.0f;
+constexpr float TA_LOG2_E = 1.4426950408889634f;
+constexpr float TA_LN_2 = 0.6931471805599453f;
+constexpr uint32_t TA_BITS_ONE = 0x3F800000u;
+constexpr uint32_t TA_BITS_FOUR = 0x40800000u;
+
+__device__ __forceinline__ float ta_pow2_biased(float biased, uint32_t base = TA_BITS_ONE) {
+    return __uint_as_float((__float_as_uint(fmaxf(biased, TA_MAGIC_FLOOR)) << 23) + base);
+}

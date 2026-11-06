@@ -389,3 +389,10 @@ def test_unaligned_causal_prefill_matches_sdpa(monkeypatch, method, head_dim, le
     assert output.shape == (1, length, 4, head_dim)
     cosine = F.cosine_similarity(output.transpose(1, 2).float().flatten(), ref.flatten(), dim=0)
     assert cosine.item() > 0.95
+
+
+def test_transformers_config_forwards_exp_approx():
+    from thriftattention.integrations import transformers as hf
+
+    assert hf.TransformersAttentionConfig(name="unit_exp_default").attention_config().exp_approx is False
+    assert hf.TransformersAttentionConfig(name="unit_exp_approx", exp_approx=True).attention_config().exp_approx is True

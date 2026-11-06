@@ -40,6 +40,15 @@ out = ta.attention(q, k, v)
 
 Q is shaped `[batch, query_heads, query_len, head_dim]`; K and V are shaped `[batch, kv_heads, kv_len, head_dim]`.
 
+### Approximate exponentials
+
+`AttentionConfig(exp_approx=True)` (or `TransformersAttentionConfig(exp_approx=True)`) makes the tiled NVFP4
+kernels form the softmax weights as powers of two with integer arithmetic and sum them on the tensor core,
+instead of calling the exponential unit. It is off by default. It applies to the dense and Thrift FP4 passes at
+head_dim 64 and 128; MXFP4, head_dim 256, and the single-query (decode) kernels keep ordinary exponentials.
+`benchmarks/compare_exp_approx.py` and `benchmarks/compare_thrift_exp_approx.py` report its speed and accuracy
+against the exact path and FP16 SDPA.
+
 ## Integration with Transformers library
 ```python
 import torch

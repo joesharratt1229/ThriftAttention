@@ -100,6 +100,11 @@ class Sm120Nvfp4Backend:
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
+        if config.exp_approx:
+            if quant_format.name != "nvfp4":
+                raise NotImplementedError("exp_approx is only implemented for the NVFP4 tiled kernels")
+            if q.shape[3] == 256:
+                raise NotImplementedError("exp_approx is not implemented for head_dim 256")
         packed = quant_format.quantize_qkv(q, k, v, is_bf16=is_bf16)
         ext = get_extension()
 
@@ -110,13 +115,13 @@ class Sm120Nvfp4Backend:
                     if config.causal
                     else ext.fp4_attention_noncausal_mxfp4_packed
                 )
-            else:
-                fn = (
-                    ext.fp4_attention_causal_nvfp4_packed
-                    if config.causal
-                    else ext.fp4_attention_noncausal_nvfp4_packed
-                )
-            return fn(*packed, is_bf16)
+                return fn(*packed, is_bf16)
+            fn = (
+                ext.fp4_attention_causal_nvfp4_packed
+                if config.causal
+                else ext.fp4_attention_noncausal_nvfp4_packed
+            )
+            return fn(*packed, is_bf16, config.exp_approx)
         if config.method == "thrift":
             if selection is None:
                 raise ValueError("thrift attention requires a selection tensor")
@@ -126,13 +131,13 @@ class Sm120Nvfp4Backend:
                     if config.causal
                     else ext.thrift_attention_noncausal_mxfp4_packed
                 )
-            else:
-                fn = (
-                    ext.thrift_attention_causal_nvfp4_packed
-                    if config.causal
-                    else ext.thrift_attention_noncausal_nvfp4_packed
-                )
-            return fn(q, k, v, selection, *packed, is_bf16)
+                return fn(q, k, v, selection, *packed, is_bf16)
+            fn = (
+                ext.thrift_attention_causal_nvfp4_packed
+                if config.causal
+                else ext.thrift_attention_noncausal_nvfp4_packed
+            )
+            return fn(q, k, v, selection, *packed, is_bf16, config.exp_approx)
         raise ValueError(f"unsupported attention method {config.method!r}")
 
 
