@@ -61,6 +61,7 @@ def main() -> None:
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--lengths", default="131072")
     parser.add_argument("--methods", default="fp16,fp4,thrift")
+    parser.add_argument("--exp-approx", action="store_true", help="Use approximate exponentials in the fp4 and thrift methods.")
     parser.add_argument("--fractions", default="0.05")
     parser.add_argument("--num-docs", type=int, default=1)
     parser.add_argument("--text-file", type=Path, default=None)
@@ -141,6 +142,8 @@ def main() -> None:
 
         for fraction in run_fractions:
             label = f"thrift_{fraction * 100:g}pct".replace(".", "p") if method == "thrift" else method
+            if args.exp_approx and method != "fp16":
+                label += "_exp_approx"
 
             if method == "fp16":
                 model.set_attn_implementation(FLASH_ATTN_IMPLEMENTATION)
@@ -152,6 +155,7 @@ def main() -> None:
                         name=impl_name,
                         method="fp4" if method == "fp4" else "thrift",
                         fraction=0.0 if fraction is None else fraction,
+                        exp_approx=args.exp_approx,
                     )
                 )
                 model.set_attn_implementation(attn_impl)

@@ -1,4 +1,5 @@
-// SM120 NVFP4 attention baseline
+// SM120 NVFP4 dense attention. EXP_APPROX replaces the softmax exponentials with the power-of-two
+// approximation of cuda_common.cuh and sums the quantized P on the tensor core.
 
 #include <cstdint>
 #include <float.h>
@@ -11,12 +12,15 @@
 #include "thriftattention/sm120/cuda_common.cuh"
 
 // QK^T -> causal mask -> online softmax -> FP4-pack P
-template<bool CAUSAL, int BLOCK_KV, int HEAD_DIM, int HEAD_DIM_2,
+// EXP_APPROX: rowmax holds the magic-biased integer rung of each row, rowsum is unused, and rowsum_acc is the
+// P @ ones accumulator of fp4_pv.
+template<bool CAUSAL, bool EXP_APPROX, int BLOCK_KV, int HEAD_DIM, int HEAD_DIM_2,
          int SCALE_DIM, int WARP_Q>
 __device__ __forceinline__
 void fp4_qk_softmax_pack(
     float rowmax[WARP_Q / 16][2],
     float rowsum[WARP_Q / 16][2],
+    float rowsum_acc[WARP_Q / 16][4],
     float O_rmem[WARP_Q / 16][HEAD_DIM / 8][4],
     uint32_t Q_rmem[WARP_Q / 16][HEAD_DIM / 64][4],
     uint32_t sfQ_rmem[WARP_Q / 16][HEAD_DIM / 64],
@@ -131,80 +135,128 @@ void fp4_qk_softmax_pack(
         this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[0], 2));
         this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[1], 2));
 
-        // new rowmax
-        this_rowmax[0] = max(this_rowmax[0], rowmax[mma_id_q][0]);
-        this_rowmax[1] = max(this_rowmax[1], rowmax[mma_id_q][1]);
-
-        // rescale previous O for new rowmax
         float rescale[2];
-        rescale[0] = __expf(rowmax[mma_id_q][0] - this_rowmax[0]);
-        rescale[1] = __expf(rowmax[mma_id_q][1] - this_rowmax[1]);
-        for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
-            O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
-            O_rmem[mma_id_q][mma_id_d][1] *= rescale[0];
-            O_rmem[mma_id_q][mma_id_d][2] *= rescale[1];
-            O_rmem[mma_id_q][mma_id_d][3] *= rescale[1];
+        if constexpr (EXP_APPROX) {
+            // The row maximum stays on an integer log2 rung, magic-biased (R = TA_MAGIC + n with n at or above
+            // every scaled score of the row so far). O and the P @ ones row sum rescale by the exact power of
+            // two 2^(n_old - n_new); the rung rarely moves, so the warp skips the rescale when no lane's did.
+            const float R_old0 = rowmax[mma_id_q][0];
+            const float R_old1 = rowmax[mma_id_q][1];
+            const float R_new0 = fmaxf((this_rowmax[0] + 0.5f) + TA_MAGIC, R_old0);
+            const float R_new1 = fmaxf((this_rowmax[1] + 0.5f) + TA_MAGIC, R_old1);
+            rowmax[mma_id_q][0] = R_new0;
+            rowmax[mma_id_q][1] = R_new1;
+            rescale[0] = ta_pow2_biased((R_old0 - R_new0) + TA_MAGIC);
+            rescale[1] = ta_pow2_biased((R_old1 - R_new1) + TA_MAGIC);
+            if (__any_sync(0xFFFFFFFF, R_new0 != R_old0 || R_new1 != R_old1)) {
+                for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
+                    O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
+                    O_rmem[mma_id_q][mma_id_d][1] *= rescale[0];
+                    O_rmem[mma_id_q][mma_id_d][2] *= rescale[1];
+                    O_rmem[mma_id_q][mma_id_d][3] *= rescale[1];
+                }
+                rowsum_acc[mma_id_q][0] *= rescale[0];
+                rowsum_acc[mma_id_q][1] *= rescale[0];
+                rowsum_acc[mma_id_q][2] *= rescale[1];
+                rowsum_acc[mma_id_q][3] *= rescale[1];
+            }
+        } else {
+            // new rowmax
+            this_rowmax[0] = max(this_rowmax[0], rowmax[mma_id_q][0]);
+            this_rowmax[1] = max(this_rowmax[1], rowmax[mma_id_q][1]);
+
+            // rescale previous O for new rowmax
+            rescale[0] = __expf(rowmax[mma_id_q][0] - this_rowmax[0]);
+            rescale[1] = __expf(rowmax[mma_id_q][1] - this_rowmax[1]);
+            for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
+                O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
+                O_rmem[mma_id_q][mma_id_d][1] *= rescale[0];
+                O_rmem[mma_id_q][mma_id_d][2] *= rescale[1];
+                O_rmem[mma_id_q][mma_id_d][3] *= rescale[1];
+            }
+
+            // save new rowmax
+            rowmax[mma_id_q][0] = this_rowmax[0];
+            rowmax[mma_id_q][1] = this_rowmax[1];
         }
-
-        // save new rowmax
-        rowmax[mma_id_q][0] = this_rowmax[0];
-        rowmax[mma_id_q][1] = this_rowmax[1];
-
-        // softmax numerator and rowsumexp
-        float this_rowsumexp[2] = {};
-        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
-            float *regs = S_rmem[mma_id_q][mma_id_kv];
-            regs[0] = __expf(regs[0] - rowmax[mma_id_q][0]);
-            regs[1] = __expf(regs[1] - rowmax[mma_id_q][0]);
-            regs[2] = __expf(regs[2] - rowmax[mma_id_q][1]);
-            regs[3] = __expf(regs[3] - rowmax[mma_id_q][1]);
-
-            this_rowsumexp[0] += regs[0] + regs[1];
-            this_rowsumexp[1] += regs[2] + regs[3];
-        }
-
-        // butterfly reduction within 4 threads
-        this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 1);
-        this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 2);
-        this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 1);
-        this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 2);
-
-        // accumulate to running rowsum
-        rowsum[mma_id_q][0] = rowsum[mma_id_q][0] * rescale[0] + this_rowsumexp[0];
-        rowsum[mma_id_q][1] = rowsum[mma_id_q][1] * rescale[1] + this_rowsumexp[1];
-
-        constexpr float FP4_RANGE = 448.0f * 6.0f;
-        constexpr float FP4_MAX = 6.0f;
-        float sf_P_upper[BLOCK_KV / MMA_N / 2];
-        float sf_P_lower[BLOCK_KV / MMA_N / 2];
 
         // One FP8 scale per 16 probabilities, from their largest (one A-operand register of the P.V MMA)
-        for (int g = 0; g < BLOCK_KV / MMA_N / 4; g++) {
-            // the largest probability of the group, formed as the probabilities are
-            const float pmax_upper = __expf(group_max[g][0] - rowmax[mma_id_q][0]);
-            const float pmax_lower = __expf(group_max[g][1] - rowmax[mma_id_q][1]);
+        constexpr float FP4_RANGE = 448.0f * 6.0f;
+        constexpr float FP4_MAX = 6.0f;
+        float group_sf[BLOCK_KV / MMA_N / 4][2];
 
-            // lanes 0, 1 hold the maximum of scale 2g and lanes 2, 3 that of 2g+1; every lane packs both
-            const float other_upper = __shfl_xor_sync(0xFFFFFFFF, pmax_upper, 2);
-            const float other_lower = __shfl_xor_sync(0xFFFFFFFF, pmax_lower, 2);
-            const bool first = (lane_id % 4) < 2;
-            const float upper_first = first ? pmax_upper : other_upper;
-            const float upper_second = first ? other_upper : pmax_upper;
-            const float lower_first = first ? pmax_lower : other_lower;
-            const float lower_second = first ? other_lower : pmax_lower;
-            sf_P_upper[2 * g] = upper_first > 0.0f ? (FP4_RANGE / FP4_MAX * upper_first) : 1.0f;
-            sf_P_upper[2 * g + 1] = upper_second > 0.0f ? (FP4_RANGE / FP4_MAX * upper_second) : 1.0f;
-            sf_P_lower[2 * g] = lower_first > 0.0f ? (FP4_RANGE / FP4_MAX * lower_first) : 1.0f;
-            sf_P_lower[2 * g + 1] = lower_second > 0.0f ? (FP4_RANGE / FP4_MAX * lower_second) : 1.0f;
-
-            const float inv_upper = pmax_upper > 0.0f ? (FP4_MAX / pmax_upper) : 0.0f;
-            const float inv_lower = pmax_lower > 0.0f ? (FP4_MAX / pmax_lower) : 0.0f;
-            for (int t = 4 * g; t < 4 * g + 4; t++) {
-                S_rmem[mma_id_q][t][0] *= inv_upper;
-                S_rmem[mma_id_q][t][1] *= inv_upper;
-                S_rmem[mma_id_q][t][2] *= inv_lower;
-                S_rmem[mma_id_q][t][3] *= inv_lower;
+        if constexpr (EXP_APPROX) {
+            // Each group snaps its maximum to a rung b <= R. Its codes hold 4 * 2^round(s - b) and its scale
+            // 448 * 2^(b - R), both exact powers of two; masked scores become code 0.
+            for (int g = 0; g < BLOCK_KV / MMA_N / 4; g++) {
+                float addend[2];
+                for (int row = 0; row < 2; row++) {
+                    const float b = fminf(fmaxf((group_max[g][row] + 0.5f) + TA_MAGIC, TA_MAGIC_FLOOR),
+                                          rowmax[mma_id_q][row]);
+                    addend[row] = 2.0f * TA_MAGIC - b;
+                    group_sf[g][row] = 448.0f * ta_pow2_biased((b - rowmax[mma_id_q][row]) + TA_MAGIC);
+                }
+                for (int t = 4 * g; t < 4 * g + 4; t++) {
+                    float *regs = S_rmem[mma_id_q][t];
+                    regs[0] = ta_pow2_biased(regs[0] + addend[0], TA_BITS_FOUR);
+                    regs[1] = ta_pow2_biased(regs[1] + addend[0], TA_BITS_FOUR);
+                    regs[2] = ta_pow2_biased(regs[2] + addend[1], TA_BITS_FOUR);
+                    regs[3] = ta_pow2_biased(regs[3] + addend[1], TA_BITS_FOUR);
+                }
             }
+        } else {
+            // softmax numerator and rowsumexp
+            float this_rowsumexp[2] = {};
+            for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+                float *regs = S_rmem[mma_id_q][mma_id_kv];
+                regs[0] = __expf(regs[0] - rowmax[mma_id_q][0]);
+                regs[1] = __expf(regs[1] - rowmax[mma_id_q][0]);
+                regs[2] = __expf(regs[2] - rowmax[mma_id_q][1]);
+                regs[3] = __expf(regs[3] - rowmax[mma_id_q][1]);
+
+                this_rowsumexp[0] += regs[0] + regs[1];
+                this_rowsumexp[1] += regs[2] + regs[3];
+            }
+
+            // butterfly reduction within 4 threads
+            this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 1);
+            this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 2);
+            this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 1);
+            this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 2);
+
+            // accumulate to running rowsum
+            rowsum[mma_id_q][0] = rowsum[mma_id_q][0] * rescale[0] + this_rowsumexp[0];
+            rowsum[mma_id_q][1] = rowsum[mma_id_q][1] * rescale[1] + this_rowsumexp[1];
+
+            for (int g = 0; g < BLOCK_KV / MMA_N / 4; g++) {
+                // the largest probability of the group, formed as the probabilities are
+                const float pmax_upper = __expf(group_max[g][0] - rowmax[mma_id_q][0]);
+                const float pmax_lower = __expf(group_max[g][1] - rowmax[mma_id_q][1]);
+                group_sf[g][0] = pmax_upper > 0.0f ? (FP4_RANGE / FP4_MAX * pmax_upper) : 1.0f;
+                group_sf[g][1] = pmax_lower > 0.0f ? (FP4_RANGE / FP4_MAX * pmax_lower) : 1.0f;
+
+                const float inv_upper = pmax_upper > 0.0f ? (FP4_MAX / pmax_upper) : 0.0f;
+                const float inv_lower = pmax_lower > 0.0f ? (FP4_MAX / pmax_lower) : 0.0f;
+                for (int t = 4 * g; t < 4 * g + 4; t++) {
+                    S_rmem[mma_id_q][t][0] *= inv_upper;
+                    S_rmem[mma_id_q][t][1] *= inv_upper;
+                    S_rmem[mma_id_q][t][2] *= inv_lower;
+                    S_rmem[mma_id_q][t][3] *= inv_lower;
+                }
+            }
+        }
+
+        // lanes 0, 1 hold the scale of group 2g and lanes 2, 3 that of 2g+1; every lane packs both
+        float sf_P_upper[BLOCK_KV / MMA_N / 2];
+        float sf_P_lower[BLOCK_KV / MMA_N / 2];
+        for (int g = 0; g < BLOCK_KV / MMA_N / 4; g++) {
+            const float other_upper = __shfl_xor_sync(0xFFFFFFFF, group_sf[g][0], 2);
+            const float other_lower = __shfl_xor_sync(0xFFFFFFFF, group_sf[g][1], 2);
+            const bool first = (lane_id % 4) < 2;
+            sf_P_upper[2 * g] = first ? group_sf[g][0] : other_upper;
+            sf_P_upper[2 * g + 1] = first ? other_upper : group_sf[g][0];
+            sf_P_lower[2 * g] = first ? group_sf[g][1] : other_lower;
+            sf_P_lower[2 * g + 1] = first ? other_lower : group_sf[g][1];
         }
 
         for (int g = 0; g < BLOCK_KV / MMA_N / 4; g++) {
@@ -238,11 +290,12 @@ void fp4_qk_softmax_pack(
     }
 }
 
-// O += P @ V
-template<int BLOCK_KV, int HEAD_DIM, int WARP_Q>
+// O += P @ V; EXP_APPROX also accumulates rowsum_acc += P @ ones.
+template<bool EXP_APPROX, int BLOCK_KV, int HEAD_DIM, int WARP_Q>
 __device__ __forceinline__
 void fp4_pv(
     float O_rmem[WARP_Q / 16][HEAD_DIM / 8][4],
+    float rowsum_acc[WARP_Q / 16][4],
     uint32_t S_fp4_rmem[WARP_Q / 16][BLOCK_KV / 64][4],
     uint32_t S_fp4_s_rmem[WARP_Q / 16][BLOCK_KV / 64],
     uint32_t V_smem,
@@ -290,9 +343,23 @@ void fp4_pv(
                     S_fp4_s_rmem[mma_id_q][mma_id_kv],
                     sfV_rmem[mma_id_kv][mma_id_d],
                     O_rmem[mma_id_q][mma_id_d]);
+
+    if constexpr (EXP_APPROX) {
+        // Row sums of the quantized P on the tensor core: with B = ones (E2M1 code 2 = 1.0 in every nibble,
+        // E4M3 scale 1.0 = 0x38) every column of the tile holds the row's sum of codes times scales.
+        uint32_t ones_b[2] = {0x22222222u, 0x22222222u};
+        for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
+            for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++)
+                ta_mma_m16n8k64_nvfp4(
+                    S_fp4_rmem[mma_id_q][mma_id_kv],
+                    ones_b,
+                    S_fp4_s_rmem[mma_id_q][mma_id_kv],
+                    0x38383838u,
+                    rowsum_acc[mma_id_q]);
+    }
 }
 
-template<typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
+template<typename T, bool CAUSAL, bool EXP_APPROX, int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
          int HEAD_DIM_2, int SCALE_DIM,
          int NUM_WARPS, int WARP_Q>
 __launch_bounds__(NUM_WARPS * TA_WARP_SIZE)
@@ -318,7 +385,8 @@ void fp4_attention_kernel(
     constexpr int MMA_K = 64;
     constexpr int MMA_N = 8;
 
-    const float softmax_scale = rsqrtf(static_cast<float>(HEAD_DIM));
+    // EXP_APPROX works in log2 units
+    const float softmax_scale = rsqrtf(static_cast<float>(HEAD_DIM)) * (EXP_APPROX ? TA_LOG2_E : 1.0f);
 
     const int bid = blockIdx.x;
     const int tid = threadIdx.x;
@@ -354,11 +422,12 @@ void fp4_attention_kernel(
 
     float rowmax[WARP_Q/MMA_M][2];
     float rowsum[WARP_Q/MMA_M][2] = {};
+    float rowsum_acc[WARP_Q/MMA_M][4] = {};
     float O_rmem[WARP_Q/MMA_M][HEAD_DIM/MMA_N][4] = {};
 
     for (int mma_id_q = 0; mma_id_q < WARP_Q/MMA_M; mma_id_q++) {
-        rowmax[mma_id_q][0] = -FLT_MAX;
-        rowmax[mma_id_q][1] = -FLT_MAX;
+        rowmax[mma_id_q][0] = EXP_APPROX ? TA_MAGIC_FLOOR : -FLT_MAX;
+        rowmax[mma_id_q][1] = EXP_APPROX ? TA_MAGIC_FLOOR : -FLT_MAX;
     }
 
     // ---- load Q data global -> shared (swizzled) -> registers ----
@@ -453,8 +522,8 @@ void fp4_attention_kernel(
         asm volatile("cp.async.wait_group 1;");
         __syncthreads();
 
-        fp4_qk_softmax_pack<CAUSAL, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM, WARP_Q>(
-            rowmax, rowsum, O_rmem, Q_rmem, sfQ_rmem, S_fp4_rmem, S_fp4_s_rmem,
+        fp4_qk_softmax_pack<CAUSAL, EXP_APPROX, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM, WARP_Q>(
+            rowmax, rowsum, rowsum_acc, O_rmem, Q_rmem, sfQ_rmem, S_fp4_rmem, S_fp4_s_rmem,
             K_ld_base, K_sf_smem, k_block_start, needs_causal_mask,
             lane_id, k_col_base, q_row_upper_global, q_row_lower_global, softmax_scale);
 
@@ -463,8 +532,8 @@ void fp4_attention_kernel(
         asm volatile("cp.async.wait_group 0;");
         __syncthreads();
 
-        fp4_pv<BLOCK_KV, HEAD_DIM, WARP_Q>(
-            O_rmem, S_fp4_rmem, S_fp4_s_rmem, V_smem, V_sf_smem, lane_id);
+        fp4_pv<EXP_APPROX, BLOCK_KV, HEAD_DIM, WARP_Q>(
+            O_rmem, rowsum_acc, S_fp4_rmem, S_fp4_s_rmem, V_smem, V_sf_smem, lane_id);
 
         K += BLOCK_KV * HEAD_DIM_2;
         S_K += BLOCK_KV * SCALE_DIM;
@@ -473,6 +542,8 @@ void fp4_attention_kernel(
         S_V += BLOCK_KV / 16;
     }
 
+    // EXP_APPROX: numerator and denominator share the P codes and scales, so the P @ ones sum normalizes O
+    // directly; columns 0 and 2 of that tile hold this thread's two rows.
     constexpr float FP4_RANGE_INV = 1.0f / (448.0f * 6.0f);
 
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
@@ -482,8 +553,8 @@ void fp4_attention_kernel(
 
             float *regs = O_rmem[mma_id_q][mma_id_d];
 
-            float norm0 = FP4_RANGE_INV / rowsum[mma_id_q][0];
-            float norm1 = FP4_RANGE_INV / rowsum[mma_id_q][1];
+            const float norm0 = EXP_APPROX ? 1.0f / rowsum_acc[mma_id_q][0] : FP4_RANGE_INV / rowsum[mma_id_q][0];
+            const float norm1 = EXP_APPROX ? 1.0f / rowsum_acc[mma_id_q][2] : FP4_RANGE_INV / rowsum[mma_id_q][1];
 
             regs[0] *= norm0;
             regs[1] *= norm0;
@@ -558,6 +629,7 @@ void fp4_attention_hd256_kernel(
 
     float rowmax[WARP_Q/MMA_M][2];
     float rowsum[WARP_Q/MMA_M][2] = {};
+    float rowsum_acc[WARP_Q/MMA_M][4] = {};  // unused: head_dim 256 has no EXP_APPROX path
     float O_rmem[WARP_Q/MMA_M][HEAD_DIM/MMA_N][4] = {};
 
     for (int mma_id_q = 0; mma_id_q < WARP_Q/MMA_M; mma_id_q++) {
@@ -687,13 +759,13 @@ void fp4_attention_hd256_kernel(
         const uint32_t cur_V    = cur_K_sf + BLOCK_KV * SCALE_DIM * sizeof(__nv_fp8_e4m3);
         const uint32_t cur_V_sf = cur_V    + HEAD_DIM * (BLOCK_KV / 2) * sizeof(__nv_fp4x2_e2m1);
 
-        fp4_qk_softmax_pack<CAUSAL, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM, WARP_Q>(
-            rowmax, rowsum, O_rmem, Q_rmem, sfQ_rmem, S_fp4_rmem, S_fp4_s_rmem,
+        fp4_qk_softmax_pack<CAUSAL, false, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM, WARP_Q>(
+            rowmax, rowsum, rowsum_acc, O_rmem, Q_rmem, sfQ_rmem, S_fp4_rmem, S_fp4_s_rmem,
             cur_K_ld, cur_K_sf, k_block_start, needs_causal_mask,
             lane_id, k_col_base, q_row_upper_global, q_row_lower_global, softmax_scale);
 
-        fp4_pv<BLOCK_KV, HEAD_DIM, WARP_Q>(
-            O_rmem, S_fp4_rmem, S_fp4_s_rmem, cur_V, cur_V_sf, lane_id);
+        fp4_pv<false, BLOCK_KV, HEAD_DIM, WARP_Q>(
+            O_rmem, rowsum_acc, S_fp4_rmem, S_fp4_s_rmem, cur_V, cur_V_sf, lane_id);
 
         cur_buf_off = KV_BUF_BYTES - cur_buf_off;
     }
@@ -722,7 +794,7 @@ void fp4_attention_hd256_kernel(
         }
 }
 
-template<typename T, bool CAUSAL, int HEAD_DIM>
+template<typename T, bool CAUSAL, bool EXP_APPROX, int HEAD_DIM>
 static void launch_fp4_attention(
     const __nv_fp4x2_e2m1* Q, const __nv_fp4x2_e2m1* K, const __nv_fp4x2_e2m1* V,
     const __nv_fp8_e4m3* S_Q, const __nv_fp8_e4m3* S_K, const __nv_fp8_e4m3* S_V,
@@ -748,7 +820,7 @@ static void launch_fp4_attention(
     constexpr int smem_size = q_phase_smem + v_phase_smem > k_phase_smem
                             ? q_phase_smem + v_phase_smem : k_phase_smem;
 
-    auto kernel = fp4_attention_kernel<T, CAUSAL, BLOCK_Q, BLOCK_KV, HEAD_DIM,
+    auto kernel = fp4_attention_kernel<T, CAUSAL, EXP_APPROX, BLOCK_Q, BLOCK_KV, HEAD_DIM,
                                        HEAD_DIM_2, SCALE_DIM,
                                        NUM_WARPS, WARP_Q>;
 
@@ -797,7 +869,7 @@ static void launch_fp4_attention_hd256(
         bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
 }
 
-template<typename T, bool CAUSAL>
+template<typename T, bool CAUSAL, bool EXP_APPROX>
 static void dispatch_fp4_attention(
     const __nv_fp4x2_e2m1* Q,
     const __nv_fp4x2_e2m1* K,
@@ -814,14 +886,15 @@ static void dispatch_fp4_attention(
     int num_kv_heads,
     int head_dim) {
     if (head_dim == 64) {
-        launch_fp4_attention<T, CAUSAL, 64>(
+        launch_fp4_attention<T, CAUSAL, EXP_APPROX, 64>(
             Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
             kv_capacity, num_q_heads, num_kv_heads);
     } else if (head_dim == 128) {
-        launch_fp4_attention<T, CAUSAL, 128>(
+        launch_fp4_attention<T, CAUSAL, EXP_APPROX, 128>(
             Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
             kv_capacity, num_q_heads, num_kv_heads);
-    } else {
+    } else if constexpr (!EXP_APPROX) {
+        // head_dim 256 has no EXP_APPROX path; the binding rejects that combination
         launch_fp4_attention_hd256<T, CAUSAL>(
             Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
             kv_capacity, num_q_heads, num_kv_heads);
@@ -843,7 +916,8 @@ static void fp4_attention_nvfp4_typed(
     int kv_capacity,
     int num_q_heads,
     int num_kv_heads,
-    int head_dim) {
+    int head_dim,
+    bool exp_approx) {
     auto Q = reinterpret_cast<const __nv_fp4x2_e2m1*>(Q_raw);
     auto K = reinterpret_cast<const __nv_fp4x2_e2m1*>(K_raw);
     auto V = reinterpret_cast<const __nv_fp4x2_e2m1*>(V_raw);
@@ -852,9 +926,15 @@ static void fp4_attention_nvfp4_typed(
     auto S_V = reinterpret_cast<const __nv_fp8_e4m3*>(S_V_raw);
     auto O = reinterpret_cast<T*>(O_raw);
 
-    dispatch_fp4_attention<T, CAUSAL>(
-        Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
-        kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    if (exp_approx) {
+        dispatch_fp4_attention<T, CAUSAL, true>(
+            Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
+            kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    } else {
+        dispatch_fp4_attention<T, CAUSAL, false>(
+            Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len,
+            kv_capacity, num_q_heads, num_kv_heads, head_dim);
+    }
 }
 
 void fp4_attention_causal_nvfp4(
@@ -872,15 +952,16 @@ void fp4_attention_causal_nvfp4(
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
-    bool is_bf16) {
+    bool is_bf16,
+    bool exp_approx) {
     if (is_bf16) {
         fp4_attention_nvfp4_typed<__nv_bfloat16, true>(
             Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
-            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim, exp_approx);
     } else {
         fp4_attention_nvfp4_typed<half, true>(
             Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
-            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim, exp_approx);
     }
 }
 
@@ -899,14 +980,15 @@ void fp4_attention_noncausal_nvfp4(
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
-    bool is_bf16) {
+    bool is_bf16,
+    bool exp_approx) {
     if (is_bf16) {
         fp4_attention_nvfp4_typed<__nv_bfloat16, false>(
             Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
-            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim, exp_approx);
     } else {
         fp4_attention_nvfp4_typed<half, false>(
             Q_raw, K_raw, V_raw, S_Q_raw, S_K_raw, S_V_raw, O_raw,
-            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim);
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads, head_dim, exp_approx);
     }
 }

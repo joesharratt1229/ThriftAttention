@@ -647,7 +647,7 @@ def cached_prefill_attention(
             if config.causal
             else ext.fp4_attention_noncausal_nvfp4_packed
         )
-        return fn(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, is_bf16)
+        return fn(q_packed, k_packed, v_packed_t, q_scale, k_scale, v_scale_t, is_bf16, config.exp_approx)
 
     if config.method != "thrift":
         raise ValueError(f"unsupported ThriftAttention method {config.method!r}")
@@ -677,6 +677,7 @@ def cached_prefill_attention(
         k_scale,
         v_scale_t,
         is_bf16,
+        config.exp_approx,
     )
 
 

@@ -44,6 +44,7 @@ class TransformersAttentionConfig:
     backend: AttentionBackendName = "auto"
     implementation: AttentionImplementation = "auto"
     fallback: FallbackBackend = "error"
+    exp_approx: bool = False
 
     def attention_config(self) -> AttentionConfig:
         return AttentionConfig(
@@ -61,6 +62,7 @@ class TransformersAttentionConfig:
                 ("auto", "tiled", "single_query"),
             ),
             fallback=_validate_choice("fallback", self.fallback, ("error",)),
+            exp_approx=bool(self.exp_approx),
         )
 
 

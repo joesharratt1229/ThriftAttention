@@ -1,3 +1,5 @@
 *pycache*
 *cpython*
 *egg-info*
+benchmarks/results/
+examples/long_context_quality/results/

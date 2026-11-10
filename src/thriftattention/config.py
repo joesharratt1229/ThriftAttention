@@ -24,3 +24,5 @@ class AttentionConfig:
     backend: AttentionBackendName = "auto"
     implementation: AttentionImplementation = "auto"
     fallback: FallbackBackend = "error"
+    # Power-of-two softmax weights in the tiled NVFP4 kernels (head_dim 64 and 128); off by default.
+    exp_approx: bool = False
