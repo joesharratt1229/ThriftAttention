@@ -146,6 +146,13 @@ __device__ inline uint32_t ta_ld_shared_u16(uint32_t addr) {
 
 // The power of two at or above a positive scale: the value cvt.rp.satfinite.ue8m0x2 stores it as. Dividing by it
 // keeps every value within the E2M1 range.
+// rcp.approx.ftz.f32, the reciprocal that vLLM's NVFP4 quantization kernels use
+__device__ __forceinline__ float ta_rcp_approx_ftz(float a) {
+    float b;
+    asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(b) : "f"(a));
+    return b;
+}
+
 __device__ inline float ta_round_ue8m0_up(float x) {
     const uint32_t bits = __float_as_uint(x);
     return __uint_as_float(((bits >> 23) + ((bits & 0x7FFFFFu) != 0u)) << 23);
